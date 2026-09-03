@@ -179,6 +179,27 @@ fixed it, and the sweep went from 90 failures back to none.
 All of these produce plausible wrong numbers rather than crashes, which is what
 makes an independent oracle worth more than careful reading.
 
+## Instruction coverage is not function coverage
+
+The two numbers move very differently, and only one of them decides whether a
+build is possible. One unsupported instruction fails the whole function it sits
+in, so function completeness lags instruction coverage badly and is the figure
+worth watching:
+
+| | instructions | functions |
+|---|---|---|
+| integer core only | 97.9% | 72.0% |
+| + scalar FP, atomics, bitfield | 99.2% | 85.8% |
+| + PC-relative literal loads | 99.2% | 92.9% |
+| + NEON | 99.96% | 97.7% |
+| whole engine, today | 99.93% | 98.6% |
+
+The literal-load row is the clearest illustration. It was 1,389 instructions —
+a tenth of a percent — but they are scattered roughly one per function, so
+handling them moved function completeness seven points. Late in the tail, the
+instruction column stops being informative entirely: what matters is how widely
+a form is *spread*, not how often it occurs.
+
 ## Two execution paths, one host
 
 The host program is needed either way, so it comes first.
@@ -206,10 +227,11 @@ ELF.
       OpenAL resolves plenty but pulls in `libOpenSLES` — its backend is
       Android's, and it is the one library worth replacing rather than loading.
 - [ ] **Lifter.** ARM64 → C, boundaries from `.eh_frame`, indirect branches via
-      an address → function-pointer table. **99.2% of instructions lift; 94.3% of
-      functions lift completely.** Scalar FP, atomics, bitfield and the
-      addressing modes are done; what remains is almost entirely true NEON —
-      vector registers with arrangements.
+      an address → function-pointer table. Over the whole 62,008-function
+      engine: **99.93% of instructions lift, and 98.6% of functions lift
+      completely.** What remains is a long tail of narrow NEON forms — lane
+      widening and narrowing, `ld1`/`st1`, horizontal reductions — plus the
+      `svc` sites, which need the shim rather than the lifter.
 
 ## Ports using this
 

@@ -65,6 +65,21 @@ def reg_of(md: Cs, reg: int) -> tuple[int, bool, bool]:
 
 FP_BYTES = {"b": 1, "h": 2, "s": 4, "d": 8, "q": 16}
 
+# Vector arrangements: lanes, the union view to address them through, and the
+# element width in bits. A 64-bit arrangement writes only the low half of the
+# register and zeroes the top, which the emitters get for free by assembling
+# the result in a zeroed temporary.
+VAS_INFO = {
+    "16B": (16, "u8", 8),   "8B": (8, "u8", 8),
+    "8H": (8, "u16", 16),   "4H": (4, "u16", 16),
+    "4S": (4, "u32", 32),   "2S": (2, "u32", 32),
+    "2D": (2, "u64", 64),   "1D": (1, "u64", 64),
+    "1B": (1, "u8", 8),     "1H": (1, "u16", 16),
+    "1S": (1, "u32", 32),
+}
+VAS_NAMES = {getattr(a64, n): n.replace("ARM64_VAS_", "")
+             for n in dir(a64) if n.startswith("ARM64_VAS_")}
+
 
 def vreg_of(md: Cs, reg: int):
     """(index, kind) for an FP/SIMD register, or None if it is not one.
@@ -240,6 +255,223 @@ class Lifter:
             addr = f"({addr} + INT64_C({m.disp}))"
         return addr
 
+    # --- vector -------------------------------------------------------------
+
+    def is_vector(self, op) -> bool:
+        if op.type != a64.ARM64_OP_REG:
+            return False
+        return (self.md.reg_name(op.reg) or "").startswith("v")
+
+    def vas_of(self, op):
+        """(lanes, view, element bits) for an arrangement, or None."""
+        return VAS_INFO.get(VAS_NAMES.get(getattr(op, "vas", 0), ""))
+
+    def lane_of(self, op) -> int:
+        return getattr(op, "vector_index", -1)
+
+    def vreg_index(self, op) -> int:
+        info = vreg_of(self.md, op.reg)
+        if info is None:
+            raise Unsupported("not a vector register")
+        return info[0]
+
+    def vec_elem(self, op, lane: int, view: str) -> str:
+        return f"(c)->q[{self.vreg_index(op)}].{view}[{lane}]"
+
+    def vec_source(self, op, lane: int, view: str) -> str:
+        """A source lane, honouring a lane-indexed operand as a broadcast."""
+        idx = self.lane_of(op)
+        return self.vec_elem(op, idx if idx >= 0 else lane, view)
+
+    def vec_result(self, dest, body):
+        """Assemble lanes in a zeroed temporary, then commit.
+
+        The temporary is not decoration. A destination register is frequently
+        also a source, so writing lanes in place would feed already-updated
+        values into later lanes. Zeroing it also gives the 64-bit arrangements
+        their upper-half clear for free.
+        """
+        return (["{ Arm64Vec _t; _t.u64[0] = 0; _t.u64[1] = 0;"] + body +
+                [f"  (c)->q[{self.vreg_index(dest)}] = _t; }}"])
+
+    def emit_vector(self, insn, ops):
+        m = insn.mnemonic
+
+        # A whole-register move is by far the most common vector instruction in
+        # a real engine, and it is only a copy. `orr vD, vN, vN` is the same
+        # thing spelled differently, which is how the assembler encodes it.
+        if len(ops) >= 2 and self.is_vector(ops[0]) and self.is_vector(ops[1]) \
+                and self.lane_of(ops[0]) < 0 and self.lane_of(ops[1]) < 0 \
+                and (m == "mov" or
+                     (m == "orr" and len(ops) == 3 and ops[1].reg == ops[2].reg)):
+            d, n = self.vreg_index(ops[0]), self.vreg_index(ops[1])
+            info = self.vas_of(ops[0])
+            if info and info[0] * info[2] == 64:
+                return [f"arc_q_w(c, {d}, (c)->q[{n}].u64[0], 0);"]
+            return [f"(c)->q[{d}] = (c)->q[{n}];"]
+
+        if m in ("movi", "mvni") and self.is_vector(ops[0]):
+            imm = ops[1]
+            if imm.type != a64.ARM64_OP_IMM:
+                raise Unsupported("movi operand")
+            value = imm.imm
+            if imm.shift.type == a64.ARM64_SFT_LSL and imm.shift.value:
+                value <<= imm.shift.value
+            if value == 0 and m == "movi":
+                return [f"arc_v_clear(c, {self.vreg_index(ops[0])});"]
+            info = self.vas_of(ops[0])
+            if not info:
+                raise Unsupported("movi without arrangement")
+            lanes, view, bits = info
+            mask = (1 << bits) - 1
+            if m == "mvni":
+                value = ~value
+            value &= mask
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = UINT64_C({value});" for i in range(lanes)])
+
+        # Lane to general register.
+        if m in ("umov", "smov") and not self.is_vector(ops[0]):
+            src = ops[1]
+            info = self.vas_of(src)
+            view = info[1] if info else "u32"
+            bits = info[2] if info else 32
+            expr = self.vec_elem(src, max(self.lane_of(src), 0), view)
+            if m == "smov":
+                w = 64 if self.dest_is64(ops[0]) else 32
+                expr = f"arc_sext{w}({expr}, {bits})"
+            return [self.write(ops[0], expr)]
+
+        # Into a single lane, from another lane or from a general register.
+        if self.is_vector(ops[0]) and self.lane_of(ops[0]) >= 0 and \
+                m in ("ins", "mov"):
+            d, src = ops[0], ops[1]
+            info = self.vas_of(d)
+            view = info[1] if info else "u64"
+            value = (self.vec_elem(src, max(self.lane_of(src), 0), view)
+                     if self.is_vector(src) else self.read(src))
+            return [f"{self.vec_elem(d, self.lane_of(d), view)} = ({value});"]
+
+        if m == "dup":
+            d, src = ops[0], ops[1]
+            info = self.vas_of(d)
+            if not info:
+                raise Unsupported("dup without arrangement")
+            lanes, view, _ = info
+            value = (self.vec_source(src, 0, view) if self.is_vector(src)
+                     else self.read(src))
+            return self.vec_result(d, [f"  _t.{view}[{i}] = ({value});"
+                                       for i in range(lanes)])
+
+        info = self.vas_of(ops[0]) if self.is_vector(ops[0]) else None
+        if not info:
+            raise Unsupported(f"vector {m} without arrangement")
+        lanes, view, bits = info
+        fview = {32: "f32", 64: "f64"}.get(bits)
+        sview = {8: "i8", 16: "i16", 32: "i32", 64: "i64"}.get(bits, "i32")
+        ones = f"(uint{bits}_t)~(uint{bits}_t)0"
+
+        vshift = {"shl": "<<", "ushr": ">>", "sshr": ">>"}
+        if m in vshift and len(ops) == 3 and ops[2].type == a64.ARM64_OP_IMM:
+            n = ops[2].imm
+            # An arithmetic right shift has to read the lane through the signed
+            # view; the unsigned one would shift zeroes in.
+            src_view = sview if m == "sshr" else view
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)("
+                f"{self.vec_source(ops[1], i, src_view)} {vshift[m]} {n});"
+                for i in range(lanes)])
+
+        int_bin = {"add": "+", "sub": "-", "and": "&", "orr": "|",
+                   "eor": "^", "mul": "*"}
+        flt_bin = {"fadd": "+", "fsub": "-", "fmul": "*", "fdiv": "/"}
+
+        if m in int_bin and len(ops) == 3:
+            c = int_bin[m]
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {self.vec_source(ops[1], i, view)} {c}"
+                f" {self.vec_source(ops[2], i, view)};" for i in range(lanes)])
+        if m in ("bic", "orn") and len(ops) == 3:
+            c = "&" if m == "bic" else "|"
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {self.vec_source(ops[1], i, view)} {c}"
+                f" (~{self.vec_source(ops[2], i, view)});" for i in range(lanes)])
+        if m in flt_bin and len(ops) == 3:
+            if not fview:
+                raise Unsupported(f"{m} on {bits}-bit lanes")
+            c = flt_bin[m]
+            return self.vec_result(ops[0], [
+                f"  _t.{fview}[{i}] = {self.vec_source(ops[1], i, fview)} {c}"
+                f" {self.vec_source(ops[2], i, fview)};" for i in range(lanes)])
+
+        vrint = {"frinta": "round", "frintm": "floor", "frintp": "ceil",
+                 "frintz": "trunc", "frintn": "nearbyint", "frintx": "rint",
+                 "frinti": "rint"}
+        if m in vrint and fview:
+            f = "f" if bits == 32 else ""
+            return self.vec_result(ops[0], [
+                f"  _t.{fview}[{i}] = {vrint[m]}{f}("
+                f"{self.vec_source(ops[1], i, fview)});" for i in range(lanes)])
+
+        if m in ("fneg", "fabs", "fsqrt") and fview:
+            f = "f" if bits == 32 else ""
+            w = "32" if bits == 32 else "64"
+            body = []
+            for i in range(lanes):
+                v = self.vec_source(ops[1], i, fview)
+                expr = {"fneg": f"-({v})", "fabs": f"fabs{f}({v})",
+                        "fsqrt": f"arc_fsqrt{w}({v})"}[m]
+                body.append(f"  _t.{fview}[{i}] = {expr};")
+            return self.vec_result(ops[0], body)
+        if m == "neg":
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(0 -"
+                f" {self.vec_source(ops[1], i, view)});" for i in range(lanes)])
+        if m in ("not", "mvn"):
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = ~{self.vec_source(ops[1], i, view)};"
+                for i in range(lanes)])
+        if m == "cnt":
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = arc_popcount8("
+                f"{self.vec_source(ops[1], i, view)});" for i in range(lanes)])
+
+        if m in ("scvtf", "ucvtf") and fview:
+            cast = ("int" if m == "scvtf" else "uint") + str(bits) + "_t"
+            ctype = "float" if bits == 32 else "double"
+            return self.vec_result(ops[0], [
+                f"  _t.{fview}[{i}] = ({ctype})({cast})"
+                f"{self.vec_source(ops[1], i, view)};" for i in range(lanes)])
+        if m in ("fcvtzs", "fcvtzu") and fview:
+            fn = f"arc_f2i{bits}" if m == "fcvtzs" else f"arc_f2u{bits}"
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {fn}((double)"
+                f"{self.vec_source(ops[1], i, fview)});" for i in range(lanes)])
+
+        # A comparison writes all-ones or zero into the lane, not 0 or 1.
+        int_cmp = {"cmeq": "==", "cmgt": ">", "cmge": ">=",
+                   "cmhi": ">", "cmhs": ">="}
+        flt_cmp = {"fcmeq": "==", "fcmgt": ">", "fcmge": ">="}
+        if m in int_cmp:
+            v = sview if m in ("cmgt", "cmge") else view
+            body = []
+            for i in range(lanes):
+                r = (self.vec_source(ops[2], i, v)
+                     if len(ops) > 2 and self.is_vector(ops[2]) else "0")
+                body.append(f"  _t.{view}[{i}] = ({self.vec_source(ops[1], i, v)}"
+                            f" {int_cmp[m]} {r}) ? {ones} : 0;")
+            return self.vec_result(ops[0], body)
+        if m in flt_cmp and fview:
+            body = []
+            for i in range(lanes):
+                r = (self.vec_source(ops[2], i, fview)
+                     if len(ops) > 2 and self.is_vector(ops[2]) else "0.0")
+                body.append(f"  _t.{view}[{i}] = ({self.vec_source(ops[1], i, fview)}"
+                            f" {flt_cmp[m]} {r}) ? {ones} : 0;")
+            return self.vec_result(ops[0], body)
+
+        raise Unsupported(f"vector {m}")
+
     # --- instruction emitters ----------------------------------------------
 
     def emit(self, insn, func_start: int, func_end: int,
@@ -265,6 +497,12 @@ class Lifter:
         m = insn.mnemonic
         ops = insn.operands
         out: list[str] = []
+
+        # `mov`, `add`, `orr` and `fmul` each name both a scalar and a vector
+        # instruction; the operands decide which. Vector forms are split off
+        # here, before any scalar emitter gets a chance at them.
+        if any(self.is_vector(o) for o in ops):
+            return self.emit_vector(insn, ops)
 
         def arith(op_c: str, set_flags: bool, sub: bool = False):
             d, a, b = ops[0], ops[1], ops[2] if len(ops) > 2 else None
@@ -337,15 +575,35 @@ class Lifter:
         if m == "adds": return arith("+", True)
         if m == "sub":  return arith("-", False)
         if m == "subs": return arith("-", True, sub=True)
+        if m in ("adc", "adcs", "sbc", "sbcs"):
+            d, a, b = ops[0], ops[1], ops[2]
+            is64 = self.dest_is64(d)
+            w = "64" if is64 else "32"
+            cast = "uint64_t" if is64 else "uint32_t"
+            rhs = self.read(b)
+            if m.startswith("sbc"):
+                rhs = f"(({cast})~({cast})({rhs}))"
+            if m.endswith("s"):
+                return [self.write(
+                    d, f"arc_add{w}(c, {self.read(a)}, {rhs}, (c)->cf)")]
+            return [self.write(
+                d, f"(({cast})({self.read(a)}) + ({cast})({rhs}) + (c)->cf)")]
         if m == "cmp":  return compare(sub=True)
         if m == "cmn":  return compare(sub=False)
 
         # -- logical
         if m == "and":  return logical("&", False)
         if m == "ands": return logical("&", True)
+        if m == "bics": return logical("&", True, invert_rhs=True)
         if m == "orr":  return logical("|", False)
         if m == "eor":  return logical("^", False)
         if m == "bic":  return logical("&", False, invert_rhs=True)
+        if m == "orn":  return logical("|", False, invert_rhs=True)
+        if m == "mneg":
+            cast = "uint64_t" if self.dest_is64(ops[0]) else "uint32_t"
+            return [self.write(ops[0],
+                               f"(({cast})0 - (({cast})({self.read(ops[1])})"
+                               f" * ({cast})({self.read(ops[2])})))")]
         if m == "tst":
             a, b = ops[0], ops[1]
             is64 = reg_of(self.md, a.reg)[1]
@@ -474,8 +732,10 @@ class Lifter:
             return [f"arc_dispatch(c, {self.read(ops[0])}); return;"]
         if m == "ret":
             return ["return;"]
-        if m == "nop":
-            return ["/* nop */"]
+        if m in ("nop", "bti", "hint", "dmb", "dsb", "isb", "prfm", "prfum"):
+            return [f"/* {m}: no architectural effect here */"]
+        if m == "brk":
+            return ["arc_trap(c, \"brk\");"]
 
         # -- floating point
         # Scalar FP maps onto C's own float and double, which is the whole
@@ -535,6 +795,13 @@ class Lifter:
             return [self.fp_write(ops[0], expr)]
 
         if m in ("scvtf", "ucvtf"):
+            if self.fp_of(ops[1]) is not None:
+                # Source is an FP register holding an integer bit pattern.
+                sidx, skind = self.fp_of(ops[1])
+                bits = 32 if skind == "s" else 64
+                cast = ("int" if m == "scvtf" else "uint") + str(bits) + "_t"
+                raw = f"ARC_SU_R(c, {sidx})" if skind == "s" else f"ARC_DU_R(c, {sidx})"
+                return [self.fp_write(ops[0], f"(({cast})({raw}))")]
             idx, is64, _ = reg_of(self.md, ops[1].reg)
             signed = m == "scvtf"
             cast = (("int64_t" if is64 else "int32_t") if signed
@@ -552,6 +819,16 @@ class Lifter:
                      "fcvtns": ("nearbyint", True), "fcvtnu": ("nearbyint", False)}
         if m in cvt_round:
             rounder, signed = cvt_round[m]
+            if self.fp_of(ops[0]) is not None:
+                # Destination is an FP register receiving an integer.
+                didx, dkind = self.fp_of(ops[0])
+                bits = 32 if dkind == "s" else 64
+                expr = self.fp_read(ops[1])
+                if rounder:
+                    expr = f"{rounder}((double)({expr}))"
+                fn = (f"arc_f2i{bits}" if signed else f"arc_f2u{bits}")
+                setter = "arc_su_w" if dkind == "s" else "arc_du_w"
+                return [f"{setter}(c, {didx}, {fn}((double)({expr})));"]
             idx, is64, _ = reg_of(self.md, ops[0].reg)
             expr = self.fp_read(ops[1])
             if len(ops) > 2:

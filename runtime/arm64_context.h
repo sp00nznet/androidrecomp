@@ -354,6 +354,11 @@ static inline uint32_t arc_sext32(uint32_t v, unsigned width) {
   return (uint32_t)(((int32_t)(v << up)) >> up);
 }
 
+static inline uint8_t arc_popcount8(uint8_t v) {
+  v = (uint8_t)(v - ((v >> 1) & 0x55));
+  v = (uint8_t)((v & 0x33) + ((v >> 2) & 0x33));
+  return (uint8_t)((v + (v >> 4)) & 0x0F);
+}
 static inline uint64_t arc_clz64(uint64_t v) {
   uint64_t n = 0;
   if (!v) return 64;
@@ -410,6 +415,11 @@ void arc_tpidr_write(uint64_t v);
 // Every `blr`/`br` target is looked up in a sorted address -> function table
 // built from the recovered function starts. A miss traps loudly: an unlifted
 // target reached at runtime is a bug to fix, not something to paper over.
+// A guest trap -- `brk`, or an indirect branch with no lifted target. Loud on
+// purpose: reaching one means the lift is incomplete, not that the game did
+// something interesting.
+void arc_trap(Arm64Ctx* c, const char* what);
+
 typedef void (*Arc64Fn)(Arm64Ctx*);
 void arc_dispatch(Arm64Ctx* c, uint64_t target);
 

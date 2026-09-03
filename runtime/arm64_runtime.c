@@ -115,3 +115,12 @@ uint64_t arc_smulh(uint64_t a, uint64_t b) {
 static ARC_THREAD_LOCAL uint64_t t_tpidr;
 uint64_t arc_tpidr_read(void) { return t_tpidr; }
 void arc_tpidr_write(uint64_t v) { t_tpidr = v; }
+
+#include <stdio.h>
+#include <stdlib.h>
+
+void arc_trap(Arm64Ctx* c, const char* what) {
+  (void)c;
+  fprintf(stderr, "guest trap: %s\n", what ? what : "?");
+  abort();
+}
