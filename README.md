@@ -205,10 +205,18 @@ a form is *spread*, not how often it occurs.
 ## Building and running the lifted program
 
 ```sh
-python tools/lifter.py libengine.so --out generated --shards 64
+python tools/lifter.py libengine.so libc++_shared.so --out generated --shards 64
 cmake -S . -B build-lifted -DARC_LIFTED_DIR=generated
 cmake --build build-lifted
 ```
+
+A program is not one library. An engine calls into the C++ runtime the APK
+ships beside it, and those calls land in ARM code like any other, so every
+image the guest executes has to be lifted into the same program. The dispatch
+table spans them, keyed on which image an address falls inside; function names
+carry the image index because offsets overlap between images; and each lifted
+function refers to its own image's load address, which is fixed when the C is
+generated rather than carried at run time.
 
 For this engine that is 430 MB of C across 66 translation units, which compiles
 in about 75 seconds. Every recovered function becomes a C function; the 1.4%
@@ -244,9 +252,7 @@ without needing a window, a JNI environment or a server. Failures are recovered
 rather than fatal — a boot that dies on the first bad constructor tells you one
 thing per run, one that keeps going tells you the shape of what is left.
 
-On this engine, **1,294 of 1,527 constructors run**. The rest stop at a single,
-precisely named requirement: 230 of them call into `libc++_shared.so`, which is
-a guest image that has not been lifted.
+On this engine, **1,493 of 1,527 constructors run**.
 
 Two things had to exist first, and both are general.
 
@@ -279,6 +285,21 @@ The lesson generalises: a guest image's imports partition into ones the host
 satisfies and ones another guest image satisfies, and only the first kind may
 be called natively. The second kind belongs to the dispatcher, and traps until
 that image is lifted too.
+
+### Two mnemonics were 48% of a library
+
+`libc++_shared.so` initially lifted at 47.7% of functions against libscorpio's
+98.6%, and the whole difference was `paciasp` and `autiasp` — 2,700 of the
+2,750 instructions that failed. It was built with `-mbranch-protection`, so
+every non-leaf function signs the return address on entry and authenticates it
+on exit.
+
+Both are identity operations for a lifted program. Signing defends a return
+address held in memory an attacker might corrupt; ours lives in the context,
+there is no key, and a lifted `ret` returns from a C function rather than
+branching through `x30`. Treating the pair as no-ops preserves exactly what it
+guarantees on hardware — that `x30` is unchanged from entry to exit — and took
+the library to 99.7%.
 
 ## Two execution paths, one host
 

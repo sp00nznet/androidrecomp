@@ -109,6 +109,10 @@ class Lifter:
         # a tail call into a neighbour, or a target in the 1.2% of .text that
         # .eh_frame does not cover. Those need stubs or the link fails.
         self.referenced: set[int] = set()
+        # Which image is being lifted. Function names and every PC-relative
+        # computation are scoped to it, because two images have overlapping
+        # offsets and different bases.
+        self.image_index = 0
 
     # --- operand helpers ---------------------------------------------------
 
@@ -592,6 +596,16 @@ class Lifter:
                     d, f"arc_add{w}(c, {self.read(a)}, {rhs}, (c)->cf)")]
             return [self.write(
                 d, f"(({cast})({self.read(a)}) + ({cast})({rhs}) + (c)->cf)")]
+        if m in ("negs", "ngcs"):
+            d, src = ops[0], ops[1]
+            is64 = self.dest_is64(d)
+            w = "64" if is64 else "32"
+            if m == "negs":
+                return [self.write(d, f"arc_sub{w}(c, 0, {self.read(src)})")]
+            cast = "uint64_t" if is64 else "uint32_t"
+            return [self.write(
+                d, f"arc_add{w}(c, 0, (({cast})~({cast})({self.read(src)})),"
+                   f" (c)->cf)")]
         if m == "cmp":  return compare(sub=True)
         if m == "cmn":  return compare(sub=False)
 
@@ -683,9 +697,11 @@ class Lifter:
 
         # -- addressing
         if m == "adr":
-            return [self.write(ops[0], f"((c)->image_base + UINT64_C({ops[1].imm}))")]
+            return [self.write(ops[0],
+                               f"({self.base_expr()} + UINT64_C({ops[1].imm}))")]
         if m == "adrp":
-            return [self.write(ops[0], f"((c)->image_base + UINT64_C({ops[1].imm & ~0xFFF}))")]
+            return [self.write(ops[0], f"({self.base_expr()} + "
+                                       f"UINT64_C({ops[1].imm & ~0xFFF}))")]
 
         # -- loads and stores
         ld = {"ldr": (None, 8), "ldrb": ("uint8_t", 1), "ldrh": ("uint16_t", 2),
@@ -727,17 +743,34 @@ class Lifter:
             return [f"if ((({self.read(ops[0])}) >> {bit} & 1) {test} 0) {body}"]
         if m == "bl":
             t = branch_target(ops[0])
-            return [f"ARC_X_W(c, 30, (c)->image_base + UINT64_C({insn.address + 4}));",
+            return [f"ARC_X_W(c, 30, {self.base_expr()} + "
+                    f"UINT64_C({insn.address + 4}));",
                     f"{self.fn_name(t)}(c);"]
         if m == "blr":
-            return [f"ARC_X_W(c, 30, (c)->image_base + UINT64_C({insn.address + 4}));",
+            return [f"ARC_X_W(c, 30, {self.base_expr()} + "
+                    f"UINT64_C({insn.address + 4}));",
                     f"arc_dispatch(c, {self.read(ops[0])});"]
         if m == "br":
             return [f"arc_dispatch(c, {self.read(ops[0])}); return;"]
-        if m == "ret":
+        if m in ("ret", "retaa", "retab"):
             return ["return;"]
-        if m in ("nop", "bti", "hint", "dmb", "dsb", "isb", "prfm", "prfum"):
+        if m in ("nop", "bti", "hint", "dmb", "dsb", "isb", "prfm", "prfum",
+                 "clrex", "sevl", "sev", "wfe", "wfi", "yield"):
             return [f"/* {m}: no architectural effect here */"]
+
+        # Pointer authentication. libc++ is commonly built with -mbranch-
+        # protection, so every non-leaf function signs the return address on
+        # entry and authenticates it on exit -- two instructions that between
+        # them accounted for nearly every function in it failing to lift.
+        #
+        # They are identity operations for a lifted program. Signing defends a
+        # return address held in memory an attacker might corrupt; ours lives
+        # in the context, there is no key, and a lifted `ret` returns from a C
+        # function rather than branching to x30. Making both no-ops keeps x30
+        # consistent from entry to exit, which is what the pair guarantees on
+        # hardware.
+        if m.startswith(("pac", "aut", "xpac")):
+            return [f"/* {m}: pointer authentication is identity when lifted */"]
         if m == "brk":
             return ["arc_trap(c, \"brk\");"]
 
@@ -1076,7 +1109,7 @@ class Lifter:
             # A literal load: `ldr x0, <address>`, reading a constant pooled
             # near the code. Capstone resolves the PC-relative offset to an
             # absolute address in the image, so it only needs rebasing.
-            addr = f"((c)->image_base + UINT64_C({mem.imm}))"
+            addr = f"({self.base_expr()} + UINT64_C({mem.imm}))"
             if self.fp_of(d) is not None:
                 return self.emit_fp_load(insn, d, mem, addr)
             is64 = self.dest_is64(d)
@@ -1164,7 +1197,16 @@ class Lifter:
 
     def fn_name(self, addr: int) -> str:
         self.referenced.add(addr)
-        return f"fn_{addr:x}"
+        return f"fn{self.image_index}_{addr:x}"
+
+    def base_expr(self) -> str:
+        """The load address of the image this function came from.
+
+        Not a field of the context: a lifted function belongs to exactly one
+        image, so which base it means is fixed when the C is generated, and
+        baking it in keeps an indirect call from having to carry the answer.
+        """
+        return f"arc_image_bases[{self.image_index}]"
 
     # --- function level -----------------------------------------------------
 
@@ -1256,14 +1298,15 @@ def functions_from_eh_frame(elf: ELFFile) -> list[tuple[int, int]]:
     return out
 
 
-def emit_program(lifter: Lifter, funcs, sections, out_dir: str,
-                 shards: int, limit: int) -> None:
-    """Write the whole lifted program as a set of translation units.
+def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
+                 limit: int) -> None:
+    """Write one lifted program covering every image given.
 
-    One C file per function would be 62,000 files; one file for everything
-    would be several hundred megabytes and defeat any compiler. Sharding keeps
-    each unit at a size a compiler is happy with and lets the build run in
-    parallel.
+    A program is not one library. An engine calls into the C++ runtime the APK
+    ships beside it, and those calls land in ARM code like any other -- so the
+    dispatch table has to span every image, keyed on which one an address falls
+    inside. Offsets overlap between images, so function names carry the image
+    index too.
     """
     os.makedirs(out_dir, exist_ok=True)
     handles = []
@@ -1273,73 +1316,103 @@ def emit_program(lifter: Lifter, funcs, sections, out_dir: str,
         fh.write('#include "lifted.h"\n\n')
         handles.append(fh)
 
-    defined: list[int] = []
-    unlifted: list[int] = []
-    done = 0
-    for start, size in funcs:
-        if limit and done >= limit:
-            break
-        body = bytes_at(sections, start, size)
-        if body is None:
-            continue
-        done += 1
-        code = lifter.lift_function(start, size, body)
-        defined.append(start)
-        if code is None:
-            unlifted.append(start)
-            continue
-        # Round-robin by index: function addresses are 4-byte aligned,
-        # so keying the shard on the address itself sends every
-        # function to unit zero.
-        handles[len(defined) % shards].write(code + "\n")
+    per_image = []          # (name, defined[], stub_targets[])
+    written = 0
+    for index, (name, funcs, sections) in enumerate(images):
+        lifter.image_index = index
+        lifter.referenced = set()
+        defined, unlifted = [], []
+        done = 0
+        for start_addr, size in funcs:
+            if limit and done >= limit:
+                break
+            body = bytes_at(sections, start_addr, size)
+            if body is None:
+                continue
+            done += 1
+            code = lifter.lift_function(start_addr, size, body)
+            defined.append(start_addr)
+            if code is None:
+                unlifted.append(start_addr)
+                continue
+            handles[written % shards].write(code + "\n")
+            written += 1
+        stubs = sorted(set(unlifted) | (lifter.referenced - set(defined)))
+        per_image.append((name, sorted(set(defined) | set(stubs)), stubs,
+                          len(defined) - len(unlifted)))
+        print(f"  {name}: {len(defined) - len(unlifted):,} lifted, "
+              f"{len(unlifted):,} did not lift, {len(stubs) - len(unlifted):,} "
+              f"stubs for targets outside .eh_frame")
 
-    # A function that did not lift still needs to exist, or every caller fails
-    # to link. It traps instead, so an incomplete lift shows up the moment that
-    # path is taken rather than at build time.
-    stub_targets = sorted(set(unlifted) |
-                          (lifter.referenced - set(defined)))
     with open(os.path.join(out_dir, "stubs.c"), "w", encoding="utf-8") as fh:
         fh.write('#include "lifted.h"\n\n')
-        for addr in stub_targets:
-            fh.write(f'void fn_{addr:x}(Arm64Ctx* c) {{ '
-                     f'arc_trap(c, "unlifted fn_{addr:x}"); }}\n')
+        for index, (_, _, stubs, _) in enumerate(per_image):
+            for addr in stubs:
+                fh.write(f'void fn{index}_{addr:x}(Arm64Ctx* c) {{ '
+                         f'arc_trap(c, "unlifted fn{index}_{addr:x}"); }}\n')
 
-    all_fns = sorted(set(defined) | set(stub_targets))
     with open(os.path.join(out_dir, "lifted.h"), "w", encoding="utf-8") as fh:
         fh.write("// Generated by tools/lifter.py -- do not edit.\n"
                  '#pragma once\n#include "arm64_context.h"\n\n'
                  "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
-        for addr in all_fns:
-            fh.write(f"void fn_{addr:x}(Arm64Ctx*);\n")
-        fh.write("\nextern const uint64_t arc_image_size;\n")
+        fh.write("// Where each image was loaded. The host fills these in with\n"
+                 "// arc_set_image before calling anything.\n")
+        fh.write(f"#define ARC_IMAGE_COUNT {len(per_image)}\n")
+        fh.write("extern uint64_t arc_image_bases[ARC_IMAGE_COUNT];\n")
+        fh.write("void arc_set_image(size_t index, uint64_t base, uint64_t span);\n")
+        fh.write("const char* arc_image_name(size_t index);\n\n")
+        for index, (_, all_fns, _, _) in enumerate(per_image):
+            for addr in all_fns:
+                fh.write(f"void fn{index}_{addr:x}(Arm64Ctx*);\n")
         fh.write("#ifdef __cplusplus\n}\n#endif\n")
 
-    # The dispatch table: guest address -> lifted function. Sorted, so an
-    # indirect branch is a binary search rather than a hash lookup, and a miss
-    # is a trap rather than a wild jump.
     with open(os.path.join(out_dir, "dispatch.c"), "w", encoding="utf-8") as fh:
         fh.write('#include "lifted.h"\n\n'
-                 "typedef struct { uint64_t offset; Arc64Fn fn; } ArcEntry;\n\n"
-                 "static const ArcEntry kFunctions[] = {\n")
-        for addr in all_fns:
-            fh.write(f"  {{ UINT64_C({addr}), fn_{addr:x} }},\n")
-        fh.write("};\n"
-                 "static const size_t kCount = sizeof(kFunctions) / sizeof(kFunctions[0]);\n\n")
+                 "typedef struct { uint64_t offset; Arc64Fn fn; } ArcEntry;\n"
+                 "typedef struct { const ArcEntry* items; size_t count; } ArcTable;\n\n")
+        for index, (_, all_fns, _, _) in enumerate(per_image):
+            fh.write(f"static const ArcEntry kImage{index}[] = {{\n")
+            for addr in all_fns:
+                fh.write(f"  {{ UINT64_C({addr}), fn{index}_{addr:x} }},\n")
+            fh.write("};\n")
+        fh.write("\nstatic const ArcTable kTables[ARC_IMAGE_COUNT] = {\n")
+        for index, (_, all_fns, _, _) in enumerate(per_image):
+            fh.write(f"  {{ kImage{index}, {len(all_fns)} }},\n")
+        fh.write("};\n\n")
+        fh.write("static const char* const kNames[ARC_IMAGE_COUNT] = {\n")
+        for name, _, _, _ in per_image:
+            fh.write(f'  "{name}",\n')
+        fh.write("};\n\n")
+        fh.write("uint64_t arc_image_bases[ARC_IMAGE_COUNT];\n"
+                 "static uint64_t g_spans[ARC_IMAGE_COUNT];\n\n"
+                 "void arc_set_image(size_t index, uint64_t base, uint64_t span) {\n"
+                 "  if (index >= ARC_IMAGE_COUNT) return;\n"
+                 "  arc_image_bases[index] = base;\n"
+                 "  g_spans[index] = span;\n"
+                 "}\n\n"
+                 "const char* arc_image_name(size_t index) {\n"
+                 "  return index < ARC_IMAGE_COUNT ? kNames[index] : 0;\n"
+                 "}\n\n")
         fh.write("""void arc_dispatch(Arm64Ctx* c, uint64_t target) {
-  // Targets are host addresses; the table is keyed on image offsets.
-  uint64_t off = target - c->image_base;
-  size_t lo = 0, hi = kCount;
-  while (lo < hi) {
-    size_t mid = lo + (hi - lo) / 2;
-    if (kFunctions[mid].offset < off) lo = mid + 1;
-    else hi = mid;
+  for (size_t im = 0; im < ARC_IMAGE_COUNT; ++im) {
+    const uint64_t base = arc_image_bases[im];
+    if (!base || target < base || target >= base + g_spans[im]) continue;
+    const uint64_t off = target - base;
+    const ArcEntry* items = kTables[im].items;
+    size_t lo = 0, hi = kTables[im].count;
+    while (lo < hi) {
+      const size_t mid = lo + (hi - lo) / 2;
+      if (items[mid].offset < off) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < kTables[im].count && items[lo].offset == off) {
+      items[lo].fn(c);
+      return;
+    }
+    break;  // inside this image, but not at a function we lifted
   }
-  if (lo < kCount && kFunctions[lo].offset == off) {
-    kFunctions[lo].fn(c);
-    return;
-  }
-  // Not a lifted function. It may still be a host import the guest reached
-  // through its GOT, which the runtime knows about and we do not.
+  // Not lifted code at all. It may be a host import the guest reached through
+  // its GOT, which the runtime knows about and we do not.
   arc_dispatch_miss(c, target);
 }
 """)
@@ -1349,18 +1422,16 @@ def emit_program(lifter: Lifter, funcs, sections, out_dir: str,
 
     total_bytes = sum(os.path.getsize(os.path.join(out_dir, f))
                       for f in os.listdir(out_dir))
-    print(f"\nwrote {out_dir}: {len(all_fns):,} functions across {shards} units"
-          f" ({total_bytes / 1e6:.0f} MB)")
-    print(f"  {len(defined) - len(unlifted):,} lifted, "
-          f"{len(unlifted):,} trapping stubs, "
-          f"{len(stub_targets) - len(unlifted):,} stubs for targets outside "
-          f".eh_frame")
+    total_fns = sum(len(a) for _, a, _, _ in per_image)
+    print(f"\nwrote {out_dir}: {total_fns:,} functions from {len(per_image)} "
+          f"images across {shards} units ({total_bytes / 1e6:.0f} MB)")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("library")
+    ap.add_argument("library", nargs="+",
+                    help="the engine, then any guest libraries it calls into")
     ap.add_argument("--out", help="directory to write generated C into")
     ap.add_argument("--shards", type=int, default=64,
                     help="translation units to split the program across")
@@ -1369,16 +1440,21 @@ def main() -> None:
                     help="print coverage instead of writing code")
     args = ap.parse_args()
 
-    with open(args.library, "rb") as fh:
-        elf = ELFFile(fh)
-        sections = code_sections(elf)
-        funcs = sorted(functions_from_eh_frame(elf) + functions_from_plt(elf))
+    images = []
+    for lib in args.library:
+        with open(lib, "rb") as fh:
+            elf = ELFFile(fh)
+            images.append((os.path.basename(lib),
+                           sorted(functions_from_eh_frame(elf) +
+                                  functions_from_plt(elf)),
+                           code_sections(elf)))
 
     lifter = Lifter()
 
     if args.out:
-        emit_program(lifter, funcs, sections, args.out, args.shards, args.limit)
+        emit_program(lifter, images, args.out, args.shards, args.limit)
     else:
+        funcs, sections = images[0][1], images[0][2]
         done = failed = 0
         for start, size in funcs:
             if args.limit and done + failed >= args.limit:

@@ -27,6 +27,7 @@
 
 #include "arm64_context.h"
 #include "elf_image.h"
+#include "lifted.h"
 #include "shim.h"
 
 namespace {
@@ -48,6 +49,19 @@ struct Mapping {
   uint64_t span;
 };
 std::vector<Mapping> g_mappings;
+
+// The generated program knows which images it covers, by name. Matching on the
+// name rather than on load order means the host may map them in any sequence.
+void AnnounceImage(const std::string& name, uint64_t base, uint64_t span) {
+  g_mappings.push_back({name, base, span});
+  for (size_t i = 0; i < ARC_IMAGE_COUNT; ++i) {
+    const char* known = arc_image_name(i);
+    if (known && name == known) {
+      arc_set_image(i, base, span);
+      return;
+    }
+  }
+}
 
 std::string ExplainAddress(uint64_t addr) {
   for (const auto& u : g_unresolved)
@@ -175,8 +189,7 @@ int main(int argc, char** argv) {
     auto img = std::make_unique<arc::ElfImage>();
     if (img->Load(p.string(), resolve, &err)) {
       arc::ShimRegisterImage(img.get());
-      g_mappings.push_back({need, reinterpret_cast<uint64_t>(img->base()),
-                            img->span()});
+      AnnounceImage(need, reinterpret_cast<uint64_t>(img->base()), img->span());
       g_deps.push_back(std::move(img));
     }
   }
@@ -185,9 +198,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   arc::ShimRegisterImage(&g_image);
-  g_mappings.push_back({path.filename().string(),
-                        reinterpret_cast<uint64_t>(g_image.base()),
-                        g_image.span()});
+  AnnounceImage(path.filename().string(),
+                reinterpret_cast<uint64_t>(g_image.base()), g_image.span());
 
   // Every import the shim satisfied is a host address the guest will reach by
   // branching through its GOT. The dispatcher has to be able to tell those
@@ -225,10 +237,17 @@ int main(int argc, char** argv) {
   printf("imports    %zu host functions, %zu satisfied by unlifted guest "
          "images, %zu unresolved\n", natives, guest_side, g_unresolved.size());
   printf("\nmapped images\n");
-  for (const Mapping& m : g_mappings)
-    printf("  %-22s %#018llx .. %#018llx\n", m.name.c_str(),
+  for (const Mapping& m : g_mappings) {
+    bool lifted = false;
+    for (size_t i = 0; i < ARC_IMAGE_COUNT; ++i) {
+      const char* known = arc_image_name(i);
+      if (known && m.name == known) { lifted = true; break; }
+    }
+    printf("  %-22s %#018llx .. %#018llx  %s\n", m.name.c_str(),
            static_cast<unsigned long long>(m.base),
-           static_cast<unsigned long long>(m.base + m.span));
+           static_cast<unsigned long long>(m.base + m.span),
+           lifted ? "lifted" : "not lifted");
+  }
 
   std::vector<uint8_t> stack(kGuestStack);
   Arm64Ctx ctx;
