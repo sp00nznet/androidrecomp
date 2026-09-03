@@ -11,6 +11,7 @@
 // tells you the shape of what is left.
 
 #include <setjmp.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,11 +40,28 @@ std::vector<std::unique_ptr<arc::ElfImage>> g_deps;
 // called one function nobody wrote".
 std::vector<std::pair<uint64_t, std::string>> g_unresolved;
 
+// Every image we mapped, so a faulting address can be attributed to one of
+// them rather than reported as a bare number.
+struct Mapping {
+  std::string name;
+  uint64_t base;
+  uint64_t span;
+};
+std::vector<Mapping> g_mappings;
+
 std::string ExplainAddress(uint64_t addr) {
   for (const auto& u : g_unresolved)
     if (u.first == addr)
       return "unresolved import " + u.second;
-  return std::string();
+  for (const Mapping& m : g_mappings) {
+    if (addr >= m.base && addr < m.base + m.span) {
+      char buf[160];
+      snprintf(buf, sizeof(buf), "inside %s at +%#llx", m.name.c_str(),
+               static_cast<unsigned long long>(addr - m.base));
+      return buf;
+    }
+  }
+  return "not in any mapped image";
 }
 
 constexpr size_t kGuestStack = 8 * 1024 * 1024;
@@ -68,16 +86,26 @@ int RunWithRecovery(Arm64Ctx* c, uint64_t target) {
 // a null tells you one thing, an address inside the guard page the loader binds
 // unresolved imports to tells you exactly which shim is missing.
 uint64_t g_fault_address;
+const char* g_fault_kind = "";
 
 int FaultFilter(EXCEPTION_POINTERS* ep, unsigned long* code) {
   *code = ep->ExceptionRecord->ExceptionCode;
-  g_fault_address = ep->ExceptionRecord->NumberParameters >= 2
-                        ? ep->ExceptionRecord->ExceptionInformation[1]
-                        : 0;
+  g_fault_address = 0;
+  g_fault_kind = "";
+  if (ep->ExceptionRecord->NumberParameters >= 2) {
+    g_fault_address = ep->ExceptionRecord->ExceptionInformation[1];
+    switch (ep->ExceptionRecord->ExceptionInformation[0]) {
+      case 0: g_fault_kind = "read"; break;
+      case 1: g_fault_kind = "write"; break;
+      case 8: g_fault_kind = "execute"; break;
+      default: break;
+    }
+  }
   return EXCEPTION_EXECUTE_HANDLER;
 }
 #else
 uint64_t g_fault_address;
+const char* g_fault_kind = "";
 #endif
 
 int CallGuarded(Arm64Ctx* c, uint64_t target, unsigned long* code) {
@@ -147,6 +175,8 @@ int main(int argc, char** argv) {
     auto img = std::make_unique<arc::ElfImage>();
     if (img->Load(p.string(), resolve, &err)) {
       arc::ShimRegisterImage(img.get());
+      g_mappings.push_back({need, reinterpret_cast<uint64_t>(img->base()),
+                            img->span()});
       g_deps.push_back(std::move(img));
     }
   }
@@ -155,15 +185,32 @@ int main(int argc, char** argv) {
     return 1;
   }
   arc::ShimRegisterImage(&g_image);
+  g_mappings.push_back({path.filename().string(),
+                        reinterpret_cast<uint64_t>(g_image.base()),
+                        g_image.span()});
 
   // Every import the shim satisfied is a host address the guest will reach by
   // branching through its GOT. The dispatcher has to be able to tell those
   // from lifted functions.
-  size_t natives = 0;
-  auto register_imports = [&natives](const arc::ElfImage& img) {
+  auto in_guest_image = [](uint64_t addr) {
+    for (const Mapping& m : g_mappings)
+      if (addr >= m.base && addr < m.base + m.span) return true;
+    return false;
+  };
+
+  size_t natives = 0, guest_side = 0;
+  auto register_imports = [&](const arc::ElfImage& img) {
     for (const arc::Import& i : img.imports()) {
       if (!i.resolved) {
         g_unresolved.emplace_back(i.bound_to, i.name);
+        continue;
+      }
+      // Satisfied by another guest image rather than by the shim: that address
+      // is ARM code. Calling it as a host function would execute the wrong
+      // architecture. It belongs to the dispatcher, which will trap until that
+      // image is lifted too.
+      if (in_guest_image(i.bound_to)) {
+        ++guest_side;
         continue;
       }
       arc_register_native(i.bound_to, i.name.c_str());
@@ -175,8 +222,13 @@ int main(int argc, char** argv) {
 
   printf("image      %s at %p\n", path.filename().string().c_str(),
          static_cast<void*>(g_image.base()));
-  printf("imports    %zu host functions registered, %zu unresolved\n",
-         natives, g_unresolved.size());
+  printf("imports    %zu host functions, %zu satisfied by unlifted guest "
+         "images, %zu unresolved\n", natives, guest_side, g_unresolved.size());
+  printf("\nmapped images\n");
+  for (const Mapping& m : g_mappings)
+    printf("  %-22s %#018llx .. %#018llx\n", m.name.c_str(),
+           static_cast<unsigned long long>(m.base),
+           static_cast<unsigned long long>(m.base + m.span));
 
   std::vector<uint8_t> stack(kGuestStack);
   Arm64Ctx ctx;
@@ -192,6 +244,7 @@ int main(int argc, char** argv) {
 
   size_t ok = 0, trapped = 0, faulted = 0;
   std::vector<std::string> first_failures;
+  std::vector<std::pair<uint64_t, size_t>> fault_sites;
   for (size_t i = 0; i < total; ++i) {
     // Each constructor starts from a clean frame; a previous failure must not
     // leave the stack pointer somewhere strange.
@@ -202,7 +255,15 @@ int main(int argc, char** argv) {
       ++ok;
       continue;
     }
-    if (rc == 1) ++trapped; else ++faulted;
+    if (rc == 1) {
+      ++trapped;
+    } else {
+      ++faulted;
+      bool seen = false;
+      for (auto& f : fault_sites)
+        if (f.first == g_fault_address) { ++f.second; seen = true; break; }
+      if (!seen) fault_sites.emplace_back(g_fault_address, 1);
+    }
     if (first_failures.size() < 12) {
       char buf[320];
       if (rc == 1) {
@@ -211,9 +272,10 @@ int main(int argc, char** argv) {
                  arc_last_trap());
       } else {
         const std::string what = ExplainAddress(g_fault_address);
-        snprintf(buf, sizeof(buf), "  ctor %zu at %#llx: %s touching %#llx%s%s",
-                 i, static_cast<unsigned long long>(ctors[i] - ctx.image_base),
-                 FaultName(code),
+        snprintf(buf, sizeof(buf),
+                 "  ctor %zu at %#llx: %s on %s of %#llx%s%s", i,
+                 static_cast<unsigned long long>(ctors[i] - ctx.image_base),
+                 FaultName(code), g_fault_kind,
                  static_cast<unsigned long long>(g_fault_address),
                  what.empty() ? "" : " -- ", what.c_str());
       }
@@ -222,6 +284,18 @@ int main(int argc, char** argv) {
   }
 
   printf("  %zu ran, %zu trapped, %zu faulted\n", ok, trapped, faulted);
+  if (!fault_sites.empty()) {
+    printf("\ndistinct fault addresses (%zu)\n", fault_sites.size());
+    std::sort(fault_sites.begin(), fault_sites.end(),
+              [](const std::pair<uint64_t, size_t>& a,
+                 const std::pair<uint64_t, size_t>& b) {
+                return a.second > b.second;
+              });
+    for (size_t i = 0; i < fault_sites.size() && i < 10; ++i)
+      printf("  %6zu x %#018llx  %s\n", fault_sites[i].second,
+             static_cast<unsigned long long>(fault_sites[i].first),
+             ExplainAddress(fault_sites[i].first).c_str());
+  }
   if (!first_failures.empty()) {
     printf("\nfirst failures\n");
     for (const std::string& f : first_failures) printf("%s\n", f.c_str());

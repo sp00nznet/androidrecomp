@@ -244,7 +244,9 @@ without needing a window, a JNI environment or a server. Failures are recovered
 rather than fatal — a boot that dies on the first bad constructor tells you one
 thing per run, one that keeps going tells you the shape of what is left.
 
-On this engine, **1,294 of 1,527 constructors run**.
+On this engine, **1,294 of 1,527 constructors run**. The rest stop at a single,
+precisely named requirement: 230 of them call into `libc++_shared.so`, which is
+a guest image that has not been lifted.
 
 Two things had to exist first, and both are general.
 
@@ -263,6 +265,20 @@ contain it. Registering the resolved imports lets an indirect branch tell the
 two apart, and a generic thunk marshals the integer half of the calling
 convention across. Floating-point arguments live in `v0`-`v7` and are not
 carried yet; that needs per-signature thunks generated from the import list.
+
+**"Resolved" is not the same as "a host function".** An import satisfied by
+another *guest* image — the APK's own `libc++_shared.so`, say — has a perfectly
+real address, so it looks resolved like any other. It is ARM code. Handing it to
+the native thunk calls it as though it were x86, which faults on *execute*
+rather than on read or write, at an address inside an image that is definitely
+mapped. Reporting which of the three kinds of access faulted is what makes that
+diagnosable at all; without it the symptom is an impossible-looking fault in
+memory you allocated yourself.
+
+The lesson generalises: a guest image's imports partition into ones the host
+satisfies and ones another guest image satisfies, and only the first kind may
+be called natively. The second kind belongs to the dispatcher, and traps until
+that image is lifted too.
 
 ## Two execution paths, one host
 
