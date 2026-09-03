@@ -160,8 +160,24 @@ not have found:
   shifts. Shifting in the source width silently discards everything that
   crosses the 32-bit boundary.
 
-All three produce plausible-looking wrong numbers rather than crashes, which is
-what makes an independent oracle worth more than careful reading.
+Floating point produced two more of the same kind, where C and the architecture
+simply disagree:
+
+- `fsqrt` of a negative gives the *default* NaN, sign bit clear. C's `sqrtf`
+  returns a negative NaN — one bit different.
+- ARM's `fmin`/`fmax` **propagate** NaN. C's `fminf`/`fmaxf` deliberately do
+  not; only ARM's `fminnm`/`fmaxnm` match them. Using the C function for the
+  propagating form returns a number where the hardware returns NaN.
+
+And it caught a regression as it was introduced. Handling PC-relative literal
+loads meant treating a `ldr` whose last operand is an immediate as a literal —
+but a *post-indexed* load also ends with an immediate, so `ldr x0, [x9], #9`
+started reading address 9. Every affected function had been counted as lifting
+successfully. Locating the memory operand by search rather than by position
+fixed it, and the sweep went from 90 failures back to none.
+
+All of these produce plausible wrong numbers rather than crashes, which is what
+makes an independent oracle worth more than careful reading.
 
 ## Two execution paths, one host
 
@@ -190,10 +206,10 @@ ELF.
       OpenAL resolves plenty but pulls in `libOpenSLES` — its backend is
       Android's, and it is the one library worth replacing rather than loading.
 - [ ] **Lifter.** ARM64 → C, boundaries from `.eh_frame`, indirect branches via
-      an address → function-pointer table. **97.9% of instructions lift; 72% of
-      functions lift completely.** The gap between those two is the whole story:
-      one unsupported instruction fails an entire function, so the remaining
-      work is the long tail — FP/SIMD registers first, then atomics.
+      an address → function-pointer table. **99.2% of instructions lift; 94.3% of
+      functions lift completely.** Scalar FP, atomics, bitfield and the
+      addressing modes are done; what remains is almost entirely true NEON —
+      vector registers with arrangements.
 
 ## Ports using this
 

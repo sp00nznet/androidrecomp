@@ -63,6 +63,25 @@ def reg_of(md: Cs, reg: int) -> tuple[int, bool, bool]:
     raise Unsupported(f"register {name}")
 
 
+FP_BYTES = {"b": 1, "h": 2, "s": 4, "d": 8, "q": 16}
+
+
+def vreg_of(md: Cs, reg: int):
+    """(index, kind) for an FP/SIMD register, or None if it is not one.
+
+    Scalar kinds are b/h/s/d/q by width; `v` is the vector view, which only the
+    arrangement in the instruction gives meaning to.
+    """
+    name = md.reg_name(reg)
+    if not name or not name[1:].isdigit():
+        return None
+    if name[0] in "bhsdq":
+        return int(name[1:]), name[0]
+    if name[0] == "v":
+        return int(name[1:]), "v"
+    return None
+
+
 class Lifter:
     def __init__(self, image_name: str = "image"):
         self.md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
@@ -144,6 +163,66 @@ class Lifter:
 
     def dest_is64(self, op) -> bool:
         return reg_of(self.md, op.reg)[1]
+
+    # --- floating point helpers --------------------------------------------
+
+    def fp_of(self, op):
+        if op.type != a64.ARM64_OP_REG:
+            return None
+        return vreg_of(self.md, op.reg)
+
+    def fp_read(self, op) -> str:
+        """C expression for a scalar FP source, as its natural C type."""
+        info = self.fp_of(op)
+        if info is None:
+            raise Unsupported("not an FP register")
+        idx, kind = info
+        if kind == "s":
+            return f"ARC_S_R(c, {idx})"
+        if kind == "d":
+            return f"ARC_D_R(c, {idx})"
+        raise Unsupported(f"scalar FP kind {kind}")
+
+    def fp_bits_read(self, op) -> str:
+        """The raw bits of an FP register, for moves that do not convert."""
+        idx, kind = self.fp_of(op)
+        if kind == "s":
+            return f"ARC_SU_R(c, {idx})"
+        if kind == "d":
+            return f"ARC_DU_R(c, {idx})"
+        if kind in ("b", "h"):
+            return f"ARC_{kind.upper()}_R(c, {idx})"
+        raise Unsupported(f"bit read of {kind}")
+
+    def fp_write(self, op, expr: str) -> str:
+        idx, kind = self.fp_of(op)
+        if kind == "s":
+            return f"arc_s_w(c, {idx}, (float)({expr}));"
+        if kind == "d":
+            return f"arc_d_w(c, {idx}, (double)({expr}));"
+        raise Unsupported(f"scalar FP kind {kind}")
+
+    def fp_bits_write(self, op, expr: str) -> str:
+        idx, kind = self.fp_of(op)
+        if kind == "s":
+            return f"arc_su_w(c, {idx}, (uint32_t)({expr}));"
+        if kind == "d":
+            return f"arc_du_w(c, {idx}, (uint64_t)({expr}));"
+        raise Unsupported(f"bit write of {kind}")
+
+    def fp_kind(self, op) -> str:
+        info = self.fp_of(op)
+        if info is None:
+            raise Unsupported("not an FP register")
+        return info[1]
+
+    def read_any(self, op) -> str:
+        """Source operand that may be a GPR, an immediate or an FP register."""
+        if op.type == a64.ARM64_OP_FP:
+            return repr(float(op.fp))
+        if self.fp_of(op) is not None:
+            return self.fp_read(op)
+        return self.read(op)
 
     def mem_address(self, op, insn) -> str:
         """C expression for a memory operand's effective address."""
@@ -398,6 +477,269 @@ class Lifter:
         if m == "nop":
             return ["/* nop */"]
 
+        # -- floating point
+        # Scalar FP maps onto C's own float and double, which is the whole
+        # reason to keep the register file as a union: the arithmetic is the
+        # host's, and only the corner cases need spelling out.
+        fp3 = {"fadd": "+", "fsub": "-", "fmul": "*", "fdiv": "/"}
+        if m in fp3:
+            return [self.fp_write(
+                ops[0],
+                f"({self.fp_read(ops[1])} {fp3[m]} {self.fp_read(ops[2])})")]
+        if m == "fneg":
+            return [self.fp_write(ops[0], f"(-({self.fp_read(ops[1])}))")]
+        if m == "fabs":
+            f = "f" if self.fp_kind(ops[0]) == "s" else ""
+            return [self.fp_write(ops[0], f"fabs{f}({self.fp_read(ops[1])})")]
+        if m == "fsqrt":
+            w = "32" if self.fp_kind(ops[0]) == "s" else "64"
+            return [self.fp_write(ops[0],
+                                  f"arc_fsqrt{w}({self.fp_read(ops[1])})")]
+        rint = {"frinta": "round", "frintm": "floor", "frintp": "ceil",
+                "frintz": "trunc", "frintn": "nearbyint", "frintx": "rint",
+                "frinti": "rint"}
+        if m in rint:
+            f = "f" if self.fp_kind(ops[0]) == "s" else ""
+            return [self.fp_write(ops[0],
+                                  f"{rint[m]}{f}({self.fp_read(ops[1])})")]
+        if m in ("fmax", "fmin", "fmaxnm", "fminnm"):
+            w = "32" if self.fp_kind(ops[0]) == "s" else "64"
+            return [self.fp_write(
+                ops[0],
+                f"arc_{m}{w}({self.fp_read(ops[1])}, {self.fp_read(ops[2])})")]
+        if m in ("fcmp", "fcmpe"):
+            b = ("0.0" if ops[1].type == a64.ARM64_OP_FP
+                 else self.fp_read(ops[1]))
+            return [f"arc_fcmp(c, (double)({self.fp_read(ops[0])}), "
+                    f"(double)({b}));"]
+        if m == "fcvt":
+            return [self.fp_write(ops[0], self.fp_read(ops[1]))]
+        if m == "fcsel":
+            cond = self.cond_of(insn)
+            return [self.fp_write(ops[0],
+                                  f"(ARC_COND(c, {cond}) ? {self.fp_read(ops[1])}"
+                                  f" : {self.fp_read(ops[2])})")]
+        if m in ("fmadd", "fmsub", "fnmadd", "fnmsub"):
+            # These are *fused*: one rounding, not two. Writing them as a * b + c
+            # rounds twice and disagrees with the hardware in the last bit, which
+            # the oracle notices even though a reading of the code would not.
+            f = "f" if self.fp_kind(ops[0]) == "s" else ""
+            a, b, acc = (self.fp_read(ops[1]), self.fp_read(ops[2]),
+                         self.fp_read(ops[3]))
+            expr = {
+                "fmadd": f"fma{f}({a}, {b}, {acc})",
+                "fmsub": f"fma{f}(-({a}), {b}, {acc})",
+                "fnmadd": f"(-fma{f}({a}, {b}, {acc}))",
+                "fnmsub": f"fma{f}({a}, {b}, -({acc}))",
+            }[m]
+            return [self.fp_write(ops[0], expr)]
+
+        if m in ("scvtf", "ucvtf"):
+            idx, is64, _ = reg_of(self.md, ops[1].reg)
+            signed = m == "scvtf"
+            cast = (("int64_t" if is64 else "int32_t") if signed
+                    else ("uint64_t" if is64 else "uint32_t"))
+            val = f"ARC_X_R(c, {idx})" if is64 else f"ARC_W_R(c, {idx})"
+            expr = f"(({cast})({val}))"
+            if len(ops) > 2:  # fixed-point form: the result is scaled down
+                expr = f"({expr} / (double)(UINT64_C(1) << {ops[2].imm}))"
+            return [self.fp_write(ops[0], expr)]
+
+        cvt_round = {"fcvtzs": ("", True), "fcvtzu": ("", False),
+                     "fcvtas": ("round", True), "fcvtau": ("round", False),
+                     "fcvtms": ("floor", True), "fcvtmu": ("floor", False),
+                     "fcvtps": ("ceil", True), "fcvtpu": ("ceil", False),
+                     "fcvtns": ("nearbyint", True), "fcvtnu": ("nearbyint", False)}
+        if m in cvt_round:
+            rounder, signed = cvt_round[m]
+            idx, is64, _ = reg_of(self.md, ops[0].reg)
+            expr = self.fp_read(ops[1])
+            if len(ops) > 2:
+                expr = f"({expr} * (double)(UINT64_C(1) << {ops[2].imm}))"
+            if rounder:
+                expr = f"{rounder}((double)({expr}))"
+            fn = (("arc_f2i64" if is64 else "arc_f2i32") if signed
+                  else ("arc_f2u64" if is64 else "arc_f2u32"))
+            return [self.write(ops[0], f"{fn}((double)({expr}))")]
+
+        if m == "fmov":
+            d, src = ops[0], ops[1]
+            if src.type == a64.ARM64_OP_FP:
+                return [self.fp_write(d, repr(float(src.fp)))]
+            d_fp, s_fp = self.fp_of(d), self.fp_of(src)
+            # fmov moves *bits*, never values -- `fmov x0, d0` hands over the
+            # encoding, not the number. Converting here would be silently wrong.
+            if d_fp and s_fp:
+                return [self.fp_bits_write(d, self.fp_bits_read(src))]
+            if d_fp:
+                return [self.fp_bits_write(d, self.read(src))]
+            if s_fp:
+                return [self.write(d, self.fp_bits_read(src))]
+            raise Unsupported("fmov shape")
+
+        if m == "movi":
+            info = self.fp_of(ops[0])
+            imm = ops[1]
+            if info and imm.type == a64.ARM64_OP_IMM and imm.imm == 0 \
+                    and not imm.shift.value:
+                return [f"arc_v_clear(c, {info[0]});"]
+            raise Unsupported("movi non-zero")
+
+        # -- acquire / release
+        # Plain accesses plus the ordering the host already gives us: lifted
+        # code runs on real threads, so a C11-visible barrier is what these
+        # need, not a model of the guest's memory system.
+        acq = {"ldar": None, "ldarb": "uint8_t", "ldarh": "uint16_t"}
+        rel = {"stlr": None, "stlrb": "uint8_t", "stlrh": "uint16_t"}
+        if m in acq:
+            return self.emit_load(insn, ops, acq[m])
+        if m in rel:
+            return self.emit_store(insn, ops, rel[m])
+
+        # -- exclusives
+        ldx = {"ldxr": 0, "ldaxr": 0, "ldxrb": 1, "ldaxrb": 1,
+               "ldxrh": 2, "ldaxrh": 2}
+        stx = {"stxr": 0, "stlxr": 0, "stxrb": 1, "stlxrb": 1,
+               "stxrh": 2, "stlxrh": 2}
+        if m in ldx:
+            d, mem = ops[0], self.find_mem(ops)
+            if mem is None:
+                raise Unsupported("exclusive addressing")
+            size = ldx[m] or (8 if reg_of(self.md, d.reg)[1] else 4)
+            addr = self.mem_address(mem, insn)
+            return [self.write(d, f"arc_load_exclusive(c, {addr}, {size})")]
+        if m in stx:
+            status, val, mem = ops[0], ops[1], self.find_mem(ops)
+            if mem is None:
+                raise Unsupported("exclusive addressing")
+            size = stx[m] or (8 if reg_of(self.md, val.reg)[1] else 4)
+            addr = self.mem_address(mem, insn)
+            return [self.write(
+                status,
+                f"arc_store_exclusive(c, {addr}, {self.read(val)}, {size})")]
+
+        # -- bitfield
+        # Capstone hands these over as (dest, source, lsb, width), which is the
+        # assembler's spelling rather than the encoding's.
+        if m in ("ubfx", "sbfx", "ubfiz", "sbfiz", "bfi", "bfxil"):
+            d, src = ops[0], ops[1]
+            lsb, width = ops[2].imm, ops[3].imm
+            is64 = self.dest_is64(d)
+            cast = "uint64_t" if is64 else "uint32_t"
+            signed = "int64_t" if is64 else "int32_t"
+            bits = 64 if is64 else 32
+            mask = (1 << width) - 1
+            val = self.read(src)
+            if m in ("ubfx", "sbfx"):
+                expr = f"((({cast})({val}) >> {lsb}) & UINT64_C({mask}))"
+                if m == "sbfx":
+                    expr = f"arc_sext{bits}({expr}, {width})"
+                return [self.write(d, expr)]
+            if m in ("ubfiz", "sbfiz"):
+                field = f"((({cast})({val})) & UINT64_C({mask}))"
+                if m == "sbfiz":
+                    field = f"arc_sext{bits}({field}, {width})"
+                return [self.write(d, f"(({cast})({field}) << {lsb})")]
+            didx, _, _ = reg_of(self.md, d.reg)
+            cur = f"ARC_X_R(c, {didx})" if is64 else f"ARC_W_R(c, {didx})"
+            if m == "bfi":
+                keep = ~(mask << lsb) & ((1 << bits) - 1)
+                ins = f"(((({cast})({val})) & UINT64_C({mask})) << {lsb})"
+                return [self.write(d, f"((({cast})({cur}) & UINT64_C({keep})) | {ins})")]
+            # bfxil: take the field from the source, keep the rest of dest
+            keep = ~mask & ((1 << bits) - 1)
+            ins = f"(((({cast})({val})) >> {lsb}) & UINT64_C({mask}))"
+            return [self.write(d, f"((({cast})({cur}) & UINT64_C({keep})) | {ins})")]
+
+        # -- widening and high multiplies
+        long_mul = {"smull": ("int64_t", "int32_t", None),
+                    "umull": ("uint64_t", "uint32_t", None),
+                    "smaddl": ("int64_t", "int32_t", "+"),
+                    "umaddl": ("uint64_t", "uint32_t", "+"),
+                    "smsubl": ("int64_t", "int32_t", "-"),
+                    "umsubl": ("uint64_t", "uint32_t", "-")}
+        if m in long_mul:
+            wide, narrow, acc_op = long_mul[m]
+            a = f"(({wide})({narrow})({self.read(ops[1])}))"
+            b = f"(({wide})({narrow})({self.read(ops[2])}))"
+            prod = f"({a} * {b})"
+            if acc_op:
+                prod = f"((({wide})({self.read(ops[3])})) {acc_op} {prod})"
+            return [self.write(ops[0], prod)]
+        if m in ("smulh", "umulh"):
+            fn = "arc_smulh" if m == "smulh" else "arc_umulh"
+            return [self.write(ops[0],
+                               f"{fn}({self.read(ops[1])}, {self.read(ops[2])})")]
+
+        # -- conditional negate / invert / compare
+        if m in ("cneg", "cinv"):
+            cond = self.cond_of(insn)
+            d = ops[0]
+            cast = "uint64_t" if self.dest_is64(d) else "uint32_t"
+            v = self.read(ops[1])
+            alt = f"(({cast})0 - ({cast})({v}))" if m == "cneg" else f"(~({cast})({v}))"
+            return [self.write(d, f"(ARC_COND(c, {cond}) ? {alt} : ({v}))")]
+        if m in ("ccmp", "ccmn"):
+            # When the condition does not hold, the flags are *assigned* the
+            # immediate rather than computed -- that is the whole point of the
+            # instruction, and it is easy to read past.
+            cond = self.cond_of(insn)
+            a, b, nzcv = ops[0], ops[1], ops[2].imm
+            is64 = reg_of(self.md, a.reg)[1]
+            w = "64" if is64 else "32"
+            fn = f"arc_sub{w}" if m == "ccmp" else f"arc_add{w}"
+            args = (f"c, {self.read(a)}, {self.read(b)}" if m == "ccmp"
+                    else f"c, {self.read(a)}, {self.read(b)}, 0")
+            return [f"if (ARC_COND(c, {cond})) {{ (void){fn}({args}); }}",
+                    f"else {{ (c)->nf = {(nzcv >> 3) & 1}; (c)->zf = {(nzcv >> 2) & 1};",
+                    f"        (c)->cf = {(nzcv >> 1) & 1}; (c)->vf = {nzcv & 1}; }}"]
+
+        # -- bit twiddling
+        if m == "extr":
+            d = ops[0]
+            is64 = self.dest_is64(d)
+            cast = "uint64_t" if is64 else "uint32_t"
+            bits = 64 if is64 else 32
+            lsb = ops[3].imm
+            hi, lo = self.read(ops[1]), self.read(ops[2])
+            if lsb == 0:
+                return [self.write(d, f"(({cast})({lo}))")]
+            return [self.write(d, f"((({cast})({lo}) >> {lsb}) | "
+                                  f"(({cast})({hi}) << {bits - lsb}))")]
+        if m in ("clz", "rbit", "rev", "rev16", "rev32"):
+            d = ops[0]
+            w = "64" if self.dest_is64(d) else "32"
+            fn = {"clz": f"arc_clz{w}", "rbit": f"arc_rbit{w}",
+                  "rev": f"arc_rev{w}", "rev16": f"arc_rev16_{w}",
+                  "rev32": "arc_rev32_64"}[m]
+            return [self.write(d, f"{fn}({self.read(ops[1])})")]
+
+        # -- unscaled signed loads
+        unscaled = {"ldursb": "int8_t", "ldursh": "int16_t", "ldursw": "int32_t"}
+        if m in unscaled:
+            return self.emit_load(insn, ops, unscaled[m])
+        if m == "ldpsw":
+            a, b, mem = ops[0], ops[1], self.find_mem(ops)
+            if mem is None:
+                raise Unsupported("ldpsw addressing")
+            addr = self.mem_address(mem, insn)
+            return [self.write(a, f"(int64_t)(int32_t)arc_ld32({addr})"),
+                    self.write(b, f"(int64_t)(int32_t)arc_ld32({addr} + 4)")
+                    ] + self.writeback(insn, mem)
+
+        # -- system registers
+        # TPIDR_EL0 is the thread pointer. Nothing else is reachable from user
+        # code in a way a game depends on, so anything else is left unsupported
+        # rather than answered with a plausible lie.
+        if m == "mrs":
+            if "tpidr_el0" in insn.op_str.lower():
+                return [self.write(ops[0], "arc_tpidr_read()")]
+            raise Unsupported(f"mrs {insn.op_str.split(',')[-1].strip()}")
+        if m == "msr":
+            if "tpidr_el0" in insn.op_str.lower():
+                return [f"arc_tpidr_write({self.read(ops[1])});"]
+            raise Unsupported("msr")
+
         raise Unsupported(m)
 
     def cond_of(self, insn) -> int:
@@ -407,11 +749,65 @@ class Lifter:
             raise Unsupported("condition")
         return cc - 1  # capstone numbers conditions from 1
 
+    def emit_fp_load(self, insn, d, mem, addr) -> list[str]:
+        idx, kind = self.fp_of(d)
+        if kind == "q":
+            return [f"arc_q_w(c, {idx}, arc_ld64({addr}), arc_ld64({addr} + 8));"]
+        setter = {"b": ("arc_su_w", "arc_ld8"), "h": ("arc_su_w", "arc_ld16"),
+                  "s": ("arc_su_w", "arc_ld32"), "d": ("arc_du_w", "arc_ld64")}
+        if kind not in setter:
+            raise Unsupported(f"FP load of {kind}")
+        set_fn, ld_fn = setter[kind]
+        return [f"{set_fn}(c, {idx}, {ld_fn}({addr}));"]
+
+    def emit_fp_store(self, insn, srcop, mem, addr) -> list[str]:
+        idx, kind = self.fp_of(srcop)
+        if kind == "q":
+            return [f"arc_st64({addr}, (c)->q[{idx}].u64[0]);",
+                    f"arc_st64({addr} + 8, (c)->q[{idx}].u64[1]);"]
+        st = {"b": ("arc_st8", "u8"), "h": ("arc_st16", "u16"),
+              "s": ("arc_st32", "u32"), "d": ("arc_st64", "u64")}
+        if kind not in st:
+            raise Unsupported(f"FP store of {kind}")
+        st_fn, view = st[kind]
+        return [f"{st_fn}({addr}, (c)->q[{idx}].{view}[0]);"]
+
+    def find_mem(self, ops):
+        """The memory operand, or None for a literal (PC-relative) access.
+
+        Position is not reliable: a post-indexed access puts its increment
+        *after* the memory operand, so `ops[-1]` is an immediate there while a
+        pre-indexed one ends with the memory operand. Taking the last operand
+        and testing its type conflates a post-index with a literal, which
+        produces a load from the displacement itself.
+        """
+        for op in ops:
+            if op.type == a64.ARM64_OP_MEM:
+                return op
+        return None
+
     def emit_load(self, insn, ops, cast) -> list[str]:
-        d, mem = ops[0], ops[-1]
+        d = ops[0]
+        mem = self.find_mem(ops)
+        if mem is None:
+            mem = ops[-1]
+        if mem.type == a64.ARM64_OP_IMM:
+            # A literal load: `ldr x0, <address>`, reading a constant pooled
+            # near the code. Capstone resolves the PC-relative offset to an
+            # absolute address in the image, so it only needs rebasing.
+            addr = f"((c)->image_base + UINT64_C({mem.imm}))"
+            if self.fp_of(d) is not None:
+                return self.emit_fp_load(insn, d, mem, addr)
+            is64 = self.dest_is64(d)
+            if cast == "int32_t":
+                return [self.write(d, f"(int64_t)(int32_t)arc_ld32({addr})")]
+            fn = "arc_ld64" if is64 else "arc_ld32"
+            return [self.write(d, f"{fn}({addr})")]
         if mem.type != a64.ARM64_OP_MEM:
             raise Unsupported("load addressing")
         addr = self.mem_address(mem, insn)
+        if self.fp_of(d) is not None:
+            return self.emit_fp_load(insn, d, mem, addr) + self.writeback(insn, mem)
         is64 = self.dest_is64(d)
         if cast is None:
             fn = "arc_ld64" if is64 else "arc_ld32"
@@ -426,10 +822,13 @@ class Lifter:
         return [self.write(d, expr)] + self.writeback(insn, mem)
 
     def emit_store(self, insn, ops, cast) -> list[str]:
-        s, mem = ops[0], ops[-1]
-        if mem.type != a64.ARM64_OP_MEM:
+        s = ops[0]
+        mem = self.find_mem(ops)
+        if mem is None:
             raise Unsupported("store addressing")
         addr = self.mem_address(mem, insn)
+        if self.fp_of(s) is not None:
+            return self.emit_fp_store(insn, s, mem, addr) + self.writeback(insn, mem)
         is64 = reg_of(self.md, s.reg)[1]
         if cast is None:
             fn = "arc_st64" if is64 else "arc_st32"
@@ -438,10 +837,23 @@ class Lifter:
         return [f"{fn}({addr}, {self.read(s)});"] + self.writeback(insn, mem)
 
     def emit_pair(self, insn, ops, is_load) -> list[str]:
-        a, b, mem = ops[0], ops[1], ops[2]
-        if mem.type != a64.ARM64_OP_MEM:
+        a, b = ops[0], ops[1]
+        mem = self.find_mem(ops)
+        if mem is None:
             raise Unsupported("pair addressing")
         addr = self.mem_address(mem, insn)
+        if self.fp_of(a) is not None:
+            idx, kind = self.fp_of(a)
+            step = FP_BYTES.get(kind)
+            if step is None:
+                raise Unsupported(f"FP pair of {kind}")
+            if is_load:
+                body = (self.emit_fp_load(insn, a, mem, addr) +
+                        self.emit_fp_load(insn, b, mem, f"({addr} + {step})"))
+            else:
+                body = (self.emit_fp_store(insn, a, mem, addr) +
+                        self.emit_fp_store(insn, b, mem, f"({addr} + {step})"))
+            return body + self.writeback(insn, mem)
         is64 = reg_of(self.md, a.reg)[1]
         step = 8 if is64 else 4
         ld, st = ("arc_ld64", "arc_st64") if is64 else ("arc_ld32", "arc_st32")

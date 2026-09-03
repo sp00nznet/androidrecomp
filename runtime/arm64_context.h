@@ -14,6 +14,7 @@
 // relative to `image_base`, which the host fills in after loading.
 #pragma once
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -163,6 +164,247 @@ static inline void arc_st16(uint64_t a, uint16_t v) {
 static inline void arc_st8(uint64_t a, uint8_t v) {
   *(uint8_t*)(uintptr_t)a = v;
 }
+
+// --- floating point --------------------------------------------------------
+// The scalar FP registers are views onto lane 0 of the vector file. Writing any
+// of them zeroes the remaining bits of the 128 -- the FP counterpart of a
+// 32-bit GPR write zero-extending, and just as easy to forget, so it lives in
+// the setters rather than in every emitter.
+
+#define ARC_B_R(c, n) ((c)->q[n].u8[0])
+#define ARC_H_R(c, n) ((c)->q[n].u16[0])
+#define ARC_S_R(c, n) ((c)->q[n].f32[0])
+#define ARC_D_R(c, n) ((c)->q[n].f64[0])
+#define ARC_SU_R(c, n) ((c)->q[n].u32[0])
+#define ARC_DU_R(c, n) ((c)->q[n].u64[0])
+
+static inline void arc_v_clear(Arm64Ctx* c, unsigned n) {
+  c->q[n].u64[0] = 0;
+  c->q[n].u64[1] = 0;
+}
+static inline void arc_s_w(Arm64Ctx* c, unsigned n, float v) {
+  arc_v_clear(c, n);
+  c->q[n].f32[0] = v;
+}
+static inline void arc_d_w(Arm64Ctx* c, unsigned n, double v) {
+  arc_v_clear(c, n);
+  c->q[n].f64[0] = v;
+}
+static inline void arc_su_w(Arm64Ctx* c, unsigned n, uint32_t v) {
+  arc_v_clear(c, n);
+  c->q[n].u32[0] = v;
+}
+static inline void arc_du_w(Arm64Ctx* c, unsigned n, uint64_t v) {
+  arc_v_clear(c, n);
+  c->q[n].u64[0] = v;
+}
+static inline void arc_q_w(Arm64Ctx* c, unsigned n, uint64_t lo, uint64_t hi) {
+  c->q[n].u64[0] = lo;
+  c->q[n].u64[1] = hi;
+}
+
+// `fcmp` does not set flags the way an integer compare does, and the fourth
+// case is the one that catches people: an unordered result (either operand
+// NaN) sets C and V, not Z.
+static inline void arc_fcmp(Arm64Ctx* c, double a, double b) {
+  if (a != a || b != b) {        /* unordered */
+    c->nf = 0; c->zf = 0; c->cf = 1; c->vf = 1;
+  } else if (a == b) {
+    c->nf = 0; c->zf = 1; c->cf = 1; c->vf = 0;
+  } else if (a < b) {
+    c->nf = 1; c->zf = 0; c->cf = 0; c->vf = 0;
+  } else {
+    c->nf = 0; c->zf = 0; c->cf = 1; c->vf = 0;
+  }
+}
+
+// Minimum and maximum are two operations here, not one, and C only implements
+// the other one. ARM's `fmin`/`fmax` *propagate* NaN; its `fminnm`/`fmaxnm` are
+// the IEEE forms that ignore it, which is what C's `fmin`/`fmax` do. Using the
+// C function for the propagating form quietly returns a number where the
+// hardware returns NaN.
+//
+// The zero case is the other half: min(+0, -0) is -0 and max(+0, -0) is +0, but
+// +0 == -0 compares equal, so a plain `a < b ? a : b` picks by argument order.
+
+static inline float arc_quiet32(float v) {
+  uint32_t b;
+  memcpy(&b, &v, 4);
+  b |= 0x00400000u;  // set the quiet bit, preserving the payload
+  memcpy(&v, &b, 4);
+  return v;
+}
+static inline double arc_quiet64(double v) {
+  uint64_t b;
+  memcpy(&b, &v, 8);
+  b |= UINT64_C(0x0008000000000000);
+  memcpy(&v, &b, 8);
+  return v;
+}
+// The default NaN is positive: sign clear, quiet bit set, payload zero.
+static inline float arc_dnan32(void) {
+  uint32_t b = 0x7FC00000u;
+  float v;
+  memcpy(&v, &b, 4);
+  return v;
+}
+static inline double arc_dnan64(void) {
+  uint64_t b = UINT64_C(0x7FF8000000000000);
+  double v;
+  memcpy(&v, &b, 8);
+  return v;
+}
+
+#define ARC_MINMAX(suffix, type, quiet)                                    \
+  static inline type arc_fmin##suffix(type a, type b) {                    \
+    if (a != a) return quiet(a);                                           \
+    if (b != b) return quiet(b);                                           \
+    if (a == b) return signbit(a) ? a : b;                                 \
+    return a < b ? a : b;                                                  \
+  }                                                                        \
+  static inline type arc_fmax##suffix(type a, type b) {                    \
+    if (a != a) return quiet(a);                                           \
+    if (b != b) return quiet(b);                                           \
+    if (a == b) return signbit(a) ? b : a;                                 \
+    return a > b ? a : b;                                                  \
+  }                                                                        \
+  static inline type arc_fminnm##suffix(type a, type b) {                  \
+    if (a != a) return b;                                                  \
+    if (b != b) return a;                                                  \
+    if (a == b) return signbit(a) ? a : b;                                 \
+    return a < b ? a : b;                                                  \
+  }                                                                        \
+  static inline type arc_fmaxnm##suffix(type a, type b) {                  \
+    if (a != a) return b;                                                  \
+    if (b != b) return a;                                                  \
+    if (a == b) return signbit(a) ? b : a;                                 \
+    return a > b ? a : b;                                                  \
+  }
+ARC_MINMAX(32, float, arc_quiet32)
+ARC_MINMAX(64, double, arc_quiet64)
+#undef ARC_MINMAX
+
+// The square root of a negative is an invalid operation, and the architecture
+// answers it with the *default* NaN -- sign clear. C's sqrt returns a negative
+// NaN, which differs in exactly one bit and would never be noticed by reading.
+static inline float arc_fsqrt32(float v) {
+  if (v != v) return arc_quiet32(v);
+  if (v < 0.0f) return arc_dnan32();
+  return sqrtf(v);
+}
+static inline double arc_fsqrt64(double v) {
+  if (v != v) return arc_quiet64(v);
+  if (v < 0.0) return arc_dnan64();
+  return sqrt(v);
+}
+
+// Float-to-integer conversion is saturating on this architecture, and NaN
+// converts to zero. In C the same cast is undefined behaviour once the value
+// does not fit, so it cannot simply be written as a cast -- the compiler is
+// entitled to produce anything at all, and at -O2 frequently does.
+static inline int64_t arc_f2i64(double v) {
+  if (v != v) return 0;
+  if (v >= 9223372036854775808.0) return INT64_MAX;
+  if (v <= -9223372036854775808.0) return INT64_MIN;
+  return (int64_t)v;
+}
+static inline int32_t arc_f2i32(double v) {
+  if (v != v) return 0;
+  if (v >= 2147483648.0) return INT32_MAX;
+  if (v <= -2147483649.0) return INT32_MIN;
+  return (int32_t)v;
+}
+static inline uint64_t arc_f2u64(double v) {
+  if (v != v || v <= 0.0) return 0;
+  if (v >= 18446744073709551616.0) return UINT64_MAX;
+  return (uint64_t)v;
+}
+static inline uint32_t arc_f2u32(double v) {
+  if (v != v || v <= 0.0) return 0;
+  if (v >= 4294967296.0) return UINT32_MAX;
+  return (uint32_t)v;
+}
+
+// --- exclusives ------------------------------------------------------------
+// A load-exclusive / store-exclusive pair is modelled as a reservation
+// remembered per thread, and the store as a compare-exchange against the value
+// the load saw. That is not what the hardware does -- it reserves an address,
+// not a value -- but it fails in the same direction: a store can spuriously
+// fail, never spuriously succeed, and every correct guest loop already retries.
+typedef struct {
+  uint64_t address;
+  uint64_t value;
+  int valid;
+} Arm64Reservation;
+
+uint64_t arc_load_exclusive(Arm64Ctx* c, uint64_t addr, int bytes);
+uint32_t arc_store_exclusive(Arm64Ctx* c, uint64_t addr, uint64_t value,
+                             int bytes);
+
+// --- bit manipulation ------------------------------------------------------
+// Sign-extending a field means shifting its top bit up to the register's top
+// and back down arithmetically. Spelled once here rather than inline in the
+// emitters, where the parentheses become unreadable.
+static inline uint64_t arc_sext64(uint64_t v, unsigned width) {
+  unsigned up = 64 - width;
+  return (uint64_t)(((int64_t)(v << up)) >> up);
+}
+static inline uint32_t arc_sext32(uint32_t v, unsigned width) {
+  unsigned up = 32 - width;
+  return (uint32_t)(((int32_t)(v << up)) >> up);
+}
+
+static inline uint64_t arc_clz64(uint64_t v) {
+  uint64_t n = 0;
+  if (!v) return 64;
+  while (!(v >> 63)) { v <<= 1; ++n; }
+  return n;
+}
+static inline uint32_t arc_clz32(uint32_t v) {
+  uint32_t n = 0;
+  if (!v) return 32;
+  while (!(v >> 31)) { v <<= 1; ++n; }
+  return n;
+}
+static inline uint64_t arc_rbit64(uint64_t v) {
+  uint64_t r = 0;
+  for (int i = 0; i < 64; ++i) { r = (r << 1) | (v & 1); v >>= 1; }
+  return r;
+}
+static inline uint32_t arc_rbit32(uint32_t v) {
+  uint32_t r = 0;
+  for (int i = 0; i < 32; ++i) { r = (r << 1) | (v & 1); v >>= 1; }
+  return r;
+}
+static inline uint64_t arc_rev64(uint64_t v) {
+  uint64_t r = 0;
+  for (int i = 0; i < 8; ++i) { r = (r << 8) | (v & 0xFF); v >>= 8; }
+  return r;
+}
+static inline uint32_t arc_rev32(uint32_t v) {
+  return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+         ((v >> 8) & 0xFF00u) | ((v >> 24) & 0xFFu);
+}
+// rev16 reverses bytes within each halfword, rev32 within each word.
+static inline uint32_t arc_rev16_32(uint32_t v) {
+  return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+}
+static inline uint64_t arc_rev16_64(uint64_t v) {
+  return ((v & UINT64_C(0x00FF00FF00FF00FF)) << 8) |
+         ((v >> 8) & UINT64_C(0x00FF00FF00FF00FF));
+}
+static inline uint64_t arc_rev32_64(uint64_t v) {
+  return ((uint64_t)arc_rev32((uint32_t)v) << 32) |
+         arc_rev32((uint32_t)(v >> 32));
+}
+
+uint64_t arc_smulh(uint64_t a, uint64_t b);
+uint64_t arc_umulh(uint64_t a, uint64_t b);
+
+// TPIDR_EL0 is the thread pointer. Bionic owns it on Android; here the guest
+// gets one per host thread, which it may read and write as it likes.
+uint64_t arc_tpidr_read(void);
+void arc_tpidr_write(uint64_t v);
 
 // --- indirect control flow -------------------------------------------------
 // Every `blr`/`br` target is looked up in a sorted address -> function table

@@ -47,6 +47,9 @@ SCRATCH_SIZE = 0x4000
 
 UC_X = [getattr(uc64, f"UC_ARM64_REG_X{i}") for i in range(29)] + [
     uc64.UC_ARM64_REG_X29, uc64.UC_ARM64_REG_X30]
+# Comparing the vector file matters as much as the general one: without it
+# every FP emitter would "pass" by not being looked at.
+UC_Q = [getattr(uc64, f"UC_ARM64_REG_Q{i}") for i in range(32)]
 
 
 class Ctx(ctypes.Structure):
@@ -104,6 +107,10 @@ def harvest(path: str, per_form: int, only: set[str] | None):
             continue
         if insn.mnemonic in ("adr", "adrp"):
             continue
+        # Literal loads read through image_base, and the harness has no image.
+        if (insn.mnemonic.startswith(("ldr", "str")) and
+                not any(o.type == a64.ARM64_OP_MEM for o in insn.operands)):
+            continue
         form = operand_shape(md, insn)
         if len(buckets[form]) < per_form:
             buckets[form].append(insn)
@@ -131,15 +138,19 @@ def build_dll(lifter: Lifter, cases: list, workdir: str) -> ctypes.CDLL | None:
 
     runtime = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "runtime")
+    # The exclusives live in the runtime rather than being emitted inline, so
+    # the test module has to link them too.
+    rt_c = os.path.join(runtime, "arm64_runtime.c")
     dll = os.path.join(workdir, "cases.dll" if os.name == "nt" else "cases.so")
     if os.name == "nt":
         defs = os.path.join(workdir, "cases.def")
         with open(defs, "w") as fh:
             fh.write("EXPORTS\n" + "\n".join(exports + ["ctx_size"]) + "\n")
-        cmd = ["cl", "/nologo", "/LD", "/O2", "/I", runtime, c_path,
+        cmd = ["cl", "/nologo", "/LD", "/O2", "/I", runtime, c_path, rt_c,
                f"/Fe:{dll}", f"/Fo:{workdir}\\", "/link", f"/DEF:{defs}"]
     else:
-        cmd = ["cc", "-shared", "-fPIC", "-O2", "-I", runtime, c_path, "-o", dll]
+        cmd = ["cc", "-shared", "-fPIC", "-O2", "-I", runtime, c_path, rt_c,
+               "-lm", "-o", dll]
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
     if proc.returncode != 0:
         print(proc.stdout[-4000:])
@@ -165,6 +176,7 @@ def run_case(lib, index, insn, scratch_addr, rng) -> tuple[bool, str]:
             name = insn._cs.reg_name(op.mem.index)
             if name and name[0] in "xw" and name[1:].isdigit():
                 regs[int(name[1:])] = rng.randrange(0, 16)
+    qregs = [rng.getrandbits(128) for _ in range(32)]
     sp = scratch_addr + SCRATCH_SIZE // 2
     nzcv = rng.getrandbits(4)
     seed_mem = bytes(rng.getrandbits(8) for _ in range(SCRATCH_SIZE))
@@ -177,6 +189,8 @@ def run_case(lib, index, insn, scratch_addr, rng) -> tuple[bool, str]:
     uc.mem_write(scratch_addr, seed_mem)
     for i, r in enumerate(regs):
         uc.reg_write(UC_X[i], r)
+    for i, q in enumerate(qregs):
+        uc.reg_write(UC_Q[i], q)
     uc.reg_write(uc64.UC_ARM64_REG_SP, sp)
     uc.reg_write(uc64.UC_ARM64_REG_NZCV, nzcv << 28)
     try:
@@ -186,25 +200,38 @@ def run_case(lib, index, insn, scratch_addr, rng) -> tuple[bool, str]:
     want = [uc.reg_read(UC_X[i]) for i in range(31)]
     want_sp = uc.reg_read(uc64.UC_ARM64_REG_SP)
     want_nzcv = (uc.reg_read(uc64.UC_ARM64_REG_NZCV) >> 28) & 0xF
+    want_q = [uc.reg_read(UC_Q[i]) for i in range(32)]
     want_mem = bytes(uc.mem_read(scratch_addr, SCRATCH_SIZE))
 
     # --- lifted
     ctx = Ctx()
     for i, r in enumerate(regs):
         ctx.x[i] = r
+    for i, q in enumerate(qregs):
+        ctx.q[i][0] = q & 0xFFFFFFFFFFFFFFFF
+        ctx.q[i][1] = q >> 64
     ctx.sp = sp
     ctx.nf = (nzcv >> 3) & 1
     ctx.zf = (nzcv >> 2) & 1
     ctx.cf = (nzcv >> 1) & 1
     ctx.vf = nzcv & 1
     ctypes.memmove(scratch_addr, seed_mem, SCRATCH_SIZE)
-    getattr(lib, f"t{index}")(ctypes.byref(ctx))
+    try:
+        getattr(lib, f"t{index}")(ctypes.byref(ctx))
+    except OSError as e:
+        # A lifted case that faults is a failing case, not a reason to abandon
+        # the sweep -- the whole point is to find out which one.
+        return False, f"faulted: {e}"
 
     for i in range(31):
         if ctx.x[i] != want[i]:
             return False, f"x{i}: lifted {ctx.x[i]:#x} != unicorn {want[i]:#x}"
     if ctx.sp != want_sp:
         return False, f"sp: lifted {ctx.sp:#x} != unicorn {want_sp:#x}"
+    for i in range(32):
+        got = ctx.q[i][0] | (ctx.q[i][1] << 64)
+        if got != want_q[i]:
+            return False, f"q{i}: lifted {got:#034x} != unicorn {want_q[i]:#034x}"
     got_nzcv = (ctx.nf << 3) | (ctx.zf << 2) | (ctx.cf << 1) | ctx.vf
     if got_nzcv != want_nzcv:
         return False, f"nzcv: lifted {got_nzcv:04b} != unicorn {want_nzcv:04b}"
