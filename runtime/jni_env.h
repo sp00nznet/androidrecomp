@@ -31,6 +31,10 @@ void arc_jni_register(void);
 size_t arc_jni_call_count(void);
 void arc_jni_report(void);
 
+// Whether an address is one of the stand-in handles, so a fault on one can be
+// reported as such rather than as an unattributable number.
+int arc_jni_owns(uint64_t address);
+
 #ifdef __cplusplus
 }
 #endif

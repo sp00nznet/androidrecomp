@@ -68,6 +68,7 @@ std::string ExplainAddress(uint64_t addr) {
   for (const auto& u : g_unresolved)
     if (u.first == addr)
       return "unresolved import " + u.second;
+  if (arc_jni_owns(addr)) return "past the end of a stand-in JNI handle";
   for (const Mapping& m : g_mappings) {
     if (addr >= m.base && addr < m.base + m.span) {
       char buf[160];
