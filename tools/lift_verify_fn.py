@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Differential-test whole lifted functions against Unicorn.
+
+`lift_verify.py` checks one instruction at a time, which deliberately excludes
+control flow. This checks entire functions: the branches, the `goto` web a
+lifted function turns into, and the register state that survives across them.
+
+The mechanism that makes it possible is that the lifted program runs against
+the *real* image -- its constants, vtables and relocated pointers -- mapped at
+a real host address. The oracle is given its own copy at the same numeric
+address, so a load of a global reads the same bytes on both sides.
+
+    python tools/lift_verify_fn.py libengine.so --generated generated/
+    python tools/lift_verify_fn.py libengine.so --generated generated/ --count 200
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import glob
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from elftools.elf.elffile import ELFFile
+
+try:
+    from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+    from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN, UcError
+    from unicorn import arm64_const as uc64
+except ImportError as e:
+    sys.exit(f"need capstone and unicorn: pip install capstone unicorn ({e})")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lifter import functions_from_eh_frame  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STACK_SIZE = 0x10000
+ARG_SIZE = 0x4000
+SENTINEL = 0x6FFF_0000  # where a returning function lands
+
+UC_X = [getattr(uc64, f"UC_ARM64_REG_X{i}") for i in range(29)] + [
+    uc64.UC_ARM64_REG_X29, uc64.UC_ARM64_REG_X30]
+UC_Q = [getattr(uc64, f"UC_ARM64_REG_Q{i}") for i in range(32)]
+
+# Instructions that would take the test outside the function under examination.
+# A call would run arbitrarily deep and could reach an unlifted stub; a syscall
+# has no meaning in either world here.
+ESCAPES = ("bl", "blr", "br", "svc", "brk", "hvc", "smc")
+
+
+class Ctx(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_uint64 * 32),
+        ("sp", ctypes.c_uint64),
+        ("lr_shadow", ctypes.c_uint64),
+        ("nf", ctypes.c_uint32), ("zf", ctypes.c_uint32),
+        ("cf", ctypes.c_uint32), ("vf", ctypes.c_uint32),
+        ("q", (ctypes.c_uint64 * 2) * 32),
+        ("image_base", ctypes.c_uint64),
+    ]
+
+
+def build(generated: str, workdir: str):
+    """Build the lifted program through CMake and load the result.
+
+    CMake already knows where this project's dependencies are, because it found
+    them for the host build. Reproducing that discovery here would be a second
+    place to keep in step with the first.
+    """
+    # Forward slashes: a backslash in a CMake -D argument is an escape, so
+    # "G:\\recomp" arrives with a carriage return in it and the glob finds
+    # nothing -- silently, because an empty glob is not an error to CMake.
+    generated = os.path.abspath(generated).replace("\\", "/")
+    print("configuring and building the lifted program ...")
+    cfg = ["cmake", "-S", ROOT.replace("\\", "/"), "-B", workdir.replace("\\", "/"),
+           "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+           f"-DARC_LIFTED_DIR={generated}"]
+    toolchain = os.environ.get("CMAKE_TOOLCHAIN_FILE")
+    if toolchain:
+        cfg.append(f"-DCMAKE_TOOLCHAIN_FILE={toolchain}")
+    elif os.name == "nt" and os.path.exists(r"C:\vcpkg\scripts\buildsystems\vcpkg.cmake"):
+        cfg.append(r"-DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake")
+    for cmd in (cfg, ["cmake", "--build", workdir, "--target", "lifted"]):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        for line in proc.stdout.splitlines():
+            if "lifted program" in line or "no generated C" in line:
+                print(f"  {line.strip()}")
+        if proc.returncode != 0:
+            print(proc.stdout[-6000:])
+            print(proc.stderr[-4000:], file=sys.stderr)
+            sys.exit("the lifted program did not build")
+
+    for root, _, files in os.walk(workdir):
+        for f in files:
+            if f in ("lifted.dll", "liblifted.so", "liblifted.dylib"):
+                path = os.path.join(root, f)
+                # Windows resolves a DLL's own dependencies from its directory.
+                if os.name == "nt":
+                    os.add_dll_directory(root)
+                    host_build = os.path.join(ROOT, "build")
+                    if os.path.isdir(host_build):
+                        os.add_dll_directory(host_build)
+                return ctypes.CDLL(path)
+    sys.exit("built, but no lifted library was produced")
+
+
+def generated_functions(generated: str) -> set:
+    """Addresses the generated program actually defines.
+
+    A partial lift is a normal thing to test, and calling a function that was
+    never emitted would reach a trapping stub and abort the run rather than
+    report anything. So candidates are drawn from what exists.
+    """
+    header = os.path.join(generated, "lifted.h")
+    out = set()
+    if not os.path.exists(header):
+        return out
+    with open(header, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("void fn_"):
+                out.add(int(line[8:line.index("(")], 16))
+    # The header declares the trapping stubs too -- they have to exist so the
+    # program links. Calling one is exactly what it is for, and exactly what a
+    # verification run must not do.
+    stubs = os.path.join(generated, "stubs.c")
+    if os.path.exists(stubs):
+        with open(stubs, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("void fn_"):
+                    out.discard(int(line[8:line.index("(")], 16))
+    return out
+
+
+def pick_functions(path: str, count: int, rng, available: set):
+    """Self-contained functions with real control flow in them."""
+    md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+    md.detail = True
+    with open(path, "rb") as fh:
+        elf = ELFFile(fh)
+        text = elf.get_section_by_name(".text")
+        addr, blob = text["sh_addr"], text.data()
+        funcs = functions_from_eh_frame(elf)
+
+    candidates = []
+    for start, size in funcs:
+        if not (16 <= size <= 400):
+            continue
+        if available and start not in available:
+            continue
+        off = start - addr
+        if off < 0 or off + size > len(blob):
+            continue
+        body = blob[off:off + size]
+        insns = list(md.disasm(body, start))
+        if len(insns) * 4 != size:
+            continue  # data in the middle; not a clean function
+        if any(i.mnemonic.startswith(ESCAPES) for i in insns):
+            continue
+        # "Self-contained" has to mean it too. A plain `b` to an address outside
+        # the function is a tail call, and following one can land in a function
+        # that never lifted -- which traps and takes the whole run with it.
+        if any(not (start <= op.imm < start + size)
+               for i in insns
+               for op in i.operands
+               if op.type == 2 and  # ARM64_OP_IMM
+               i.mnemonic.startswith(("b", "cb", "tb")) and
+               i.mnemonic not in ("bfi", "bfxil", "bic", "bics")):
+            continue
+        if not any(i.mnemonic.startswith(("b", "cb", "tb")) and
+                   i.mnemonic != "bfi" for i in insns):
+            continue  # no control flow: the instruction harness covers those
+        candidates.append((start, size, body))
+    rng.shuffle(candidates)
+    return candidates[:count]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("library")
+    ap.add_argument("--generated", default="generated")
+    ap.add_argument("--count", type=int, default=100)
+    ap.add_argument("--build-dir", default="build-lifted",
+                    help="kept between runs; rebuilding 430 MB is not free")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    rng = random.Random(args.seed)
+    available = generated_functions(args.generated)
+    picks = pick_functions(args.library, args.count, rng, available)
+    print(f"{len(picks)} self-contained functions with control flow selected")
+    if not picks:
+        return
+
+    work = os.path.abspath(args.build_dir)
+    os.makedirs(work, exist_ok=True)
+    if True:
+        lib = build(args.generated, work)
+        lib.arc_test_load.restype = ctypes.c_uint64
+        lib.arc_test_load.argtypes = [ctypes.c_char_p]
+        lib.arc_test_span.restype = ctypes.c_uint64
+        lib.arc_test_ctx_size.restype = ctypes.c_size_t
+
+        base = lib.arc_test_load(args.library.encode())
+        if not base:
+            sys.exit("harness could not load the image")
+        span = lib.arc_test_span()
+        if lib.arc_test_ctx_size() != ctypes.sizeof(Ctx):
+            sys.exit("Arm64Ctx layout mismatch between C and python")
+        print(f"image mapped at {base:#x}, {span / 1e6:.1f} MB")
+
+        # One stack, allocated here, used by the lifted side directly and
+        # mapped into the emulator at the same address. Without that a returned
+        # pointer into the frame differs on the two sides for no real reason.
+        stack_buf = ctypes.create_string_buffer(STACK_SIZE + 0x1000)
+        stack_addr = ((ctypes.cast(stack_buf, ctypes.c_void_p).value + 0xFFF)
+                      & ~0xFFF)
+        arg_buf = ctypes.create_string_buffer(ARG_SIZE + 0x1000)
+        arg_addr = ((ctypes.cast(arg_buf, ctypes.c_void_p).value + 0xFFF)
+                    & ~0xFFF)
+
+        lib.arc_test_call.restype = None
+        lib.arc_test_call.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+
+        passed = failed = skipped = 0
+        failures = []
+        for start, size, body in picks:
+            # A fresh emulator per function, with the image copied from our own
+            # process so both sides see identical memory -- including anything
+            # an earlier function wrote.
+            arg_seed = bytes(rng.getrandbits(8) for _ in range(ARG_SIZE))
+            uc = Uc(UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN)
+            page = base & ~0xFFF
+            uc.mem_map(page, (span + 0x1FFF) & ~0xFFF)
+            uc.mem_write(base, ctypes.string_at(base, span))
+            uc.mem_map(stack_addr, STACK_SIZE)
+            uc.mem_map(arg_addr, ARG_SIZE)
+            uc.mem_write(arg_addr, arg_seed)
+            ctypes.memmove(arg_addr, arg_seed, ARG_SIZE)
+            uc.mem_map(SENTINEL & ~0xFFF, 0x1000)
+
+            regs = [rng.getrandbits(16) for _ in range(31)]
+            # x0-x7 carry arguments, and most functions dereference at least
+            # one. Point them at distinct, well-separated slots in the scratch
+            # region so a load succeeds on both sides instead of faulting.
+            for i in range(8):
+                regs[i] = arg_addr + i * 0x400
+            qregs = [rng.getrandbits(128) for _ in range(32)]
+            sp = stack_addr + STACK_SIZE // 2
+            stack_seed = bytes(rng.getrandbits(8) for _ in range(STACK_SIZE))
+            nzcv = rng.getrandbits(4)
+
+            for i, r in enumerate(regs):
+                uc.reg_write(UC_X[i], r)
+            for i, q in enumerate(qregs):
+                uc.reg_write(UC_Q[i], q)
+            uc.reg_write(uc64.UC_ARM64_REG_X30, SENTINEL)
+            uc.reg_write(uc64.UC_ARM64_REG_SP, sp)
+            uc.reg_write(uc64.UC_ARM64_REG_NZCV, nzcv << 28)
+            uc.mem_write(stack_addr, stack_seed)
+            ctypes.memmove(stack_addr, stack_seed, STACK_SIZE)
+
+            try:
+                uc.emu_start(base + start, SENTINEL, count=200000)
+            except UcError as e:
+                skipped += 1
+                if args.verbose:
+                    print(f"  skip fn_{start:x}: {e}")
+                continue
+            want = [uc.reg_read(UC_X[i]) for i in range(31)]
+            want_q = [uc.reg_read(UC_Q[i]) for i in range(32)]
+            want_sp = uc.reg_read(uc64.UC_ARM64_REG_SP)
+            want_stack = bytes(uc.mem_read(stack_addr, STACK_SIZE))
+            want_args = bytes(uc.mem_read(arg_addr, ARG_SIZE))
+
+            ctx = Ctx()
+            for i, r in enumerate(regs):
+                ctx.x[i] = r
+            for i, q in enumerate(qregs):
+                ctx.q[i][0] = q & 0xFFFFFFFFFFFFFFFF
+                ctx.q[i][1] = q >> 64
+            ctx.x[30] = SENTINEL
+            ctx.sp = sp
+            ctx.image_base = base
+            ctx.nf, ctx.zf = (nzcv >> 3) & 1, (nzcv >> 2) & 1
+            ctx.cf, ctx.vf = (nzcv >> 1) & 1, nzcv & 1
+
+            try:
+                lib.arc_test_call(ctypes.byref(ctx), ctypes.c_uint64(start))
+            except OSError as e:
+                failed += 1
+                failures.append((start, f"faulted: {e}"))
+                continue
+
+            why = None
+            for i in range(31):
+                if i == 30:
+                    continue  # LR is scratch across a call
+                if ctx.x[i] != want[i]:
+                    why = f"x{i}: lifted {ctx.x[i]:#x} != unicorn {want[i]:#x}"
+                    break
+            if why is None:
+                for i in range(32):
+                    got = ctx.q[i][0] | (ctx.q[i][1] << 64)
+                    if got != want_q[i]:
+                        why = f"q{i}: lifted {got:#x} != unicorn {want_q[i]:#x}"
+                        break
+            if why is None and \
+                    ctypes.string_at(stack_addr, STACK_SIZE) != want_stack:
+                why = "stack memory differs"
+            if why is None and \
+                    ctypes.string_at(arg_addr, ARG_SIZE) != want_args:
+                why = "argument memory differs"
+
+            if why:
+                failed += 1
+                failures.append((start, why))
+            else:
+                passed += 1
+
+    print(f"\n{passed} passed, {failed} failed, {skipped} skipped")
+    if failures:
+        print(f"\nfunctions that disagree with the oracle ({len(failures)})")
+        for addr, why in failures[:20 if not args.verbose else len(failures)]:
+            print(f"  fn_{addr:x}: {why}")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -56,6 +56,7 @@ have. Licensed MIT; contributions must be your own work.
 | `runtime/arm64_context.h` | Guest CPU state and the operations lifted code emits. No address translation: guest pointers *are* host pointers. |
 | `tools/lifter.py` | aarch64 → C, one C function per `.eh_frame` function. `--report` says what fraction of real instructions the emitters cover. |
 | `tools/lift_verify.py` | Differential-tests the lifter against Unicorn on real harvested instructions — an independent oracle that needs no arm64 hardware. |
+| `tools/lift_verify_fn.py` | The same, for whole functions: builds the lifted program and runs it against the emulator with the image mapped at the same address on both sides. |
 
 ## Building
 
@@ -199,6 +200,33 @@ a tenth of a percent — but they are scattered roughly one per function, so
 handling them moved function completeness seven points. Late in the tail, the
 instruction column stops being informative entirely: what matters is how widely
 a form is *spread*, not how often it occurs.
+
+## Building and running the lifted program
+
+```sh
+python tools/lifter.py libengine.so --out generated --shards 64
+cmake -S . -B build-lifted -DARC_LIFTED_DIR=generated
+cmake --build build-lifted
+```
+
+For this engine that is 430 MB of C across 66 translation units, which compiles
+in about 75 seconds. Every recovered function becomes a C function; the 1.4%
+that do not lift become stubs that trap, so the program links and an incomplete
+lift surfaces when that path is taken rather than at build time. Indirect
+branches go through a sorted address → function-pointer table, and a miss traps
+the same way.
+
+Then check it against the oracle, whole functions at a time:
+
+```sh
+python tools/lift_verify_fn.py libengine.so --generated generated --count 250
+```
+
+This is where control flow gets tested, which the single-instruction harness
+deliberately cannot cover. The lifted program runs against the real image
+loaded at a real host address, and the emulator is given its own copy at the
+same numeric address — along with the same stack and argument memory — so a
+load of a global or a pointer walk reads identical bytes on both sides.
 
 ## Two execution paths, one host
 

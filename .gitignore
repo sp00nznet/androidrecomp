@@ -63,3 +63,9 @@ run.txt
 triage.md
 
 verify.txt
+
+# lifted program and its build
+build-lifted/
+fnverify.txt
+obj_test/
+generated_test/

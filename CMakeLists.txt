@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(androidrecomp CXX)
+project(androidrecomp C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,4 +65,36 @@ endif()
 if(PROJECT_IS_TOP_LEVEL OR NOT DEFINED PROJECT_IS_TOP_LEVEL)
   add_executable(arc_host tools/arc_host.cpp)
   target_link_libraries(arc_host PRIVATE androidrecomp)
+endif()
+
+# The lifted program, when one has been generated. Building it here rather than
+# from the verification driver means the dependency discovery above -- zlib,
+# SDL2, the platform libraries -- is done once and reused, instead of being
+# guessed at a second time.
+#
+#   python tools/lifter.py libengine.so --out generated
+#   cmake -S . -B build-lifted -DARC_LIFTED_DIR=generated
+#   cmake --build build-lifted
+set(ARC_LIFTED_DIR "" CACHE PATH "directory of generated lifted C")
+if(ARC_LIFTED_DIR)
+  file(TO_CMAKE_PATH "${ARC_LIFTED_DIR}" ARC_LIFTED_DIR)
+  file(GLOB ARC_LIFTED_SOURCES "${ARC_LIFTED_DIR}/*.c")
+  list(LENGTH ARC_LIFTED_SOURCES ARC_LIFTED_COUNT)
+  if(ARC_LIFTED_COUNT EQUAL 0)
+    message(FATAL_ERROR "no generated C in ${ARC_LIFTED_DIR}")
+  endif()
+  message(STATUS "androidrecomp: lifted program, ${ARC_LIFTED_COUNT} units")
+  add_library(lifted SHARED ${ARC_LIFTED_SOURCES}
+                            runtime/arm64_runtime.c
+                            tools/lift_harness.cpp)
+  target_include_directories(lifted PRIVATE runtime "${ARC_LIFTED_DIR}")
+  target_link_libraries(lifted PRIVATE androidrecomp)
+  set_target_properties(lifted PROPERTIES C_STANDARD 11)
+  if(MSVC)
+    # Optimising 430 MB of generated C buys nothing while it is being checked
+    # for correctness, and costs a great deal of build time.
+    target_compile_options(lifted PRIVATE /Od /MP)
+  else()
+    target_compile_options(lifted PRIVATE -O0)
+  endif()
 endif()
