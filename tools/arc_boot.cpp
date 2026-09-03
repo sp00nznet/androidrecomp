@@ -27,6 +27,7 @@
 
 #include "arm64_context.h"
 #include "elf_image.h"
+#include "jni_env.h"
 #include "lifted.h"
 #include "shim.h"
 
@@ -232,6 +233,11 @@ int main(int argc, char** argv) {
   for (const auto& d : g_deps) register_imports(*d);
   register_imports(g_image);
 
+  // The JNI table is reached the same way an import is -- the guest loads a
+  // slot out of it and branches -- so its entries have to be known to the
+  // bridge as well.
+  arc_jni_register();
+
   printf("image      %s at %p\n", path.filename().string().c_str(),
          static_cast<void*>(g_image.base()));
   printf("imports    %zu host functions, %zu satisfied by unlifted guest "
@@ -264,6 +270,7 @@ int main(int argc, char** argv) {
   size_t ok = 0, trapped = 0, faulted = 0;
   std::vector<std::string> first_failures;
   std::vector<std::pair<uint64_t, size_t>> fault_sites;
+  std::vector<std::pair<std::string, size_t>> trap_sites;
   for (size_t i = 0; i < total; ++i) {
     // Each constructor starts from a clean frame; a previous failure must not
     // leave the stack pointer somewhere strange.
@@ -276,6 +283,11 @@ int main(int argc, char** argv) {
     }
     if (rc == 1) {
       ++trapped;
+      const std::string what = arc_last_trap();
+      bool seen = false;
+      for (auto& t : trap_sites)
+        if (t.first == what) { ++t.second; seen = true; break; }
+      if (!seen) trap_sites.emplace_back(what, 1);
     } else {
       ++faulted;
       bool seen = false;
@@ -303,6 +315,17 @@ int main(int argc, char** argv) {
   }
 
   printf("  %zu ran, %zu trapped, %zu faulted\n", ok, trapped, faulted);
+  if (!trap_sites.empty()) {
+    printf("\ndistinct traps (%zu)\n", trap_sites.size());
+    std::sort(trap_sites.begin(), trap_sites.end(),
+              [](const std::pair<std::string, size_t>& a,
+                 const std::pair<std::string, size_t>& b) {
+                return a.second > b.second;
+              });
+    for (size_t i = 0; i < trap_sites.size() && i < 12; ++i)
+      printf("  %6zu x %s\n", trap_sites[i].second,
+             trap_sites[i].first.c_str());
+  }
   if (!fault_sites.empty()) {
     printf("\ndistinct fault addresses (%zu)\n", fault_sites.size());
     std::sort(fault_sites.begin(), fault_sites.end(),
@@ -329,8 +352,16 @@ int main(int argc, char** argv) {
     printf("\ncalling %s at %#llx\n", entry,
            static_cast<unsigned long long>(addr - ctx.image_base));
     ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestStack - 64) & ~15ULL;
+    // A JNI entry point takes the environment first and the object that owns
+    // the method second. Neither has anything behind it here, but both have to
+    // be non-null: the engine dereferences the environment immediately.
+    memset(ctx.x, 0, sizeof(ctx.x));
+    ctx.x[0] = arc_jni_env();
+    ctx.x[1] = reinterpret_cast<uint64_t>(&ctx);  // a stand-in `this`
     unsigned long code = 0;
     const int rc = CallGuarded(&ctx, addr, &code);
+    printf("  JNI:\n");
+    arc_jni_report();
     if (rc == 0)
       printf("  returned, x0 = %#llx\n",
              static_cast<unsigned long long>(ctx.x[0]));

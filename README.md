@@ -252,7 +252,9 @@ without needing a window, a JNI environment or a server. Failures are recovered
 rather than fatal — a boot that dies on the first bad constructor tells you one
 thing per run, one that keeps going tells you the shape of what is left.
 
-On this engine, **1,493 of 1,527 constructors run**.
+On this engine, **1,494 of 1,527 constructors run**, and `init` then executes
+far enough to print the engine's own startup banner through the logging shim
+and make 73 JNI calls before it stops.
 
 Two things had to exist first, and both are general.
 
@@ -285,6 +287,26 @@ The lesson generalises: a guest image's imports partition into ones the host
 satisfies and ones another guest image satisfies, and only the first kind may
 be called natively. The second kind belongs to the dispatcher, and traps until
 that image is lifted too.
+
+### A JNIEnv with nothing behind it
+
+A JNI entry point takes a `JNIEnv*` and dereferences it immediately, because in
+JNI an environment *is* a pointer to a pointer to a table of function pointers.
+That is why the first call to `init` faulted reading address zero.
+
+`runtime/jni_env.cpp` supplies the shape without the substance: 256 distinct
+stub slots, each registered with the native bridge so an indirect branch into
+the table is recognised as a call out to the host. Every slot returns zero and
+records that it was called.
+
+Writing named implementations for all 233 real JNI functions before knowing
+which are needed would be a great deal of speculative work. Running it answers
+the question instead — this engine's `init` touches nine slots, and those are
+the ones worth implementing.
+
+Where it stops is the natural consequence: a stub returning zero hands the
+engine a null class or method handle, and it dereferences one. Returning
+distinguishable non-null handles is the next thing to try.
 
 ### Two mnemonics were 48% of a library
 

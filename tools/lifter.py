@@ -302,6 +302,21 @@ class Lifter:
         return (["{ Arm64Vec _t; _t.u64[0] = 0; _t.u64[1] = 0;"] + body +
                 [f"  (c)->q[{self.vreg_index(dest)}] = _t; }}"])
 
+    def vec_result_keep(self, dest, body):
+        """Like vec_result, but starting from what the register already holds.
+
+        The `2` forms of the narrowing instructions write one half of the
+        destination and leave the other untouched, so they cannot start from
+        zero the way every other vector result does.
+        """
+        idx = self.vreg_index(dest)
+        return ([f"{{ Arm64Vec _t = (c)->q[{idx}];"] + body +
+                [f"  (c)->q[{idx}] = _t; }}"])
+
+    @staticmethod
+    def signed_view(bits: int) -> str:
+        return {8: "i8", 16: "i16", 32: "i32", 64: "i64"}[bits]
+
     def emit_vector(self, insn, ops):
         m = insn.mnemonic
 
@@ -317,6 +332,34 @@ class Lifter:
             if info and info[0] * info[2] == 64:
                 return [f"arc_q_w(c, {d}, (c)->q[{n}].u64[0], 0);"]
             return [f"(c)->q[{d}] = (c)->q[{n}];"]
+
+        # `fmov vD.4s, #1.0` broadcasts a floating-point immediate.
+        if m == "fmov" and self.is_vector(ops[0]) and \
+                ops[1].type == a64.ARM64_OP_FP:
+            info = self.vas_of(ops[0])
+            if info:
+                lanes, _, bits = info
+                fview = {32: "f32", 64: "f64"}.get(bits)
+                if fview:
+                    value = repr(float(ops[1].fp))
+                    return self.vec_result(ops[0], [
+                        f"  _t.{fview}[{i}] = {value};" for i in range(lanes)])
+            raise Unsupported("vector fmov")
+
+        # `movi d3, #imm` names a scalar register, so there is no arrangement
+        # to replicate across -- the immediate is the whole 64-bit value.
+        if m in ("movi", "mvni") and self.fp_of(ops[0]) is not None \
+                and self.vas_of(ops[0]) is None \
+                and ops[1].type == a64.ARM64_OP_IMM:
+            idx, kind = self.fp_of(ops[0])
+            value = ops[1].imm & 0xFFFFFFFFFFFFFFFF
+            if m == "mvni":
+                value = (~value) & 0xFFFFFFFFFFFFFFFF
+            if kind == "d":
+                return [f"arc_du_w(c, {idx}, UINT64_C({value}));"]
+            if kind == "s":
+                return [f"arc_su_w(c, {idx}, UINT32_C({value & 0xFFFFFFFF}));"]
+            raise Unsupported(f"movi into {kind}")
 
         if m in ("movi", "mvni") and self.is_vector(ops[0]):
             imm = ops[1]
@@ -378,6 +421,66 @@ class Lifter:
         fview = {32: "f32", 64: "f64"}.get(bits)
         sview = {8: "i8", 16: "i16", 32: "i32", 64: "i64"}.get(bits, "i32")
         ones = f"(uint{bits}_t)~(uint{bits}_t)0"
+
+        # Widening shifts: take one half of a narrower source, extend it to the
+        # destination's lane width, then shift. The `2` forms take the top half.
+        if m in ("ushll", "ushll2", "sshll", "sshll2") and len(ops) == 3:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, sview, sbits = sinfo
+            signed = m.startswith("s")
+            base = slanes - lanes if m.endswith("2") else 0
+            src_view = self.signed_view(sbits) if signed else sview
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            n = ops[2].imm
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(({cast})"
+                f"({self.vec_elem(ops[1], base + i, src_view)}) << {n});"
+                for i in range(lanes)])
+
+        # Widening add: a full-width operand plus one half of a narrower one.
+        if m in ("uaddw", "uaddw2", "saddw", "saddw2", "usubw", "usubw2",
+                 "ssubw", "ssubw2") and len(ops) == 3:
+            sinfo = self.vas_of(ops[2])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, sview, sbits = sinfo
+            signed = m.startswith("s")
+            base = slanes - lanes if m.endswith("2") else 0
+            src_view = self.signed_view(sbits) if signed else sview
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            op_c = "-" if "sub" in m else "+"
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {self.vec_source(ops[1], i, view)} {op_c}"
+                f" (uint{bits}_t)(({cast})"
+                f"({self.vec_elem(ops[2], base + i, src_view)}));"
+                for i in range(lanes)])
+
+        # Narrowing: `xtn` fills the low half of the destination, `xtn2` the
+        # high half, leaving the other alone.
+        if m in ("xtn", "xtn2") and len(ops) == 2:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, sview, _ = sinfo
+            if m == "xtn":
+                return self.vec_result(ops[0], [
+                    f"  _t.{view}[{i}] = (uint{bits}_t)"
+                    f"({self.vec_elem(ops[1], i, sview)});"
+                    for i in range(slanes)])
+            return self.vec_result_keep(ops[0], [
+                f"  _t.{view}[{lanes - slanes + i}] = (uint{bits}_t)"
+                f"({self.vec_elem(ops[1], i, sview)});"
+                for i in range(slanes)])
+
+        # Shift by a signed per-lane amount, either direction.
+        if m in ("ushl", "sshl") and len(ops) == 3:
+            fn = f"arc_{m}{bits}"
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {fn}({self.vec_source(ops[1], i, view)},"
+                f" (int8_t){self.vec_source(ops[2], i, view)});"
+                for i in range(lanes)])
 
         vshift = {"shl": "<<", "ushr": ">>", "sshr": ">>"}
         if m in vshift and len(ops) == 3 and ops[2].type == a64.ARM64_OP_IMM:

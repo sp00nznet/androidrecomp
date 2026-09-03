@@ -24,6 +24,7 @@ add_library(androidrecomp STATIC
   runtime/shim_file.cpp
   runtime/shim_sys.cpp
   runtime/window.cpp
+  runtime/jni_env.cpp
 )
 target_include_directories(androidrecomp PUBLIC runtime)
 

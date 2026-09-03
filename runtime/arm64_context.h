@@ -28,7 +28,9 @@ typedef union {
   uint32_t u32[4];
   int32_t i32[4];
   uint16_t u16[8];
+  int16_t i16[8];
   uint8_t u8[16];
+  int8_t i8[16];
   double f64[2];
   float f32[4];
 } Arm64Vec;
@@ -340,6 +342,28 @@ typedef struct {
 uint64_t arc_load_exclusive(Arm64Ctx* c, uint64_t addr, int bytes);
 uint32_t arc_store_exclusive(Arm64Ctx* c, uint64_t addr, uint64_t value,
                              int bytes);
+
+// --- variable vector shifts ------------------------------------------------
+// One instruction shifts either way: the amount is a signed per-lane value,
+// negative meaning right. An out-of-range amount produces zero rather than the
+// undefined behaviour C would have.
+#define ARC_SHL(bits)                                                     \
+  static inline uint##bits##_t arc_ushl##bits(uint##bits##_t v, int8_t s) { \
+    if (s >= 0) return s >= bits ? 0 : (uint##bits##_t)(v << s);          \
+    s = (int8_t)-s;                                                       \
+    return s >= bits ? 0 : (uint##bits##_t)(v >> s);                      \
+  }                                                                       \
+  static inline uint##bits##_t arc_sshl##bits(uint##bits##_t v, int8_t s) { \
+    if (s >= 0) return s >= bits ? 0 : (uint##bits##_t)(v << s);          \
+    s = (int8_t)-s;                                                       \
+    if (s >= bits) s = bits - 1;                                          \
+    return (uint##bits##_t)(((int##bits##_t)v) >> s);                     \
+  }
+ARC_SHL(8)
+ARC_SHL(16)
+ARC_SHL(32)
+ARC_SHL(64)
+#undef ARC_SHL
 
 // --- bit manipulation ------------------------------------------------------
 // Sign-extending a field means shifting its top bit up to the register's top
