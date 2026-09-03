@@ -29,6 +29,7 @@
 #include <cstring>
 #include <ctime>
 #include <cwchar>
+#include <cmath>
 #include <cwctype>
 #include <chrono>
 #include <thread>
@@ -225,6 +226,102 @@ int Swprintf(wchar_t* buf, size_t n, const wchar_t* fmt, ...) {
   return r;
 }
 
+
+// --- Bionic data symbols ---------------------------------------------------
+//
+// `__sF` is the array behind stdin/stdout/stderr: the engine computes
+// `&__sF[1]` for stdout using *its* sizeof(FILE), baked in when it was
+// compiled. Rather than guess that stride -- a wrong guess hands the host CRT
+// a wild FILE* -- we reserve a region and treat any pointer inside it as one
+// of the standard streams: the base is stdin, anything else is stderr. A
+// game's use of these is diagnostic output, so folding stdout into stderr
+// costs nothing, and the stride never has to be known at all.
+alignas(16) char g_sF[3 * 512];
+
+FILE* Stream(FILE* f) {
+  const char* p = reinterpret_cast<const char*>(f);
+  if (p < g_sF || p >= g_sF + sizeof(g_sF)) return f;
+  return p == g_sF ? stdin : stderr;
+}
+
+// Anything that takes a FILE* has to translate first, because the pointer may
+// be one of the three above rather than one the host CRT handed out.
+int Fprintf(FILE* f, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vfprintf(Stream(f), fmt, ap);
+  va_end(ap);
+  return n;
+}
+int Vfprintf(FILE* f, const char* fmt, va_list ap) {
+  return vfprintf(Stream(f), fmt, ap);
+}
+size_t Fwrite(const void* p, size_t sz, size_t n, FILE* f) {
+  return fwrite(p, sz, n, Stream(f));
+}
+size_t Fread(void* p, size_t sz, size_t n, FILE* f) {
+  return fread(p, sz, n, Stream(f));
+}
+int Fputs(const char* str, FILE* f) { return fputs(str, Stream(f)); }
+int Fputc(int c, FILE* f) { return fputc(c, Stream(f)); }
+int Fflush(FILE* f) { return fflush(f ? Stream(f) : nullptr); }
+int Fclose(FILE* f) {
+  // Closing a standard stream would take the host's own logging with it.
+  FILE* h = Stream(f);
+  return (h == stdin || h == stderr || h == stdout) ? 0 : fclose(h);
+}
+
+// Bionic's `_ctype_` is a 257-entry table indexed as `_ctype_[c + 1]`, with
+// index 0 reserved for EOF. The classifications come from the host, so only
+// the bit values below are assumed -- and a wrong bit shows up as character
+// classification going astray, never as memory corruption.
+constexpr unsigned char kCtypeUpper = 0x01, kCtypeLower = 0x02,
+                        kCtypeDigit = 0x04, kCtypeSpace = 0x08,
+                        kCtypePunct = 0x10, kCtypeControl = 0x20,
+                        kCtypeHex = 0x40, kCtypeBlank = 0x80;
+
+const unsigned char* BuildCtype() {
+  static unsigned char table[257] = {};
+  for (int c = 0; c < 256; ++c) {
+    unsigned char f = 0;
+    if (isupper(c)) f |= kCtypeUpper;
+    if (islower(c)) f |= kCtypeLower;
+    if (isdigit(c)) f |= kCtypeDigit;
+    if (isspace(c)) f |= kCtypeSpace;
+    if (ispunct(c)) f |= kCtypePunct;
+    if (iscntrl(c)) f |= kCtypeControl;
+    if (isxdigit(c)) f |= kCtypeHex;
+    if (c == ' ' || c == '\t') f |= kCtypeBlank;
+    table[c + 1] = f;
+  }
+  return table;
+}
+const unsigned char* g_ctype = BuildCtype();
+
+// --- odds and ends ---------------------------------------------------------
+
+void Sincosf(float x, float* sin_out, float* cos_out) {
+  *sin_out = sinf(x);
+  *cos_out = cosf(x);
+}
+
+int Getentropy(void* buf, size_t len) {
+  auto* out = static_cast<unsigned char*>(buf);
+#if defined(_WIN32)
+  // RtlGenRandom, reached without dragging in the whole CryptoAPI header set.
+  static auto gen = reinterpret_cast<BOOLEAN(WINAPI*)(PVOID, ULONG)>(
+      GetProcAddress(LoadLibraryA("advapi32.dll"), "SystemFunction036"));
+  if (gen && gen(out, static_cast<ULONG>(len))) return 0;
+#endif
+  for (size_t i = 0; i < len; ++i) out[i] = static_cast<unsigned char>(rand());
+  return 0;
+}
+
+// ponytail: thread_local destructors are never run. We never unload an image
+// and the process exits wholesale, so there is nothing for them to clean up
+// before. Give this a real registry if a title starts leaning on them.
+int CxaThreadAtexit(void (*)(void*), void*, void*) { return 0; }
+
 struct Entry {
   const char* name;
   void* fn;
@@ -305,8 +402,20 @@ const Entry kTable[] = {
     E("ctime", ctime),
 
     // stdio the host hides behind inline definitions
+    E("__sF", g_sF),
+    E("_ctype_", g_ctype),
+    E("fprintf", Fprintf),
+    E("vfprintf", Vfprintf),
+    E("fwrite", Fwrite),
+    E("fread", Fread),
+    E("fputs", Fputs),
+    E("fputc", Fputc),
+    E("fflush", Fflush),
+    E("fclose", Fclose),
+    E("sincosf", Sincosf),
+    E("getentropy", Getentropy),
+    E("__cxa_thread_atexit_impl", CxaThreadAtexit),
     E("printf", printf),
-    E("fprintf", fprintf),
     E("sprintf", sprintf),
     E("snprintf", snprintf),
     E("sscanf", sscanf),

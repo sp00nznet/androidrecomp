@@ -147,6 +147,10 @@ const Alias kAliases[] = {
     {"isatty", "_isatty"},
     {"unlink", "_unlink"},
     {"putenv", "_putenv"},
+    {"fdopen", "_fdopen"},
+    // off_t is 64-bit on Android, which is what _fseeki64 takes.
+    {"fseeko", "_fseeki64"},
+    {"ftello", "_ftelli64"},
 #endif
 };
 
@@ -171,6 +175,8 @@ uint64_t ShimResolve(const char* name) {
   if (uint64_t a = ShimResolvePthread(name)) return a;
   if (uint64_t a = ShimResolvePosix(name)) return a;
   if (uint64_t a = ShimResolveGL(name)) return a;
+  if (uint64_t a = ShimResolveFile(name)) return a;
+  if (uint64_t a = ShimResolveSys(name)) return a;
 
   for (const Entry& e : kExplicit)
     if (strcmp(e.name, name) == 0) return reinterpret_cast<uint64_t>(e.fn);

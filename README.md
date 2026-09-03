@@ -3,8 +3,10 @@
 > A toolkit for turning Android games' native engines into native desktop
 > applications. Bring your own APK.
 
-**Status: early.** The loader, the Bionic/Android shim layer and the host window
-work. No lifter yet — see [Milestones](#milestones).
+**Status: the shim layer is essentially closed.** On its first real target —
+*The Simpsons: Tapped Out*'s 28 MB Scorpio engine — **770 of 776 imports
+resolve**, and the window comes up with a live GL context. No lifter yet, so it
+runs on arm64 hosts only. See [Milestones](#milestones).
 
 ---
 
@@ -46,6 +48,8 @@ have. Licensed MIT; contributions must be your own work.
 | `runtime/shim_pthread` | Threads, semaphores and TLS keys on `std::thread` and the C++ primitives. |
 | `runtime/shim_posix` | The locale `*_l` family, time, the stdio entry points MSVC hides inline, wide-character and BSD string helpers. |
 | `runtime/shim_gl` | GL by name through the live driver — desktop GL exports most GLES2 entry points under identical names, so this costs no code per symbol either. |
+| `runtime/shim_file` | File I/O, directories and `mmap` at Bionic's struct layouts and flag values, which are *not* the host's. |
+| `runtime/shim_sys` | Sockets, `dlopen`/`dlsym`/`dl_iterate_phdr` over the loaded images, process and system. |
 | `runtime/window` | SDL2 window, GL context and event loop: the desktop stand-in for `GLSurfaceView`. |
 | `tools/apk_probe.py` | Feasibility triage for a new title: imports, function count from `.eh_frame`, instruction histogram, and the constructs a lifter must special-case. |
 | `tools/arc_host.cpp` | Loads a library and prints the outstanding-import work list. With no `--contract`, lists every `Java_*` export — how you discover a title's host contract. |
@@ -136,11 +140,15 @@ ELF.
 - [x] **Loader.** Map, relocate, bind, protect; load APK-shipped dependencies.
 - [x] **Shim.** libc, libc++, threads, locale, time, stdio, zlib, GL.
 - [x] **Window.** SDL2 window, GL context, event loop.
+- [x] **File I/O and memory.** POSIX file I/O, directories and `mmap`, written
+      at Bionic's struct layouts rather than forwarded to the host's.
+- [x] **Sockets and dynamic linking.** Including `dl_iterate_phdr` over the
+      loaded images, which is how guest C++ exceptions find their `.eh_frame`.
 - [ ] **JNI bridge.** A `JNIEnv` the engine can call back through, and input
       translation. Per-title glue lives in the port; the reusable parts land here.
-- [ ] **Audio.** openal-soft in place of a shipped `libopenal.so`.
-- [ ] **File I/O and asset paths.** POSIX file I/O, `mmap`, and Android asset
-      layout mapped onto plain directories.
+- [ ] **Audio.** openal-soft in place of a shipped `libopenal.so`. A shipped
+      OpenAL resolves plenty but pulls in `libOpenSLES` — its backend is
+      Android's, and it is the one library worth replacing rather than loading.
 - [ ] **Lifter.** ARM64 → C, boundaries from `.eh_frame`, indirect branches via
       an address → function-pointer table.
 

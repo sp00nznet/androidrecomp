@@ -39,4 +39,17 @@ size_t ShimPosixCount();
 // is current, which is why the window is opened before the engine is loaded.
 uint64_t ShimResolveGL(const char* name);
 
+// File I/O, directories and memory mapping, at Bionic's struct layouts.
+uint64_t ShimResolveFile(const char* name);
+size_t ShimFileCount();
+
+// Sockets, dynamic linking, process and system.
+uint64_t ShimResolveSys(const char* name);
+size_t ShimSysCount();
+
+// Makes a loaded image visible to dlsym and dl_iterate_phdr. Call it for every
+// image the host maps, or guest exception unwinding will not find .eh_frame.
+class ElfImage;
+void ShimRegisterImage(const ElfImage* image);
+
 }  // namespace arc

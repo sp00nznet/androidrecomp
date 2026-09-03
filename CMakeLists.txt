@@ -21,12 +21,17 @@ add_library(androidrecomp STATIC
   runtime/shim_pthread.cpp
   runtime/shim_posix.cpp
   runtime/shim_gl.cpp
+  runtime/shim_file.cpp
+  runtime/shim_sys.cpp
   runtime/window.cpp
 )
 target_include_directories(androidrecomp PUBLIC runtime)
 
 if(UNIX AND NOT APPLE)
   target_link_libraries(androidrecomp PUBLIC dl)
+endif()
+if(WIN32)
+  target_link_libraries(androidrecomp PUBLIC ws2_32)
 endif()
 
 # zlib satisfies a dozen imports directly -- Bionic ships stock zlib, so every

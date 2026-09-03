@@ -66,6 +66,12 @@ class ElfImage {
   size_t relocations_applied() const { return relocs_; }
   const std::vector<uint64_t>& init_array() const { return init_array_; }
 
+  // The program headers, inside the mapped image. dl_iterate_phdr hands these
+  // to the C++ unwinder, which is how it finds each image's .eh_frame -- so
+  // exceptions in the guest depend on them.
+  const void* phdrs() const { return phdrs_; }
+  size_t phnum() const { return phnum_; }
+
  private:
   uint64_t SymbolValue(uint32_t index, const Resolver& resolve);
   const char* SymbolName(uint32_t index) const;
@@ -85,6 +91,8 @@ class ElfImage {
   std::vector<Import> imports_;
   std::vector<uint64_t> init_array_;
   std::vector<std::string> verneed_;  // version index -> name
+  const void* phdrs_ = nullptr;
+  size_t phnum_ = 0;
 };
 
 }  // namespace arc

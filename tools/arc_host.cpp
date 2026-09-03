@@ -167,6 +167,7 @@ int main(int argc, char** argv) {
     }
     printf("  %-22s loaded -- %zu symbols, %zu relocs\n", name.c_str(),
            img->symbol_count(), img->relocations_applied());
+    arc::ShimRegisterImage(img.get());
     deps.push_back(std::move(img));
   }
 
@@ -175,6 +176,10 @@ int main(int argc, char** argv) {
     fprintf(stderr, "load failed: %s\n", err.c_str());
     return 1;
   }
+
+  // dlsym and the C++ unwinder's dl_iterate_phdr both search registered
+  // images, so every image the host maps has to be announced.
+  arc::ShimRegisterImage(&image);
 
   printf("\nimage      %s\n", path.filename().string().c_str());
   printf("base       %p, span %.1f MB\n", static_cast<void*>(image.base()),

@@ -246,6 +246,11 @@ bool ElfImage::Load(const std::string& path, const Resolver& resolve,
     // The memsz > filesz tail (.bss) is already zero from a fresh mapping.
   }
 
+  // The program headers sit inside the first PT_LOAD, so they are addressable
+  // in the mapped image once the segments are copied.
+  phdrs_ = base_ + eh->phoff;
+  phnum_ = eh->phnum;
+
   // --- .dynamic ------------------------------------------------------------
   const Dyn* dyn = reinterpret_cast<const Dyn*>(base_ + dynamic->vaddr);
   uint64_t rela = 0, relasz = 0, jmprel = 0, pltrelsz = 0;
