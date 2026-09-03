@@ -116,12 +116,22 @@ so a `uint32_t` fits them all, with no NDK headers needed to prove it.
 **A smaller host struct written into a larger guest allocation is safe; the
 reverse is not.** Bionic's `struct tm` carries two fields more than the
 Microsoft CRT's, so filling one from the host leaves the leading fields correct
-and the tail untouched. Bionic's `FILE` is where this bites — `__sF` is the
-array behind `stdin`/`stdout`/`stderr`, and indexing it needs Bionic's
-`sizeof(FILE)`. That symbol is left unresolved rather than guessed. The same
-discipline governs aliases: `mkdir(path, mode)` and the Microsoft CRT's
+and the tail untouched. It runs the other way too: Bionic's `struct stat` and
+`struct dirent` share no layout with the host's, so those are filled field by
+field at Bionic's offsets instead of letting the host write its own shape.
+
+The corollary is that the best answer is often to need neither. `__sF` is the
+array behind `stdin`/`stdout`/`stderr`, and the engine indexes it with its own
+baked-in `sizeof(FILE)` — a stride we cannot know. So the shim reserves a region
+and treats *any* pointer inside it as a standard stream: the base is stdin,
+anything else stderr. Diagnostic output does not care, and the stride never has
+to be guessed.
+
+The same discipline governs aliases: `mkdir(path, mode)` and the Microsoft CRT's
 `_mkdir(path)` are not the same function, and aliasing them would compile, link,
-run and corrupt the stack.
+run and corrupt the stack. Nor are Bionic's open flags the host's — `O_CREAT` is
+0100 against 0x100 — and `struct addrinfo` orders `ai_addr` and `ai_canonname`
+the opposite way from Winsock's. Each of those fails silently, not loudly.
 
 ## Two execution paths, one host
 
