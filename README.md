@@ -53,6 +53,9 @@ have. Licensed MIT; contributions must be your own work.
 | `runtime/window` | SDL2 window, GL context and event loop: the desktop stand-in for `GLSurfaceView`. |
 | `tools/apk_probe.py` | Feasibility triage for a new title: imports, function count from `.eh_frame`, instruction histogram, and the constructs a lifter must special-case. |
 | `tools/arc_host.cpp` | Loads a library and prints the outstanding-import work list. With no `--contract`, lists every `Java_*` export — how you discover a title's host contract. |
+| `runtime/arm64_context.h` | Guest CPU state and the operations lifted code emits. No address translation: guest pointers *are* host pointers. |
+| `tools/lifter.py` | aarch64 → C, one C function per `.eh_frame` function. `--report` says what fraction of real instructions the emitters cover. |
+| `tools/lift_verify.py` | Differential-tests the lifter against Unicorn on real harvested instructions — an independent oracle that needs no arm64 hardware. |
 
 ## Building
 
@@ -133,6 +136,33 @@ run and corrupt the stack. Nor are Bionic's open flags the host's — `O_CREAT` 
 0100 against 0x100 — and `struct addrinfo` orders `ai_addr` and `ai_canonname`
 the opposite way from Winsock's. Each of those fails silently, not loudly.
 
+## Verifying a lifter with no arm64 hardware
+
+A lifter is normally validated by running the lifted code on the real machine
+and diffing the register state. Without arm64 hardware that is not available —
+so the oracle is [Unicorn](https://www.unicorn-engine.org/), a QEMU-derived
+arm64 emulator that runs on x86. What matters is that it is an *independent*
+implementation: a misreading we invent in the emitters is not mirrored in it.
+
+`lift_verify.py` harvests real instructions from a real library rather than
+synthesising them, groups them by operand shape, and feeds the same randomised
+register state, flags and memory to both the compiled lifted C and Unicorn,
+then compares registers, flags and memory.
+
+It paid for itself on the first run, with three bugs that reading the code would
+not have found:
+
+- Immediates carry their own shift. `add w9, w20, #2, lsl #12` means 8192, not
+  2 — off by exactly 8190.
+- Extended-register operands carry an extend *and* a shift, not one or the
+  other, so `add x8, x8, w25, sxtw #3` was dropping the sign extension.
+- And the order of those two matters: the source widens to 64 bits first, then
+  shifts. Shifting in the source width silently discards everything that
+  crosses the 32-bit boundary.
+
+All three produce plausible-looking wrong numbers rather than crashes, which is
+what makes an independent oracle worth more than careful reading.
+
 ## Two execution paths, one host
 
 The host program is needed either way, so it comes first.
@@ -160,7 +190,10 @@ ELF.
       OpenAL resolves plenty but pulls in `libOpenSLES` — its backend is
       Android's, and it is the one library worth replacing rather than loading.
 - [ ] **Lifter.** ARM64 → C, boundaries from `.eh_frame`, indirect branches via
-      an address → function-pointer table.
+      an address → function-pointer table. **97.9% of instructions lift; 72% of
+      functions lift completely.** The gap between those two is the whole story:
+      one unsupported instruction fails an entire function, so the remaining
+      work is the long tail — FP/SIMD registers first, then atomics.
 
 ## Ports using this
 
