@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Game content never enters this repo. You bring your own APK.
+# ---------------------------------------------------------------------------
+*.apk
+*.aab
+*.dex
+*.so
+*.rgb
+*.bsv3
+*.xml.bin
+assets/
+dlc/
+gameassets/
+sprites/
+extracted/
+work/
+
+# Lifter output is derived from the game binary -- also never committed.
+recompiled/
+generated/
+
+# Save games / personal data
+towns/
+saves/
+*.pb
+.env
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+build/
+cmake-build-*/
+out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.dylib
+*.exe
+*.pdb
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vs/
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+.DS_Store
+
+# tool output
+probe.txt
+run.txt
+triage.md
