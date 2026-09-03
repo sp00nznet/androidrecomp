@@ -415,10 +415,27 @@ void arc_tpidr_write(uint64_t v);
 // Every `blr`/`br` target is looked up in a sorted address -> function table
 // built from the recovered function starts. A miss traps loudly: an unlifted
 // target reached at runtime is a bug to fix, not something to paper over.
-// A guest trap -- `brk`, or an indirect branch with no lifted target. Loud on
-// purpose: reaching one means the lift is incomplete, not that the game did
-// something interesting.
+// A guest trap -- `brk`, or an indirect branch that resolves to nothing. Loud
+// on purpose: reaching one means the lift is incomplete, not that the game did
+// something interesting. A host that has armed a recovery point (see
+// arc_set_recovery) gets control back instead of the process dying, which is
+// what lets a boot attempt enumerate every failure rather than the first.
 void arc_trap(Arm64Ctx* c, const char* what);
+
+// Arms a longjmp target for the next guest call. Pass NULL to disarm.
+// The buffer is a jmp_buf; kept as void* so this header needs no <setjmp.h>.
+void arc_set_recovery(void* jmp_buffer);
+const char* arc_last_trap(void);
+
+// --- calling out of the guest ----------------------------------------------
+// An import is reached the same way a virtual method is: the guest loads a GOT
+// slot and branches to it. The address in that slot is a *host* function the
+// shim supplied, so the dispatch table will never contain it. Registering them
+// lets an indirect branch tell the two apart.
+void arc_register_native(uint64_t address, const char* name);
+
+// Called by the generated dispatcher when the lifted table has no entry.
+void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
 
 typedef void (*Arc64Fn)(Arm64Ctx*);
 void arc_dispatch(Arm64Ctx* c, uint64_t target);

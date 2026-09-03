@@ -116,11 +116,72 @@ static ARC_THREAD_LOCAL uint64_t t_tpidr;
 uint64_t arc_tpidr_read(void) { return t_tpidr; }
 void arc_tpidr_write(uint64_t v) { t_tpidr = v; }
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+static ARC_THREAD_LOCAL jmp_buf* t_recovery;
+static ARC_THREAD_LOCAL char t_last_trap[256];
+
+void arc_set_recovery(void* jmp_buffer) {
+  t_recovery = (jmp_buf*)jmp_buffer;
+}
+
+const char* arc_last_trap(void) { return t_last_trap; }
 
 void arc_trap(Arm64Ctx* c, const char* what) {
   (void)c;
-  fprintf(stderr, "guest trap: %s\n", what ? what : "?");
+  snprintf(t_last_trap, sizeof(t_last_trap), "%s", what ? what : "?");
+  if (t_recovery) longjmp(*t_recovery, 1);
+  fprintf(stderr, "guest trap: %s\n", t_last_trap);
   abort();
+}
+
+// --- native call bridge ----------------------------------------------------
+
+typedef struct {
+  uint64_t address;
+  const char* name;
+} NativeEntry;
+
+// ponytail: a linear array. It holds a few hundred imports and is searched only
+// on a dispatch miss, which is once per call *out* of the guest. Sort it and
+// bisect if a profile ever says otherwise.
+#define ARC_MAX_NATIVES 2048
+static NativeEntry g_natives[ARC_MAX_NATIVES];
+static size_t g_native_count;
+
+void arc_register_native(uint64_t address, const char* name) {
+  if (!address || g_native_count >= ARC_MAX_NATIVES) return;
+  for (size_t i = 0; i < g_native_count; ++i)
+    if (g_natives[i].address == address) return;
+  g_natives[g_native_count].address = address;
+  g_natives[g_native_count].name = name;
+  ++g_native_count;
+}
+
+// ponytail: eight integer arguments in, one integer result out. That is the
+// integer half of the AArch64 calling convention and covers allocation,
+// string, file and threading calls -- which is nearly everything a guest asks
+// the host for. It does NOT carry floating-point arguments, which live in
+// v0-v7 and would need per-signature thunks to place correctly. Generate those
+// from the import list when a title actually needs one.
+typedef uint64_t (*ArcNative8)(uint64_t, uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t, uint64_t);
+
+void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
+  for (size_t i = 0; i < g_native_count; ++i) {
+    if (g_natives[i].address != target) continue;
+    ArcNative8 fn = (ArcNative8)(uintptr_t)target;
+    uint64_t r = fn(c->x[0], c->x[1], c->x[2], c->x[3],
+                    c->x[4], c->x[5], c->x[6], c->x[7]);
+    c->x[0] = r;
+    return;
+  }
+  char msg[128];
+  snprintf(msg, sizeof(msg),
+           "indirect branch to %#llx, neither lifted nor a known import",
+           (unsigned long long)target);
+  arc_trap(c, msg);
 }

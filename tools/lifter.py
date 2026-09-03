@@ -1202,6 +1202,44 @@ class Lifter:
                 + "\n".join(body) + "\n}\n")
 
 
+def code_sections(elf: ELFFile) -> list[tuple[int, bytes]]:
+    """Every section holding instructions we may need to lift."""
+    out = []
+    for name in (".text", ".plt"):
+        sec = elf.get_section_by_name(name)
+        if sec is not None:
+            out.append((sec["sh_addr"], sec.data()))
+    return out
+
+
+def bytes_at(sections, addr: int, size: int):
+    for base, data in sections:
+        if base <= addr and addr + size <= base + len(data):
+            return data[addr - base:addr - base + size]
+    return None
+
+
+def functions_from_plt(elf: ELFFile) -> list[tuple[int, int]]:
+    """The PLT, as 16-byte functions.
+
+    `.eh_frame` describes the functions a compiler emitted, and the PLT is not
+    one of them -- the linker synthesises it. But every call to an imported
+    function goes through it, so without these a lifted program traps the
+    moment it calls out to the host, which is immediately: a C++ static
+    constructor registers its destructor through `__cxa_atexit` before it does
+    anything else.
+
+    Each entry is the same four instructions -- load the GOT slot, branch to it
+    -- so lifting them turns the final `br` into an ordinary indirect branch
+    that the dispatcher resolves to the host function the loader bound there.
+    """
+    plt = elf.get_section_by_name(".plt")
+    if plt is None:
+        return []
+    base, size = plt["sh_addr"], plt["sh_size"]
+    return [(base + off, 16) for off in range(0, size - 15, 16)]
+
+
 def functions_from_eh_frame(elf: ELFFile) -> list[tuple[int, int]]:
     if not elf.has_dwarf_info():
         return []
@@ -1218,8 +1256,8 @@ def functions_from_eh_frame(elf: ELFFile) -> list[tuple[int, int]]:
     return out
 
 
-def emit_program(lifter: Lifter, funcs, text_addr: int, blob: bytes,
-                 out_dir: str, shards: int, limit: int) -> None:
+def emit_program(lifter: Lifter, funcs, sections, out_dir: str,
+                 shards: int, limit: int) -> None:
     """Write the whole lifted program as a set of translation units.
 
     One C file per function would be 62,000 files; one file for everything
@@ -1241,11 +1279,11 @@ def emit_program(lifter: Lifter, funcs, text_addr: int, blob: bytes,
     for start, size in funcs:
         if limit and done >= limit:
             break
-        off = start - text_addr
-        if off < 0 or off + size > len(blob):
+        body = bytes_at(sections, start, size)
+        if body is None:
             continue
         done += 1
-        code = lifter.lift_function(start, size, blob[off:off + size])
+        code = lifter.lift_function(start, size, body)
         defined.append(start)
         if code is None:
             unlifted.append(start)
@@ -1300,7 +1338,9 @@ def emit_program(lifter: Lifter, funcs, text_addr: int, blob: bytes,
     kFunctions[lo].fn(c);
     return;
   }
-  arc_trap(c, "indirect branch to an address with no lifted function");
+  // Not a lifted function. It may still be a host import the guest reached
+  // through its GOT, which the runtime knows about and we do not.
+  arc_dispatch_miss(c, target);
 }
 """)
 
@@ -1331,24 +1371,22 @@ def main() -> None:
 
     with open(args.library, "rb") as fh:
         elf = ELFFile(fh)
-        text = elf.get_section_by_name(".text")
-        text_addr, blob = text["sh_addr"], text.data()
-        funcs = functions_from_eh_frame(elf)
+        sections = code_sections(elf)
+        funcs = sorted(functions_from_eh_frame(elf) + functions_from_plt(elf))
 
     lifter = Lifter()
 
     if args.out:
-        emit_program(lifter, funcs, text_addr, blob, args.out, args.shards,
-                     args.limit)
+        emit_program(lifter, funcs, sections, args.out, args.shards, args.limit)
     else:
         done = failed = 0
         for start, size in funcs:
             if args.limit and done + failed >= args.limit:
                 break
-            off = start - text_addr
-            if off < 0 or off + size > len(blob):
+            body = bytes_at(sections, start, size)
+            if body is None:
                 continue
-            if lifter.lift_function(start, size, blob[off:off + size]) is None:
+            if lifter.lift_function(start, size, body) is None:
                 failed += 1
             else:
                 done += 1

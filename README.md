@@ -57,6 +57,7 @@ have. Licensed MIT; contributions must be your own work.
 | `tools/lifter.py` | aarch64 → C, one C function per `.eh_frame` function. `--report` says what fraction of real instructions the emitters cover. |
 | `tools/lift_verify.py` | Differential-tests the lifter against Unicorn on real harvested instructions — an independent oracle that needs no arm64 hardware. |
 | `tools/lift_verify_fn.py` | The same, for whole functions: builds the lifted program and runs it against the emulator with the image mapped at the same address on both sides. |
+| `tools/arc_boot.cpp` | Runs the lifted program's static constructors, then an entry point. Recovers from traps and faults so one run enumerates every failure. |
 
 ## Building
 
@@ -227,6 +228,41 @@ deliberately cannot cover. The lifted program runs against the real image
 loaded at a real host address, and the emulator is given its own copy at the
 same numeric address — along with the same stack and argument memory — so a
 load of a global or a pointer walk reads identical bytes on both sides.
+
+## Booting it
+
+```sh
+cmake -S . -B build-lifted -DARC_LIFTED_DIR=generated
+cmake --build build-lifted --target arc_boot
+./build-lifted/arc_boot libengine.so
+```
+
+`arc_boot` runs the lifted program's static constructors and then, optionally,
+a named entry point. Constructors are the right first thing to run: they
+allocate, take locks and build tables, touching a large part of the shim
+without needing a window, a JNI environment or a server. Failures are recovered
+rather than fatal — a boot that dies on the first bad constructor tells you one
+thing per run, one that keeps going tells you the shape of what is left.
+
+On this engine, **1,294 of 1,527 constructors run**.
+
+Two things had to exist first, and both are general.
+
+**The PLT has to be lifted.** `.eh_frame` describes the functions a compiler
+emitted; the PLT is synthesised by the linker and appears in none of it. But
+every call to an imported function goes through it — and a C++ static
+constructor registers its destructor through `__cxa_atexit` before doing
+anything else, so *every* constructor failed on the same missing stub. The
+entries are a fixed 16 bytes each, so lifting them is mechanical, and it took
+the count of unreachable branch targets from 6,080 to 12.
+
+**Calls out to the host need a bridge.** The guest reaches an import exactly as
+it reaches a virtual method: it loads a GOT slot and branches to it. That
+address is a host function the shim supplied, so the dispatch table will never
+contain it. Registering the resolved imports lets an indirect branch tell the
+two apart, and a generic thunk marshals the integer half of the calling
+convention across. Floating-point arguments live in `v0`-`v7` and are not
+carried yet; that needs per-signature thunks generated from the import list.
 
 ## Two execution paths, one host
 

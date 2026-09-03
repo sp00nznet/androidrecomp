@@ -97,4 +97,17 @@ if(ARC_LIFTED_DIR)
   else()
     target_compile_options(lifted PRIVATE -O0)
   endif()
+
+  # The boot attempt: runs the lifted program's static constructors, then an
+  # entry point. Links the lifted code directly rather than through the shared
+  # library, so a fault lands in this process with a usable stack.
+  add_executable(arc_boot tools/arc_boot.cpp ${ARC_LIFTED_SOURCES}
+                          runtime/arm64_runtime.c)
+  target_include_directories(arc_boot PRIVATE runtime "${ARC_LIFTED_DIR}")
+  target_link_libraries(arc_boot PRIVATE androidrecomp)
+  if(MSVC)
+    target_compile_options(arc_boot PRIVATE /Od /MP)
+  else()
+    target_compile_options(arc_boot PRIVATE -O0)
+  endif()
 endif()
