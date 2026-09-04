@@ -1400,7 +1400,13 @@ class Lifter:
 
         if not ok:
             return None
-        return (f"void {self.fn_name(addr)}(Arm64Ctx* c) {{\n"
+        # The image index and the offset, packed into one constant so that
+        # recording an entry is a single store with nothing to look up.
+        packed = (self.image_index << 56) | addr
+        name = self.fn_name(addr)
+        self.referenced.discard(addr)  # defining it is not referencing it
+        return (f"void {name}(Arm64Ctx* c) {{\n"
+                f"  arc_frame_note(UINT64_C({packed}));\n"
                 + "\n".join(body) + "\n}\n")
 
 

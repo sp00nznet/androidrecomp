@@ -77,6 +77,12 @@ endif()
 #   cmake -S . -B build-lifted -DARC_LIFTED_DIR=generated
 #   cmake --build build-lifted
 set(ARC_LIFTED_DIR "" CACHE PATH "directory of generated lifted C")
+# One store per guest function call, in exchange for knowing which functions
+# ran when something faults. Worth it while a port is being brought up.
+option(ARC_FRAMES "record which lifted functions were entered" ON)
+if(ARC_FRAMES)
+  add_compile_definitions(ARC_FRAMES)
+endif()
 if(ARC_LIFTED_DIR)
   file(TO_CMAKE_PATH "${ARC_LIFTED_DIR}" ARC_LIFTED_DIR)
   file(GLOB ARC_LIFTED_SOURCES "${ARC_LIFTED_DIR}/*.c")

@@ -196,6 +196,38 @@ void arc_trace_clear(void) {
   t_trace_seen = 0;
 }
 
+// Global rather than per-thread. A per-thread ring can only be read from the
+// thread that filled it, which forces the reporting to happen inside the guest
+// call itself -- exactly where it is least safe to do anything. Interleaving
+// between threads costs some precision in the trail; being able to read it
+// after the fact is worth more.
+#define ARC_FRAME_RING 256
+static uint64_t t_frames[ARC_FRAME_RING];
+static size_t t_frame_next;
+static size_t t_frame_seen;
+
+#if defined(ARC_FRAMES)
+void arc_frame_note(uint64_t packed) {
+  t_frames[t_frame_next] = packed;
+  t_frame_next = (t_frame_next + 1) % ARC_FRAME_RING;
+  ++t_frame_seen;
+}
+#endif
+
+size_t arc_frame_count(void) {
+  return t_frame_seen < ARC_FRAME_RING ? t_frame_seen : ARC_FRAME_RING;
+}
+
+uint64_t arc_frame_at(size_t back) {
+  if (back >= arc_frame_count()) return 0;
+  return t_frames[(t_frame_next + ARC_FRAME_RING - 1 - back) % ARC_FRAME_RING];
+}
+
+void arc_frame_clear(void) {
+  t_frame_next = 0;
+  t_frame_seen = 0;
+}
+
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
   for (size_t i = 0; i < g_native_count; ++i) {
     if (g_natives[i].address != target) continue;

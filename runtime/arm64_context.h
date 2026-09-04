@@ -501,6 +501,29 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
 // host are the cheapest substitute, and usually enough -- a fault just after
 // mmap says something quite different from one just after GetObjectField.
 void arc_trace_note(const char* what);
+
+// --- which guest functions ran ----------------------------------------------
+// A fault in lifted code names an address in the data it touched, never the
+// code that touched it: the host call stack is 70,000 identically-shaped C
+// functions and tells you nothing. So each lifted function records that it was
+// entered.
+//
+// A ring of entries rather than a stack of frames, deliberately. Nothing has
+// to be popped, so no return path can be missed, and the *path taken* is more
+// use than the depth when the question is how execution reached a bad pointer.
+// The value is the image index and the offset packed together, which is a
+// constant at generation time and so costs one store.
+//
+// Compiled out unless ARC_FRAMES is defined, because this is one store per
+// function call on every path a game has.
+#if defined(ARC_FRAMES)
+void arc_frame_note(uint64_t packed);
+#else
+#define arc_frame_note(packed) ((void)0)
+#endif
+size_t arc_frame_count(void);
+uint64_t arc_frame_at(size_t back);  // 0 is the most recent
+void arc_frame_clear(void);
 size_t arc_trace_count(void);
 const char* arc_trace_at(size_t back);  // 0 is the most recent
 void arc_trace_clear(void);

@@ -101,6 +101,22 @@ std::string ExplainAddress(uint64_t addr) {
   return "not in any mapped image";
 }
 
+// Decode a packed frame back into the image it came from and the offset
+// inside it, which is what a disassembler wants.
+void ReportFrames() {
+  const size_t n = arc_frame_count();
+  if (!n) return;
+  printf("  guest functions entered, most recent first:\n");
+  for (size_t i = 0; i < n && i < 16; ++i) {
+    const uint64_t packed = arc_frame_at(i);
+    const size_t image = static_cast<size_t>(packed >> 56);
+    const uint64_t off = packed & 0x00FFFFFFFFFFFFFFull;
+    const char* name = arc_image_name(image);
+    printf("    %-22s +%#llx\n", name ? name : "?",
+           static_cast<unsigned long long>(off));
+  }
+}
+
 void ReportTrail() {
   const size_t n = arc_trace_count();
   if (!n) return;
@@ -199,16 +215,9 @@ DWORD WINAPI RunEntry(void* p) {
   e->rc = CallGuarded(e->ctx, e->target, &e->code);
   if (e->rc == 1) snprintf(e->trap, sizeof(e->trap), "%s", arc_last_trap());
   if (e->rc != 0) {
-    // The trail is per-thread, so it has to be read here.
-    const size_t n = arc_trace_count();
-    if (n) {
-      printf("  last calls out of the guest, most recent first:\n   ");
-      for (size_t i = 0; i < n && i < 12; ++i) {
-        const char* what = arc_trace_at(i);
-        printf(" %s", what ? what : "?");
-      }
-      printf("\n");
-    }
+    // Both records are per-thread, so they have to be read here rather than
+    // after the join.
+    ReportTrail();
   }
   return 0;
 }
@@ -482,6 +491,7 @@ int main(int argc, char** argv) {
       printf("  %s on %s of %#llx%s%s\n", FaultName(code), g_fault_kind,
              static_cast<unsigned long long>(g_fault_address),
              what.empty() ? "" : " -- ", what.c_str());
+      ReportFrames();
     }
   }
   return 0;
