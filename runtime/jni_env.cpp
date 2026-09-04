@@ -5,6 +5,10 @@
 #include <cstring>
 #include <utility>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include "arm64_context.h"
 
 namespace {
@@ -50,9 +54,28 @@ uint64_t AllocateString() {
   return p;
 }
 
+// The arena is placed low in the address space on purpose. A handle is opaque
+// to the guest in principle, but code that came from a 32-bit lineage stores
+// one in an int somewhere, and a raw 64-bit heap pointer does not survive that.
+// A truncated handle then reappears in arithmetic as a large negative number --
+// which is exactly the shape of an allocation size seen in the trail.
+//
+// Keeping handles inside 32 bits makes such a truncation harmless, and costs
+// nothing: the guest only ever passes them back.
+unsigned char* ReserveLowArena() {
+#if defined(_WIN32)
+  for (uintptr_t at = 0x10000000; at < 0x60000000; at += 0x1000000) {
+    void* p = VirtualAlloc(reinterpret_cast<void*>(at), kArenaSize,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p) return static_cast<unsigned char*>(p);
+  }
+#endif
+  return static_cast<unsigned char*>(calloc(1, kArenaSize));
+}
+
 uint64_t Allocate() {
   if (!g_arena) {
-    g_arena = static_cast<unsigned char*>(calloc(1, kArenaSize));
+    g_arena = ReserveLowArena();
     if (!g_arena) return 0;
   }
   if (g_arena_used + kBlock > kArenaSize) g_arena_used = 0;  // wrap; nothing frees
