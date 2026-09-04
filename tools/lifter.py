@@ -1139,10 +1139,11 @@ class Lifter:
             a, b, mem = ops[0], ops[1], self.find_mem(ops)
             if mem is None:
                 raise Unsupported("ldpsw addressing")
-            addr = self.mem_address(mem, insn)
-            return [self.write(a, f"(int64_t)(int32_t)arc_ld32({addr})"),
-                    self.write(b, f"(int64_t)(int32_t)arc_ld32({addr} + 4)")
-                    ] + self.writeback(insn, mem)
+            return (["{ const uint64_t _pa = " + self.mem_address(mem, insn) + ";"] +
+                    ["  " + l for l in self.writeback(insn, mem)] +
+                    ["  " + self.write(a, "(int64_t)(int32_t)arc_ld32(_pa)"),
+                     "  " + self.write(b, "(int64_t)(int32_t)arc_ld32(_pa + 4)")] +
+                    ["}"])
 
         # -- system registers
         # TPIDR_EL0 is the thread pointer. Nothing else is reachable from user
@@ -1236,7 +1237,14 @@ class Lifter:
         else:
             bits = {"uint8_t": 8, "uint16_t": 16}[cast]
             expr = f"arc_ld{bits}({addr})"
-        return [self.write(d, expr)] + self.writeback(insn, mem)
+        if insn.writeback:
+            # Order matters here too, and differently from how it reads: the
+            # address is computed from the base *before* the update, whether
+            # the update is written before or after the access in the source.
+            return (["{ const uint64_t _a = " + addr + ";"] +
+                    ["  " + l for l in self.writeback(insn, mem)] +
+                    ["  " + self.write(d, expr.replace(addr, "_a"))] + ["}"])
+        return [self.write(d, expr)]
 
     def emit_store(self, insn, ops, cast) -> list[str]:
         s = ops[0]
@@ -1251,39 +1259,59 @@ class Lifter:
             fn = "arc_st64" if is64 else "arc_st32"
         else:
             fn = {"uint8_t": "arc_st8", "uint16_t": "arc_st16"}[cast]
-        return [f"{fn}({addr}, {self.read(s)});"] + self.writeback(insn, mem)
+        if insn.writeback:
+            return (["{ const uint64_t _a = " + addr + ";"] +
+                    ["  " + l for l in self.writeback(insn, mem)] +
+                    [f"  {fn}(_a, {self.read(s)});"] + ["}"])
+        return [f"{fn}({addr}, {self.read(s)});"]
 
     def emit_pair(self, insn, ops, is_load) -> list[str]:
         a, b = ops[0], ops[1]
         mem = self.find_mem(ops)
         if mem is None:
             raise Unsupported("pair addressing")
-        addr = self.mem_address(mem, insn)
+
+        # The address goes into a temporary before anything is written. A load
+        # pair whose base is also its first destination -- `ldp x8, x9, [x8]`,
+        # which is ordinary code -- otherwise reads its second element through
+        # the value the first element just loaded. It is a silent failure: the
+        # first half of the pair is still correct.
+        lines = ["{ const uint64_t _pa = " + self.mem_address(mem, insn) + ";"]
+
         if self.fp_of(a) is not None:
             idx, kind = self.fp_of(a)
             step = FP_BYTES.get(kind)
             if step is None:
                 raise Unsupported(f"FP pair of {kind}")
             if is_load:
-                body = (self.emit_fp_load(insn, a, mem, addr) +
-                        self.emit_fp_load(insn, b, mem, f"({addr} + {step})"))
+                body = (self.emit_fp_load(insn, a, mem, "_pa") +
+                        self.emit_fp_load(insn, b, mem, f"(_pa + {step})"))
             else:
-                body = (self.emit_fp_store(insn, a, mem, addr) +
-                        self.emit_fp_store(insn, b, mem, f"({addr} + {step})"))
-            return body + self.writeback(insn, mem)
-        is64 = reg_of(self.md, a.reg)[1]
-        step = 8 if is64 else 4
-        ld, st = ("arc_ld64", "arc_st64") if is64 else ("arc_ld32", "arc_st32")
-        if is_load:
-            body = [self.write(a, f"{ld}({addr})"),
-                    self.write(b, f"{ld}({addr} + {step})")]
+                body = (self.emit_fp_store(insn, a, mem, "_pa") +
+                        self.emit_fp_store(insn, b, mem, f"(_pa + {step})"))
         else:
-            body = [f"{st}({addr}, {self.read(a)});",
-                    f"{st}({addr} + {step}, {self.read(b)});"]
-        return body + self.writeback(insn, mem)
+            is64 = reg_of(self.md, a.reg)[1]
+            step = 8 if is64 else 4
+            ld, st = ("arc_ld64", "arc_st64") if is64 else ("arc_ld32", "arc_st32")
+            if is_load:
+                body = [self.write(a, f"{ld}(_pa)"),
+                        self.write(b, f"{ld}(_pa + {step})")]
+            else:
+                body = [f"{st}(_pa, {self.read(a)});",
+                        f"{st}(_pa + {step}, {self.read(b)});"]
+
+        # Write-back comes after the address is captured and before the access,
+        # so it reads the base as it was either way.
+        return (lines + ["  " + l for l in self.writeback(insn, mem)] +
+                ["  " + l for l in body] + ["}"])
 
     def writeback(self, insn, mem) -> list[str]:
-        """Pre/post-index addressing updates the base register."""
+        """Pre/post-index addressing updates the base register.
+
+        Callers capture the effective address first and only then emit this,
+        because the address is a function of the base *before* the update in
+        both the pre- and post-indexed forms.
+        """
         if not insn.writeback:
             return []
         bidx, _, b_sp = reg_of(self.md, mem.mem.base)

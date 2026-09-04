@@ -40,7 +40,7 @@ from lifter import functions_from_eh_frame  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STACK_SIZE = 0x10000
-ARG_SIZE = 0x4000
+ARG_SIZE = 0x40000
 SENTINEL = 0x6FFF_0000  # where a returning function lands
 
 UC_X = [getattr(uc64, f"UC_ARM64_REG_X{i}") for i in range(29)] + [
@@ -108,6 +108,39 @@ def build(generated: str, workdir: str):
                 return ctypes.CDLL(path)
     sys.exit("built, but no lifted library was produced")
 
+
+
+def alloc_guarded(size: int):
+    """A page-aligned region with an inaccessible page after it.
+
+    The code under test writes wherever it believes it should, and a region
+    carved out of the interpreter's own heap turns an overrun into heap
+    corruption -- which kills the harness outright and reports nothing. A guard
+    page turns the same overrun into an access violation the run can catch and
+    attribute.
+    """
+    if os.name == "nt":
+        k32 = ctypes.windll.kernel32
+        k32.VirtualAlloc.restype = ctypes.c_void_p
+        k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                     ctypes.c_ulong, ctypes.c_ulong]
+        k32.VirtualProtect.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                       ctypes.c_ulong,
+                                       ctypes.POINTER(ctypes.c_ulong)]
+        MEM_COMMIT_RESERVE, PAGE_RW, PAGE_NONE = 0x3000, 0x04, 0x01
+        base = k32.VirtualAlloc(None, size + 0x1000, MEM_COMMIT_RESERVE, PAGE_RW)
+        if not base:
+            sys.exit("could not reserve a scratch region")
+        old = ctypes.c_ulong()
+        k32.VirtualProtect(ctypes.c_void_p(base + size), 0x1000, PAGE_NONE,
+                           ctypes.byref(old))
+        return base
+    buf = ctypes.create_string_buffer(size + 0x2000)
+    keep_alive.append(buf)
+    return (ctypes.cast(buf, ctypes.c_void_p).value + 0xFFF) & ~0xFFF
+
+
+keep_alive = []
 
 def generated_functions(generated: str) -> set:
     """Addresses the generated program actually defines.
@@ -220,15 +253,47 @@ def main() -> None:
             sys.exit("Arm64Ctx layout mismatch between C and python")
         print(f"image mapped at {base:#x}, {span / 1e6:.1f} MB")
 
+        # A pristine copy, restored before every case. Lifted functions write
+        # to globals, and each emulator instance is seeded from the image as it
+        # currently stands -- so without this, every result depends on which
+        # functions ran before it, and changing the lifter silently reshuffles
+        # which cases pass. A sweep that is not reproducible cannot be compared
+        # against the previous sweep, which is the only thing it is for.
+        pristine = ctypes.string_at(base, span)
+
         # One stack, allocated here, used by the lifted side directly and
         # mapped into the emulator at the same address. Without that a returned
         # pointer into the frame differs on the two sides for no real reason.
-        stack_buf = ctypes.create_string_buffer(STACK_SIZE + 0x1000)
-        stack_addr = ((ctypes.cast(stack_buf, ctypes.c_void_p).value + 0xFFF)
-                      & ~0xFFF)
-        arg_buf = ctypes.create_string_buffer(ARG_SIZE + 0x1000)
-        arg_addr = ((ctypes.cast(arg_buf, ctypes.c_void_p).value + 0xFFF)
-                    & ~0xFFF)
+        stack_addr = alloc_guarded(STACK_SIZE)
+        arg_addr = alloc_guarded(ARG_SIZE)
+
+        # The argument region points at itself. Most functions worth testing
+        # walk a pointer -- obj->field->field -- and a region full of random
+        # bytes makes the first hop fault, which is why a third of candidates
+        # were being skipped rather than compared. Filling it with addresses
+        # inside itself means a chase of any depth lands somewhere readable,
+        # and the leftover quarter keeps ordinary values in circulation so the
+        # comparison still has something to disagree about.
+        #
+        # Built once: the same bytes are restored before each case, and the
+        # randomness that matters between cases is in the registers.
+        # Forward-only: a word may point to a *later* word, never an earlier
+        # one. Pointers into the region make a chase land somewhere readable,
+        # but pointers that can go backwards make cycles, and a function
+        # walking a cyclic list never returns -- the emulator stops on its
+        # instruction budget while the lifted side runs until the stack is
+        # gone. Monotonic targets mean every chase terminates at the end.
+        _count = ARG_SIZE // 8
+        _words = []
+        for _i in range(_count):
+            room = _count - _i - 1
+            if room > 8 and rng.random() < 0.75:
+                _target = rng.randrange(_i + 1, _count)
+                _words.append(arg_addr + _target * 8)
+            else:
+                _words.append(rng.getrandbits(32))
+        arg_seed = b"".join(struct.pack("<Q", w) for w in _words)
+        stack_seed = bytes(rng.getrandbits(8) for _ in range(STACK_SIZE))
 
         lib.arc_test_call_guarded.restype = ctypes.c_int
         lib.arc_test_call_guarded.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
@@ -239,11 +304,11 @@ def main() -> None:
             # A fresh emulator per function, with the image copied from our own
             # process so both sides see identical memory -- including anything
             # an earlier function wrote.
-            arg_seed = bytes(rng.getrandbits(8) for _ in range(ARG_SIZE))
+            ctypes.memmove(base, pristine, span)
             uc = Uc(UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN)
             page = base & ~0xFFF
             uc.mem_map(page, (span + 0x1FFF) & ~0xFFF)
-            uc.mem_write(base, ctypes.string_at(base, span))
+            uc.mem_write(base, pristine)
             uc.mem_map(stack_addr, STACK_SIZE)
             uc.mem_map(arg_addr, ARG_SIZE)
             uc.mem_write(arg_addr, arg_seed)
@@ -255,7 +320,7 @@ def main() -> None:
             # one. Point them at distinct, well-separated slots in the scratch
             # region so a load succeeds on both sides instead of faulting.
             for i in range(8):
-                regs[i] = arg_addr + i * 0x400
+                regs[i] = arg_addr + (ARG_SIZE // 4) + i * 0x800
             if args.real_floats:
                 # Uniform random bits are almost all NaN when read as floats,
                 # and ARM and x86 do not agree on *which* NaN comes out of an
@@ -270,7 +335,6 @@ def main() -> None:
             else:
                 qregs = [rng.getrandbits(128) for _ in range(32)]
             sp = stack_addr + STACK_SIZE // 2
-            stack_seed = bytes(rng.getrandbits(8) for _ in range(STACK_SIZE))
             nzcv = rng.getrandbits(4)
 
             for i, r in enumerate(regs):
