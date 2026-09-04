@@ -21,6 +21,7 @@ import glob
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -119,10 +120,12 @@ def generated_functions(generated: str) -> set:
     out = set()
     if not os.path.exists(header):
         return out
+    # Names carry an image index now -- fn0_... is the first library given to
+    # the lifter, which is the one under test here.
     with open(header, encoding="utf-8") as fh:
         for line in fh:
-            if line.startswith("void fn_"):
-                out.add(int(line[8:line.index("(")], 16))
+            if line.startswith("void fn0_"):
+                out.add(int(line[9:line.index("(")], 16))
     # The header declares the trapping stubs too -- they have to exist so the
     # program links. Calling one is exactly what it is for, and exactly what a
     # verification run must not do.
@@ -130,8 +133,8 @@ def generated_functions(generated: str) -> set:
     if os.path.exists(stubs):
         with open(stubs, encoding="utf-8") as fh:
             for line in fh:
-                if line.startswith("void fn_"):
-                    out.discard(int(line[8:line.index("(")], 16))
+                if line.startswith("void fn0_"):
+                    out.discard(int(line[9:line.index("(")], 16))
     return out
 
 
@@ -187,6 +190,9 @@ def main() -> None:
     ap.add_argument("--build-dir", default="build-lifted",
                     help="kept between runs; rebuilding 430 MB is not free")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--real-floats", action="store_true",
+                    help="seed vector registers with ordinary numbers rather "
+                         "than random bits")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -224,8 +230,8 @@ def main() -> None:
         arg_addr = ((ctypes.cast(arg_buf, ctypes.c_void_p).value + 0xFFF)
                     & ~0xFFF)
 
-        lib.arc_test_call.restype = None
-        lib.arc_test_call.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        lib.arc_test_call_guarded.restype = ctypes.c_int
+        lib.arc_test_call_guarded.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 
         passed = failed = skipped = 0
         failures = []
@@ -250,7 +256,19 @@ def main() -> None:
             # region so a load succeeds on both sides instead of faulting.
             for i in range(8):
                 regs[i] = arg_addr + i * 0x400
-            qregs = [rng.getrandbits(128) for _ in range(32)]
+            if args.real_floats:
+                # Uniform random bits are almost all NaN when read as floats,
+                # and ARM and x86 do not agree on *which* NaN comes out of an
+                # operation with two NaN inputs -- so a float routine can
+                # "disagree" without anything being wrong. Ordinary values
+                # separate a genuine lifting bug from that artefact.
+                qregs = []
+                for _ in range(32):
+                    lanes = [struct.pack("<f", rng.uniform(-1e3, 1e3))
+                             for _ in range(4)]
+                    qregs.append(int.from_bytes(b"".join(lanes), "little"))
+            else:
+                qregs = [rng.getrandbits(128) for _ in range(32)]
             sp = stack_addr + STACK_SIZE // 2
             stack_seed = bytes(rng.getrandbits(8) for _ in range(STACK_SIZE))
             nzcv = rng.getrandbits(4)
@@ -290,11 +308,11 @@ def main() -> None:
             ctx.nf, ctx.zf = (nzcv >> 3) & 1, (nzcv >> 2) & 1
             ctx.cf, ctx.vf = (nzcv >> 1) & 1, nzcv & 1
 
-            try:
-                lib.arc_test_call(ctypes.byref(ctx), ctypes.c_uint64(start))
-            except OSError as e:
+            rc = lib.arc_test_call_guarded(ctypes.byref(ctx),
+                                          ctypes.c_uint64(start))
+            if rc:
                 failed += 1
-                failures.append((start, f"faulted: {e}"))
+                failures.append((start, "trapped" if rc == 1 else "faulted"))
                 continue
 
             why = None

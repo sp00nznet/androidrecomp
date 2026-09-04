@@ -286,6 +286,39 @@ ARC_MINMAX(32, float, arc_quiet32)
 ARC_MINMAX(64, double, arc_quiet64)
 #undef ARC_MINMAX
 
+// The four basic operations, with this architecture's answer when one of them
+// is invalid -- 0/0, inf-inf, 0*inf. x86 hands back a NaN with the sign bit
+// set; the default NaN here has it clear. A propagated input NaN keeps its
+// payload and is merely quieted, which is a different rule again, so the two
+// cases are separated rather than both answered with a constant.
+//
+// ponytail: a compare and a predictable branch on every floating-point
+// operation, which is the hottest path a game has. Correct first; if a profile
+// ever objects, the check can be hoisted into the operations that can actually
+// raise invalid.
+#define ARC_FP_OPS(suffix, type, quiet, dnan)                              \
+  static inline type arc_fop_fix##suffix(type r, type a, type b) {         \
+    if (r == r) return r;                                                  \
+    if (a != a) return quiet(a);                                           \
+    if (b != b) return quiet(b);                                           \
+    return dnan();                                                         \
+  }                                                                        \
+  static inline type arc_fadd##suffix(type a, type b) {                    \
+    return arc_fop_fix##suffix(a + b, a, b);                               \
+  }                                                                        \
+  static inline type arc_fsub##suffix(type a, type b) {                    \
+    return arc_fop_fix##suffix(a - b, a, b);                               \
+  }                                                                        \
+  static inline type arc_fmul##suffix(type a, type b) {                    \
+    return arc_fop_fix##suffix(a * b, a, b);                               \
+  }                                                                        \
+  static inline type arc_fdiv##suffix(type a, type b) {                    \
+    return arc_fop_fix##suffix(a / b, a, b);                               \
+  }
+ARC_FP_OPS(32, float, arc_quiet32, arc_dnan32)
+ARC_FP_OPS(64, double, arc_quiet64, arc_dnan64)
+#undef ARC_FP_OPS
+
 // The square root of a negative is an invalid operation, and the architecture
 // answers it with the *default* NaN -- sign clear. C's sqrt returns a negative
 // NaN, which differs in exactly one bit and would never be noticed by reading.

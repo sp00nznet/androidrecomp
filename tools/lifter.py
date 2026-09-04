@@ -510,10 +510,10 @@ class Lifter:
         if m in flt_bin and len(ops) == 3:
             if not fview:
                 raise Unsupported(f"{m} on {bits}-bit lanes")
-            c = flt_bin[m]
             return self.vec_result(ops[0], [
-                f"  _t.{fview}[{i}] = {self.vec_source(ops[1], i, fview)} {c}"
-                f" {self.vec_source(ops[2], i, fview)};" for i in range(lanes)])
+                f"  _t.{fview}[{i}] = arc_{m}{bits}("
+                f"{self.vec_source(ops[1], i, fview)},"
+                f" {self.vec_source(ops[2], i, fview)});" for i in range(lanes)])
 
         vrint = {"frinta": "round", "frintm": "floor", "frintp": "ceil",
                  "frintz": "trunc", "frintn": "nearbyint", "frintx": "rint",
@@ -881,11 +881,11 @@ class Lifter:
         # Scalar FP maps onto C's own float and double, which is the whole
         # reason to keep the register file as a union: the arithmetic is the
         # host's, and only the corner cases need spelling out.
-        fp3 = {"fadd": "+", "fsub": "-", "fmul": "*", "fdiv": "/"}
-        if m in fp3:
+        if m in ("fadd", "fsub", "fmul", "fdiv"):
+            w = "32" if self.fp_kind(ops[0]) == "s" else "64"
             return [self.fp_write(
                 ops[0],
-                f"({self.fp_read(ops[1])} {fp3[m]} {self.fp_read(ops[2])})")]
+                f"arc_{m}{w}({self.fp_read(ops[1])}, {self.fp_read(ops[2])})")]
         if m == "fneg":
             return [self.fp_write(ops[0], f"(-({self.fp_read(ops[1])}))")]
         if m == "fabs":

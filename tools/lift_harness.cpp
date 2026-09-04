@@ -6,6 +6,8 @@
 // does, and hands the driver the base address it landed at -- which lets the
 // oracle map its own copy at the same numeric address and see the same memory.
 
+#include <setjmp.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -32,6 +34,7 @@ void AnnounceImage(const std::string& name, uint64_t base, uint64_t span) {
 
 // Nothing leaves a Windows DLL unless it says so.
 #if defined(_WIN32)
+#include <windows.h>
 #define ARC_EXPORT __declspec(dllexport)
 #else
 #define ARC_EXPORT __attribute__((visibility("default")))
@@ -78,5 +81,39 @@ ARC_EXPORT void arc_test_call(Arm64Ctx* c, uint64_t offset) {
 }
 
 ARC_EXPORT size_t arc_test_ctx_size() { return sizeof(Arm64Ctx); }
+
+}  // extern "C"
+
+namespace {
+// Free of C++ objects: structured exception handling cannot share a frame with
+// anything that needs unwinding.
+int RunGuarded(Arm64Ctx* c, uint64_t target) {
+  jmp_buf recovery;
+  arc_set_recovery(&recovery);
+  int rc = 0;
+  if (setjmp(recovery) == 0)
+    arc_dispatch(c, target);
+  else
+    rc = 1;
+  arc_set_recovery(nullptr);
+  return rc;
+}
+}  // namespace
+
+extern "C" {
+
+// 0 ran to completion, 1 trapped, 2 faulted. A function that reaches an
+// unlifted neighbour must not take the whole sweep down with it.
+ARC_EXPORT int arc_test_call_guarded(Arm64Ctx* c, uint64_t offset) {
+#if defined(_WIN32)
+  __try {
+    return RunGuarded(c, c->image_base + offset);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 2;
+  }
+#else
+  return RunGuarded(c, c->image_base + offset);
+#endif
+}
 
 }  // extern "C"

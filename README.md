@@ -170,6 +170,12 @@ simply disagree:
 - ARM's `fmin`/`fmax` **propagate** NaN. C's `fminf`/`fmaxf` deliberately do
   not; only ARM's `fminnm`/`fmaxnm` match them. Using the C function for the
   propagating form returns a number where the hardware returns NaN.
+- The same sign difference reaches every one of `fadd`, `fsub`, `fmul` and
+  `fdiv`. When an operation is *invalid* -- `0/0`, `inf - inf`, `0 * inf` --
+  x86 produces a NaN with the sign bit set and this architecture's default NaN
+  has it clear. A propagated input NaN follows a third rule again: it keeps its
+  payload and is merely quieted. Found by the whole-function sweep, not by
+  reading.
 
 And it caught a regression as it was introduced. Handling PC-relative literal
 loads meant treating a `ldr` whose last operand is an immediate as a literal —
