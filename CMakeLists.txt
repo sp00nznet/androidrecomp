@@ -26,6 +26,7 @@ add_library(androidrecomp STATIC
   runtime/shim_varargs.cpp
   runtime/window.cpp
   runtime/jni_env.cpp
+  runtime/arm64_runtime.c
 )
 target_include_directories(androidrecomp PUBLIC runtime)
 
@@ -92,8 +93,9 @@ if(ARC_LIFTED_DIR)
     message(FATAL_ERROR "no generated C in ${ARC_LIFTED_DIR}")
   endif()
   message(STATUS "androidrecomp: lifted program, ${ARC_LIFTED_COUNT} units")
+  # The lifter emits arc_dispatch; the runtime's fallback must stand down.
+  target_compile_definitions(androidrecomp PUBLIC ARC_LIFTED)
   add_library(lifted SHARED ${ARC_LIFTED_SOURCES}
-                            runtime/arm64_runtime.c
                             tools/lift_harness.cpp)
   target_include_directories(lifted PRIVATE runtime "${ARC_LIFTED_DIR}")
   target_link_libraries(lifted PRIVATE androidrecomp)
@@ -109,8 +111,7 @@ if(ARC_LIFTED_DIR)
   # The boot attempt: runs the lifted program's static constructors, then an
   # entry point. Links the lifted code directly rather than through the shared
   # library, so a fault lands in this process with a usable stack.
-  add_executable(arc_boot tools/arc_boot.cpp ${ARC_LIFTED_SOURCES}
-                          runtime/arm64_runtime.c)
+  add_executable(arc_boot tools/arc_boot.cpp ${ARC_LIFTED_SOURCES})
   target_include_directories(arc_boot PRIVATE runtime "${ARC_LIFTED_DIR}")
   target_link_libraries(arc_boot PRIVATE androidrecomp)
   if(MSVC)

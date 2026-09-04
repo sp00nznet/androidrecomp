@@ -287,3 +287,17 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
            (unsigned long long)target);
   arc_trap(c, msg);
 }
+
+// --- dispatch without a lifted program -------------------------------------
+// arc_dispatch is normally emitted by the lifter, over the table of recovered
+// function starts. A host built before any lifting exists -- triage, loading,
+// bringing the shim up on an arm64 machine -- still references it through
+// shim_pthread, so without this the library cannot link at all.
+//
+// ponytail: every branch is a miss when nothing is lifted, and arc_dispatch_miss
+// already does the right thing with one: resolve it against the registered
+// natives, or trap loudly. Replaced by the generated dispatcher once
+// ARC_LIFTED_DIR is set.
+#if !defined(ARC_LIFTED)
+void arc_dispatch(Arm64Ctx* c, uint64_t target) { arc_dispatch_miss(c, target); }
+#endif
