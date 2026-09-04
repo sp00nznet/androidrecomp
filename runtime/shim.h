@@ -35,6 +35,10 @@ size_t ShimPthreadCount();
 uint64_t ShimResolvePosix(const char* name);
 size_t ShimPosixCount();
 
+// Functions taking the guest's own va_list, which is a structure with
+// separate register save areas rather than the host's flat pointer.
+uint64_t ShimResolveVarargs(const char* name);
+
 // GL entry points, asked of the GL driver by name. Answers only once a context
 // is current, which is why the window is opened before the engine is loaded.
 uint64_t ShimResolveGL(const char* name);

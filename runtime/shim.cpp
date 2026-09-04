@@ -195,6 +195,10 @@ void* HostLookup(const char* name) {
 }  // namespace
 
 uint64_t ShimResolve(const char* name) {
+  // First: anything taking a guest va_list. Several of these also exist as
+  // plain forwarders elsewhere in the shim, and forwarding is the wrong answer
+  // -- the argument layouts do not match.
+  if (uint64_t a = ShimResolveVarargs(name)) return a;
   if (uint64_t a = ShimResolvePthread(name)) return a;
   if (uint64_t a = ShimResolvePosix(name)) return a;
   if (uint64_t a = ShimResolveGL(name)) return a;
