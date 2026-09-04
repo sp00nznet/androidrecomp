@@ -461,6 +461,17 @@ void arc_register_native(uint64_t address, const char* name);
 // Called by the generated dispatcher when the lifted table has no entry.
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
 
+// --- what the guest was doing -----------------------------------------------
+// A fault in lifted code reports an address and nothing else: there is no host
+// call stack to walk, because the guest's frames are C frames belonging to
+// 70,000 identically-shaped functions. The last few calls it made out to the
+// host are the cheapest substitute, and usually enough -- a fault just after
+// mmap says something quite different from one just after GetObjectField.
+void arc_trace_note(const char* what);
+size_t arc_trace_count(void);
+const char* arc_trace_at(size_t back);  // 0 is the most recent
+void arc_trace_clear(void);
+
 typedef void (*Arc64Fn)(Arm64Ctx*);
 void arc_dispatch(Arm64Ctx* c, uint64_t target);
 

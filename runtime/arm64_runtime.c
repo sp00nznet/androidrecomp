@@ -170,9 +170,36 @@ void arc_register_native(uint64_t address, const char* name) {
 typedef uint64_t (*ArcNative8)(uint64_t, uint64_t, uint64_t, uint64_t,
                                uint64_t, uint64_t, uint64_t, uint64_t);
 
+#define ARC_TRACE 64
+static ARC_THREAD_LOCAL const char* t_trace[ARC_TRACE];
+static ARC_THREAD_LOCAL size_t t_trace_next;
+static ARC_THREAD_LOCAL size_t t_trace_seen;
+
+void arc_trace_note(const char* what) {
+  t_trace[t_trace_next] = what;
+  t_trace_next = (t_trace_next + 1) % ARC_TRACE;
+  ++t_trace_seen;
+}
+
+size_t arc_trace_count(void) {
+  return t_trace_seen < ARC_TRACE ? t_trace_seen : ARC_TRACE;
+}
+
+const char* arc_trace_at(size_t back) {
+  if (back >= arc_trace_count()) return 0;
+  size_t i = (t_trace_next + ARC_TRACE - 1 - back) % ARC_TRACE;
+  return t_trace[i];
+}
+
+void arc_trace_clear(void) {
+  t_trace_next = 0;
+  t_trace_seen = 0;
+}
+
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
   for (size_t i = 0; i < g_native_count; ++i) {
     if (g_natives[i].address != target) continue;
+    arc_trace_note(g_natives[i].name);
     ArcNative8 fn = (ArcNative8)(uintptr_t)target;
     uint64_t r = fn(c->x[0], c->x[1], c->x[2], c->x[3],
                     c->x[4], c->x[5], c->x[6], c->x[7]);

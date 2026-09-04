@@ -69,6 +69,7 @@ std::string ExplainAddress(uint64_t addr) {
     if (u.first == addr)
       return "unresolved import " + u.second;
   if (arc_jni_owns(addr)) return "past the end of a stand-in JNI handle";
+  if (addr < 0x10000) return "near null";
   for (const Mapping& m : g_mappings) {
     if (addr >= m.base && addr < m.base + m.span) {
       char buf[160];
@@ -77,7 +78,38 @@ std::string ExplainAddress(uint64_t addr) {
       return buf;
     }
   }
+  // Nothing we allocated deliberately. The operating system still knows what
+  // is there, which distinguishes a wild pointer from a real region touched
+  // the wrong way -- and that is the difference between hunting a lifter bug
+  // and hunting a permissions bug.
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi))) {
+    const char* state = mbi.State == MEM_COMMIT   ? "committed"
+                        : mbi.State == MEM_RESERVE ? "reserved, not committed"
+                                                   : "unallocated";
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "%s, protection %#lx, region of %#llx bytes from %#llx", state,
+             static_cast<unsigned long>(mbi.Protect),
+             static_cast<unsigned long long>(mbi.RegionSize),
+             static_cast<unsigned long long>(
+                 reinterpret_cast<uintptr_t>(mbi.AllocationBase)));
+    return buf;
+  }
+#endif
   return "not in any mapped image";
+}
+
+void ReportTrail() {
+  const size_t n = arc_trace_count();
+  if (!n) return;
+  printf("  last calls out of the guest, most recent first:\n   ");
+  for (size_t i = 0; i < n && i < 12; ++i) {
+    const char* what = arc_trace_at(i);
+    printf(" %s", what ? what : "?");
+  }
+  printf("\n");
 }
 
 constexpr size_t kGuestStack = 8 * 1024 * 1024;
@@ -157,6 +189,12 @@ const char* FaultName(unsigned long code) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Unbuffered: this program runs code that can abort the process, and
+  // block-buffered output redirected to a file dies with it -- which turns a
+  // diagnosable crash into an empty log.
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  setvbuf(stderr, nullptr, _IONBF, 0);
+
   const char* lib = nullptr;
   const char* entry = nullptr;
   long ctor_limit = 0;
@@ -359,6 +397,7 @@ int main(int argc, char** argv) {
     memset(ctx.x, 0, sizeof(ctx.x));
     ctx.x[0] = arc_jni_env();
     ctx.x[1] = reinterpret_cast<uint64_t>(&ctx);  // a stand-in `this`
+    arc_trace_clear();
     unsigned long code = 0;
     const int rc = CallGuarded(&ctx, addr, &code);
     printf("  JNI:\n");
@@ -370,9 +409,10 @@ int main(int argc, char** argv) {
       printf("  %s\n", arc_last_trap());
     else {
       const std::string what = ExplainAddress(g_fault_address);
-      printf("  %s touching %#llx%s%s\n", FaultName(code),
+      printf("  %s on %s of %#llx%s%s\n", FaultName(code), g_fault_kind,
              static_cast<unsigned long long>(g_fault_address),
              what.empty() ? "" : " -- ", what.c_str());
+      ReportTrail();
     }
   }
   return 0;

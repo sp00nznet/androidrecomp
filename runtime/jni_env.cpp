@@ -114,6 +114,7 @@ extern "C" uint64_t arc_jni_called(size_t index) {
   if (index < kSlots) ++g_hits[index];
   ++g_total;
   const SlotInfo* info = Lookup(index);
+  arc_trace_note(info ? info->name : "JNI slot");
   return (info && info->returns_handle) ? Allocate() : 0;
 }
 
