@@ -268,7 +268,9 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
       static const char* filter;
       static int checked;
       if (!checked) { filter = getenv("ARC_TRACE_CALLS"); checked = 1; }
-      if (filter && (!*filter || strstr(g_natives[i].name, filter)))
+      /* "*" matches everything: a shell cannot easily pass an empty value. */
+      if (filter && (!*filter || filter[0] == '*' ||
+                     strstr(g_natives[i].name, filter)))
         fprintf(stderr, "[call] %-12s x0=%#llx x1=%#llx x2=%#llx\n",
                 g_natives[i].name, (unsigned long long)c->x[0],
                 (unsigned long long)c->x[1], (unsigned long long)c->x[2]);

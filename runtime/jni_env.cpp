@@ -36,6 +36,20 @@ constexpr size_t kBlock = 64u << 10;
 unsigned char* g_arena;
 size_t g_arena_used;
 
+// A string handed back to the guest is not merely a pointer -- something will
+// measure it. An arena block is zeroed, so every string read out of Java came
+// back empty, and the engine's own string handling then computed a length of
+// zero minus one and asked memcpy for eighteen exabytes. Non-empty placeholder
+// text costs nothing and keeps that arithmetic in range.
+uint64_t Allocate();
+const char kPlaceholder[] = "androidrecomp";
+
+uint64_t AllocateString() {
+  const uint64_t p = Allocate();
+  if (p) memcpy(reinterpret_cast<void*>(p), kPlaceholder, sizeof(kPlaceholder));
+  return p;
+}
+
 uint64_t Allocate() {
   if (!g_arena) {
     g_arena = static_cast<unsigned char*>(calloc(1, kArenaSize));
@@ -95,6 +109,42 @@ constexpr SlotInfo kKnown[] = {
     {162, "GetArrayLength", false},
     {163, "NewObjectArray", true},
     {164, "GetObjectArrayElement", true},
+    // Anything that hands back an object, an array or a buffer has to return
+    // something non-null. A zero here is not merely "no answer" -- the caller
+    // computes a length or a pointer difference from it, and the result of
+    // that arithmetic becomes an allocation size. One zero-returning array slot
+    // was enough to produce a calloc for eighteen exabytes.
+    {29, "NewObjectV", true},
+    {30, "NewObjectA", true},
+    {155, "GetStringLength", false},
+    {156, "GetStringChars", true},   // measured by the caller; see below
+    {157, "ReleaseStringChars", false},
+    {159, "GetStringUTFLength", false},
+    {165, "SetObjectArrayElement", false},
+    {166, "NewBooleanArray", true},
+    {167, "NewByteArray", true},
+    {168, "NewCharArray", true},
+    {169, "NewShortArray", true},
+    {170, "NewIntArray", true},
+    {171, "NewLongArray", true},
+    {172, "NewFloatArray", true},
+    {173, "NewDoubleArray", true},
+    {174, "GetBooleanArrayElements", true},
+    {175, "GetByteArrayElements", true},
+    {176, "GetCharArrayElements", true},
+    {177, "GetShortArrayElements", true},
+    {178, "GetIntArrayElements", true},
+    {179, "GetLongArrayElements", true},
+    {180, "GetFloatArrayElements", true},
+    {181, "GetDoubleArrayElements", true},
+    {182, "ReleaseBooleanArrayElements", false},
+    {183, "ReleaseByteArrayElements", false},
+    {184, "ReleaseCharArrayElements", false},
+    {185, "ReleaseShortArrayElements", false},
+    {186, "ReleaseIntArrayElements", false},
+    {187, "ReleaseLongArrayElements", false},
+    {188, "ReleaseFloatArrayElements", false},
+    {189, "ReleaseDoubleArrayElements", false},
     {206, "RegisterNatives", false},
     {210, "GetJavaVM", false},
     {217, "NewWeakGlobalRef", true},
@@ -115,7 +165,17 @@ extern "C" uint64_t arc_jni_called(size_t index) {
   ++g_total;
   const SlotInfo* info = Lookup(index);
   arc_trace_note(info ? info->name : "JNI slot");
-  return (info && info->returns_handle) ? Allocate() : 0;
+  if (info) {
+    if (!info->returns_handle) return 0;
+    // Anything the caller will read as text needs to contain some.
+    const bool textual = index == 156 || index == 160 || index == 154 ||
+                         index == 158;
+    return textual ? AllocateString() : Allocate();
+  }
+  // Not one we recognise. Erring towards a handle is the safer default: one
+  // the caller ignores costs a block of arena, whereas a zero it treats as a
+  // pointer or a count turns into arithmetic on nothing.
+  return Allocate();
 }
 
 // Every slot has the same shape as the native bridge's thunk, so a call

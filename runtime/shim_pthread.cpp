@@ -32,6 +32,13 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
+#include "arm64_context.h"
 #include "shim.h"
 
 namespace arc {
@@ -89,9 +96,24 @@ struct Semaphore {
 };
 Registry<Semaphore> g_semaphores;
 
+// A guest thread is not a std::thread running a host function. Its entry point
+// is a guest address, so it has to be dispatched with a context and a stack of
+// its own -- and the host thread it runs on needs a large stack, because lifted
+// functions call one another as ordinary C functions and the guest's call depth
+// is the host's.
+constexpr size_t kGuestThreadStack = 16 * 1024 * 1024;
+constexpr size_t kGuestThreadHeadroom = 1 * 1024 * 1024;
+constexpr size_t kHostThreadStack = 256u << 20;
+
 struct Thread {
-  std::thread thread;
+#if defined(_WIN32)
+  void* handle = nullptr;
+#else
+  pthread_t handle{};
+  bool started = false;
+#endif
   void* result = nullptr;
+  bool detached = false;
 };
 Registry<Thread> g_threads;
 
@@ -257,29 +279,104 @@ int Setspecific(uint32_t key, void* value) {
   return 0;
 }
 
-int Create(uint64_t* out, const void*, void* (*start)(void*), void* arg) {
+struct GuestThreadStart {
+  uint64_t entry;
+  uint64_t arg;
+  uint32_t id;
+  Thread* slot;
+};
+
+void RunGuestThread(GuestThreadStart* s) {
+  t_self_id = s->id;
+  std::vector<uint8_t> stack(kGuestThreadStack);
+  Arm64Ctx ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestThreadStack -
+            kGuestThreadHeadroom) & ~15ULL;
+  ctx.x[0] = s->arg;
+  arc_dispatch(&ctx, s->entry);
+  s->slot->result = reinterpret_cast<void*>(ctx.x[0]);
+  delete s;
+}
+
+#if defined(_WIN32)
+unsigned long __stdcall GuestThreadMain(void* p) {
+  RunGuestThread(static_cast<GuestThreadStart*>(p));
+  return 0;
+}
+#else
+void* GuestThreadMain(void* p) {
+  RunGuestThread(static_cast<GuestThreadStart*>(p));
+  return nullptr;
+}
+#endif
+
+int Create(uint64_t* out, const void*, uint64_t start, uint64_t arg) {
   uint32_t id = 0;
   Thread* t = g_threads.Obtain(&id);
   if (!t) return 11 /* EAGAIN */;
-  t->thread = std::thread([t, id, start, arg] {
-    t_self_id = id;
-    t->result = start(arg);
-  });
+
+  auto* s = new GuestThreadStart{start, arg, id, t};
+#if defined(_WIN32)
+  t->handle = CreateThread(nullptr, kHostThreadStack, GuestThreadMain, s, 0,
+                           nullptr);
+  if (!t->handle) {
+    delete s;
+    return 11;
+  }
+#else
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, kHostThreadStack);
+  if (pthread_create(&t->handle, &attr, GuestThreadMain, s) != 0) {
+    pthread_attr_destroy(&attr);
+    delete s;
+    return 11;
+  }
+  pthread_attr_destroy(&attr);
+  t->started = true;
+#endif
   *out = id;
   return 0;
 }
+
 int Join(uint64_t id, void** result) {
   Thread* t = g_threads.Find(static_cast<uint32_t>(id));
   if (!t) return 3 /* ESRCH */;
-  if (t->thread.joinable()) t->thread.join();
+#if defined(_WIN32)
+  if (t->handle) {
+    WaitForSingleObject(t->handle, INFINITE);
+    CloseHandle(t->handle);
+    t->handle = nullptr;
+  }
+#else
+  if (t->started && !t->detached) {
+    pthread_join(t->handle, nullptr);
+    t->started = false;
+  }
+#endif
   if (result) *result = t->result;
   return 0;
 }
+
 int Detach(uint64_t id) {
   Thread* t = g_threads.Find(static_cast<uint32_t>(id));
-  if (t && t->thread.joinable()) t->thread.detach();
+  if (!t) return 3;
+  t->detached = true;
+#if defined(_WIN32)
+  if (t->handle) {
+    CloseHandle(t->handle);
+    t->handle = nullptr;
+  }
+#else
+  if (t->started) {
+    pthread_detach(t->handle);
+    t->started = false;
+  }
+#endif
   return 0;
 }
+
 uint64_t Self() { return t_self_id; }
 int Equal(uint64_t a, uint64_t b) { return a == b; }
 int Kill(uint64_t, int) { return 0; }
