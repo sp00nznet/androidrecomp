@@ -117,6 +117,7 @@ uint64_t arc_tpidr_read(void) { return t_tpidr; }
 void arc_tpidr_write(uint64_t v) { t_tpidr = v; }
 
 #include <setjmp.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -260,6 +261,18 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
   for (size_t i = 0; i < g_native_count; ++i) {
     if (g_natives[i].address != target) continue;
     arc_trace_note(g_natives[i].name);
+    /* Optional argument trace. A name in the trail says the guest called
+       memmove; the arguments say whether it asked for a sane length. Set
+       ARC_TRACE_CALLS to a substring to see only the calls that matter. */
+    {
+      static const char* filter;
+      static int checked;
+      if (!checked) { filter = getenv("ARC_TRACE_CALLS"); checked = 1; }
+      if (filter && (!*filter || strstr(g_natives[i].name, filter)))
+        fprintf(stderr, "[call] %-12s x0=%#llx x1=%#llx x2=%#llx\n",
+                g_natives[i].name, (unsigned long long)c->x[0],
+                (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
+    }
     ArcNative8 fn = (ArcNative8)(uintptr_t)target;
     uint64_t r = fn(c->x[0], c->x[1], c->x[2], c->x[3],
                     c->x[4], c->x[5], c->x[6], c->x[7]);

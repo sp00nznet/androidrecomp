@@ -169,11 +169,28 @@ int FormatInto(Sink& sink, const char* fmt, GuestVaList* ap) {
   return static_cast<int>(sink.used);
 }
 
+// Optional tracing, because "the formatted length is wrong" and "the length is
+// right and something downstream is wrong" look identical from a fault
+// address. Set ARC_TRACE_FORMAT to tell them apart.
+bool Tracing() {
+  static const bool on = getenv("ARC_TRACE_FORMAT") != nullptr;
+  return on;
+}
+
+void TraceResult(const char* who, const char* fmt, int n, const char* text) {
+  if (!Tracing()) return;
+  fprintf(stderr, "[format] %s -> %d  fmt=\"%s\"", who, n, fmt ? fmt : "(null)");
+  if (text) fprintf(stderr, "  out=\"%.120s\"", text);
+  fputc('\n', stderr);
+}
+
 // --- the entry points the guest actually imports ---------------------------
 
 int Vsnprintf(char* out, uint64_t cap, const char* fmt, GuestVaList* ap) {
   Sink sink{out, static_cast<size_t>(cap), 0};
-  return FormatInto(sink, fmt, ap);
+  const int n = FormatInto(sink, fmt, ap);
+  TraceResult("vsnprintf", fmt, n, out);
+  return n;
 }
 
 int Vsprintf(char* out, const char* fmt, GuestVaList* ap) {
@@ -294,9 +311,12 @@ void SprintfCtx(Arm64Ctx* c) {
 
 void SnprintfCtx(Arm64Ctx* c) {
   GuestVaList ap = VaFromContext(c, 3);
-  Sink sink{reinterpret_cast<char*>(c->x[0]), static_cast<size_t>(c->x[1]), 0};
-  c->x[0] = static_cast<uint64_t>(
-      FormatInto(sink, reinterpret_cast<const char*>(c->x[2]), &ap));
+  char* out = reinterpret_cast<char*>(c->x[0]);
+  const char* fmt = reinterpret_cast<const char*>(c->x[2]);
+  Sink sink{out, static_cast<size_t>(c->x[1]), 0};
+  const int n = FormatInto(sink, fmt, &ap);
+  TraceResult("snprintf", fmt, n, out);
+  c->x[0] = static_cast<uint64_t>(n);
 }
 
 void AsprintfCtx(Arm64Ctx* c) {
