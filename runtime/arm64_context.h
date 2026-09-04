@@ -491,6 +491,15 @@ const char* arc_last_trap(void);
 // lets an indirect branch tell the two apart.
 void arc_register_native(uint64_t address, const char* name);
 
+// Some imports cannot be reached through the eight-integer thunk at all. A
+// variadic function's arguments are spread across the general registers, the
+// vector registers and the stack, and which of those a given argument lives in
+// depends on its type -- information the thunk does not have and cannot
+// recover. Those are registered as taking the context itself, and read their
+// own arguments out of it.
+typedef void (*ArcCtxFn)(Arm64Ctx*);
+void arc_register_ctx_native(uint64_t address, const char* name, ArcCtxFn fn);
+
 // Called by the generated dispatcher when the lifted table has no entry.
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
 

@@ -39,6 +39,9 @@ size_t ShimPosixCount();
 // separate register save areas rather than the host's flat pointer.
 uint64_t ShimResolveVarargs(const char* name);
 
+// Announces the variadic handlers to the dispatcher. Call once at startup.
+void ShimRegisterVarargs();
+
 // GL entry points, asked of the GL driver by name. Answers only once a context
 // is current, which is why the window is opened before the engine is loaded.
 uint64_t ShimResolveGL(const char* name);

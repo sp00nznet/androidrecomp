@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "arm64_context.h"
 #include "shim.h"
 
 namespace arc {
@@ -186,8 +187,9 @@ int VsnprintfChk(char* out, uint64_t cap, int, uint64_t, const char* fmt,
 }
 
 int Vfprintf(void* stream, const char* fmt, GuestVaList* ap) {
+  GuestVaList probe = *ap;
   Sink measure{nullptr, 0, 0};
-  const int n = FormatInto(measure, fmt, ap);
+  const int n = FormatInto(measure, fmt, &probe);
   (void)stream;
   // Streams route to stderr the same way the logging shim does; there is no
   // guest FILE* worth honouring here.
@@ -201,8 +203,9 @@ int Vfprintf(void* stream, const char* fmt, GuestVaList* ap) {
 }
 
 int Vasprintf(char** out, const char* fmt, GuestVaList* ap) {
+  GuestVaList probe = *ap;
   Sink measure{nullptr, 0, 0};
-  const int n = FormatInto(measure, fmt, ap);
+  const int n = FormatInto(measure, fmt, &probe);
   *out = static_cast<char*>(malloc(static_cast<size_t>(n) + 1));
   if (!*out) return -1;
   Sink sink{*out, static_cast<size_t>(n) + 1, 0};
@@ -211,8 +214,9 @@ int Vasprintf(char** out, const char* fmt, GuestVaList* ap) {
 
 int AndroidLogVprint(int prio, const char* tag, const char* fmt,
                      GuestVaList* ap) {
+  GuestVaList probe = *ap;
   Sink measure{nullptr, 0, 0};
-  const int n = FormatInto(measure, fmt, ap);
+  const int n = FormatInto(measure, fmt, &probe);
   char* buffer = static_cast<char*>(malloc(static_cast<size_t>(n) + 1));
   if (!buffer) return n;
   Sink sink{buffer, static_cast<size_t>(n) + 1, 0};
@@ -221,6 +225,124 @@ int AndroidLogVprint(int prio, const char* tag, const char* fmt,
   free(buffer);
   return n;
 }
+
+// --- variadic calls --------------------------------------------------------
+//
+// A variadic call and a va_list describe the same thing. The named arguments
+// take general registers in order; everything after them continues through the
+// remaining general registers, with floating-point arguments taking vector
+// registers instead, and the overflow going to the stack. That is exactly what
+// a va_list records -- so one can be synthesised from the register state and
+// handed to the same formatter.
+//
+// `named_gp` is how many general registers the named parameters used, which is
+// the only thing that differs between these functions.
+GuestVaList VaFromContext(Arm64Ctx* c, int named_gp) {
+  GuestVaList v;
+  v.stack = c->sp;
+  v.gr_top = reinterpret_cast<uint64_t>(&c->x[8]);
+  v.vr_top = reinterpret_cast<uint64_t>(&c->q[8]);
+  v.gr_offs = -static_cast<int32_t>((8 - named_gp) * 8);
+  v.vr_offs = -static_cast<int32_t>(8 * 16);
+  return v;
+}
+
+// Formats into a fresh buffer the caller frees.
+char* FormatAlloc(const char* fmt, GuestVaList* ap, int* length) {
+  GuestVaList measure = *ap;
+  Sink probe{nullptr, 0, 0};
+  const int n = FormatInto(probe, fmt, &measure);
+  char* buffer = static_cast<char*>(malloc(static_cast<size_t>(n) + 1));
+  if (!buffer) {
+    *length = 0;
+    return nullptr;
+  }
+  Sink sink{buffer, static_cast<size_t>(n) + 1, 0};
+  FormatInto(sink, fmt, ap);
+  *length = n;
+  return buffer;
+}
+
+void PrintfCtx(Arm64Ctx* c) {
+  GuestVaList ap = VaFromContext(c, 1);
+  int n = 0;
+  char* text = FormatAlloc(reinterpret_cast<const char*>(c->x[0]), &ap, &n);
+  if (text) {
+    fputs(text, stdout);
+    free(text);
+  }
+  c->x[0] = static_cast<uint64_t>(n);
+}
+
+void FprintfCtx(Arm64Ctx* c) {
+  GuestVaList ap = VaFromContext(c, 2);
+  int n = 0;
+  char* text = FormatAlloc(reinterpret_cast<const char*>(c->x[1]), &ap, &n);
+  if (text) {
+    fputs(text, stderr);
+    free(text);
+  }
+  c->x[0] = static_cast<uint64_t>(n);
+}
+
+void SprintfCtx(Arm64Ctx* c) {
+  GuestVaList ap = VaFromContext(c, 2);
+  Sink sink{reinterpret_cast<char*>(c->x[0]), SIZE_MAX, 0};
+  c->x[0] = static_cast<uint64_t>(
+      FormatInto(sink, reinterpret_cast<const char*>(c->x[1]), &ap));
+}
+
+void SnprintfCtx(Arm64Ctx* c) {
+  GuestVaList ap = VaFromContext(c, 3);
+  Sink sink{reinterpret_cast<char*>(c->x[0]), static_cast<size_t>(c->x[1]), 0};
+  c->x[0] = static_cast<uint64_t>(
+      FormatInto(sink, reinterpret_cast<const char*>(c->x[2]), &ap));
+}
+
+void AsprintfCtx(Arm64Ctx* c) {
+  GuestVaList ap = VaFromContext(c, 2);
+  int n = 0;
+  char* text = FormatAlloc(reinterpret_cast<const char*>(c->x[1]), &ap, &n);
+  *reinterpret_cast<char**>(c->x[0]) = text;
+  c->x[0] = text ? static_cast<uint64_t>(n) : UINT64_C(0xFFFFFFFFFFFFFFFF);
+}
+
+void SyslogCtx(Arm64Ctx* c) {
+  GuestVaList ap = VaFromContext(c, 2);
+  int n = 0;
+  char* text = FormatAlloc(reinterpret_cast<const char*>(c->x[1]), &ap, &n);
+  if (text) {
+    fprintf(stderr, "%s\n", text);
+    free(text);
+  }
+  c->x[0] = 0;
+}
+
+void AndroidLogPrintCtx(Arm64Ctx* c) {
+  GuestVaList ap = VaFromContext(c, 3);
+  int n = 0;
+  char* text = FormatAlloc(reinterpret_cast<const char*>(c->x[2]), &ap, &n);
+  fprintf(stderr, "[%d] %s: %s\n", static_cast<int>(c->x[0]),
+          c->x[1] ? reinterpret_cast<const char*>(c->x[1]) : "?",
+          text ? text : "");
+  free(text);
+  c->x[0] = static_cast<uint64_t>(n);
+}
+
+struct CtxEntry {
+  const char* name;
+  ArcCtxFn fn;
+};
+
+const CtxEntry kCtxTable[] = {
+    {"printf", PrintfCtx},
+    {"fprintf", FprintfCtx},
+    {"sprintf", SprintfCtx},
+    {"snprintf", SnprintfCtx},
+    {"asprintf", AsprintfCtx},
+    {"syslog", SyslogCtx},
+    {"__android_log_print", AndroidLogPrintCtx},
+};
 
 struct Entry {
   const char* name;
@@ -243,7 +365,17 @@ const Entry kTable[] = {
 uint64_t ShimResolveVarargs(const char* name) {
   for (const Entry& e : kTable)
     if (strcmp(e.name, name) == 0) return reinterpret_cast<uint64_t>(e.fn);
+  // A variadic function resolves to its own handler's address, which the
+  // dispatcher then recognises as wanting the context rather than eight
+  // integers.
+  for (const CtxEntry& e : kCtxTable)
+    if (strcmp(e.name, name) == 0) return reinterpret_cast<uint64_t>(e.fn);
   return 0;
+}
+
+void ShimRegisterVarargs() {
+  for (const CtxEntry& e : kCtxTable)
+    arc_register_ctx_native(reinterpret_cast<uint64_t>(e.fn), e.name, e.fn);
 }
 
 }  // namespace arc

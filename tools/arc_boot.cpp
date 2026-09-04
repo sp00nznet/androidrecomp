@@ -329,6 +329,7 @@ int main(int argc, char** argv) {
   // slot out of it and branches -- so its entries have to be known to the
   // bridge as well.
   arc_jni_register();
+  arc::ShimRegisterVarargs();
 
   printf("image      %s at %p\n", path.filename().string().c_str(),
          static_cast<void*>(g_image.base()));

@@ -152,6 +152,26 @@ typedef struct {
 static NativeEntry g_natives[ARC_MAX_NATIVES];
 static size_t g_native_count;
 
+typedef struct {
+  uint64_t address;
+  const char* name;
+  ArcCtxFn fn;
+} CtxNative;
+
+#define ARC_MAX_CTX_NATIVES 64
+static CtxNative g_ctx_natives[ARC_MAX_CTX_NATIVES];
+static size_t g_ctx_native_count;
+
+void arc_register_ctx_native(uint64_t address, const char* name, ArcCtxFn fn) {
+  if (!address || g_ctx_native_count >= ARC_MAX_CTX_NATIVES) return;
+  for (size_t i = 0; i < g_ctx_native_count; ++i)
+    if (g_ctx_natives[i].address == address) return;
+  g_ctx_natives[g_ctx_native_count].address = address;
+  g_ctx_natives[g_ctx_native_count].name = name;
+  g_ctx_natives[g_ctx_native_count].fn = fn;
+  ++g_ctx_native_count;
+}
+
 void arc_register_native(uint64_t address, const char* name) {
   if (!address || g_native_count >= ARC_MAX_NATIVES) return;
   for (size_t i = 0; i < g_native_count; ++i)
@@ -229,6 +249,14 @@ void arc_frame_clear(void) {
 }
 
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
+  // Context-taking natives first: they are a strict superset of what the
+  // thunk can express, so a name registered both ways wants this one.
+  for (size_t i = 0; i < g_ctx_native_count; ++i) {
+    if (g_ctx_natives[i].address != target) continue;
+    arc_trace_note(g_ctx_natives[i].name);
+    g_ctx_natives[i].fn(c);
+    return;
+  }
   for (size_t i = 0; i < g_native_count; ++i) {
     if (g_natives[i].address != target) continue;
     arc_trace_note(g_natives[i].name);
