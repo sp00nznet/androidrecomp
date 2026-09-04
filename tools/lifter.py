@@ -502,6 +502,24 @@ class Lifter:
             return self.vec_result(ops[0], [
                 f"  _t.{view}[{i}] = {self.vec_source(ops[1], i, view)} {c}"
                 f" {self.vec_source(ops[2], i, view)};" for i in range(lanes)])
+        if m in ("bsl", "bit", "bif") and len(ops) == 3:
+            d = self.vec_source(ops[0], 0, view)  # placeholder, per lane below
+            body = []
+            for i in range(lanes):
+                dst = self.vec_elem(ops[0], i, view)
+                n = self.vec_source(ops[1], i, view)
+                mm = self.vec_source(ops[2], i, view)
+                if m == "bsl":
+                    # The destination is the mask: bits from the second source
+                    # where it is set, from the third where it is clear.
+                    expr = f"(({dst} & {n}) | (~{dst} & {mm}))"
+                elif m == "bit":
+                    expr = f"({dst} ^ (({n} ^ {dst}) & {mm}))"
+                else:
+                    expr = f"({dst} ^ (({n} ^ {dst}) & ~{mm}))"
+                body.append(f"  _t.{view}[{i}] = {expr};")
+            return self.vec_result(ops[0], body)
+
         if m in ("bic", "orn") and len(ops) == 3:
             c = "&" if m == "bic" else "|"
             return self.vec_result(ops[0], [
@@ -994,13 +1012,24 @@ class Lifter:
                 return [self.write(d, self.fp_bits_read(src))]
             raise Unsupported("fmov shape")
 
-        if m == "movi":
+        if m in ("movi", "mvni"):
             info = self.fp_of(ops[0])
             imm = ops[1]
-            if info and imm.type == a64.ARM64_OP_IMM and imm.imm == 0 \
-                    and not imm.shift.value:
-                return [f"arc_v_clear(c, {info[0]});"]
-            raise Unsupported("movi non-zero")
+            if not info or imm.type != a64.ARM64_OP_IMM:
+                raise Unsupported(f"{m} shape")
+            idx, kind = info
+            value = imm.imm & 0xFFFFFFFFFFFFFFFF
+            if imm.shift.type == a64.ARM64_SFT_LSL and imm.shift.value:
+                value = (value << imm.shift.value) & 0xFFFFFFFFFFFFFFFF
+            if m == "mvni":
+                value = (~value) & 0xFFFFFFFFFFFFFFFF
+            if value == 0:
+                return [f"arc_v_clear(c, {idx});"]
+            if kind == "d":
+                return [f"arc_du_w(c, {idx}, UINT64_C({value}));"]
+            if kind == "s":
+                return [f"arc_su_w(c, {idx}, UINT32_C({value & 0xFFFFFFFF}));"]
+            raise Unsupported(f"{m} into {kind}")
 
         # -- acquire / release
         # Plain accesses plus the ordering the host already gives us: lifted

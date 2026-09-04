@@ -1,5 +1,7 @@
 #include "shim.h"
 
+#include "arm64_context.h"
+
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
@@ -84,6 +86,23 @@ int* Errno() { return &errno; }
 int CxaAtexit(void (*)(void*), void*, void*) { return 0; }
 void CxaFinalize(void*) {}
 
+// The guest ending the process is a result, not a crash. Left to resolve
+// through the host C runtime, a title that decides initialisation has failed
+// simply terminates us -- no message, no fault, nothing to distinguish it from
+// a lifter bug. Intercepting it turns "the process died" into "the engine gave
+// up, and here is the code it gave up with".
+[[noreturn]] void GuestExit(int status) {
+  char msg[64];
+  snprintf(msg, sizeof(msg), "the guest called exit(%d)", status);
+  arc_trap(nullptr, msg);
+  abort();  // only reached if no recovery point is armed
+}
+
+[[noreturn]] void GuestAbort() {
+  arc_trap(nullptr, "the guest called abort()");
+  abort();
+}
+
 struct Entry {
   const char* name;
   void* fn;
@@ -106,6 +125,10 @@ const Entry kExplicit[] = {
     {"__errno", reinterpret_cast<void*>(&Errno)},
     {"__cxa_atexit", reinterpret_cast<void*>(&CxaAtexit)},
     {"__cxa_finalize", reinterpret_cast<void*>(&CxaFinalize)},
+    {"exit", reinterpret_cast<void*>(&GuestExit)},
+    {"_exit", reinterpret_cast<void*>(&GuestExit)},
+    {"_Exit", reinterpret_cast<void*>(&GuestExit)},
+    {"abort", reinterpret_cast<void*>(&GuestAbort)},
 
 #if defined(ARC_HAVE_ZLIB)
     // Statically linked libraries bind by explicit address: they are inside

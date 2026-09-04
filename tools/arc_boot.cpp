@@ -112,7 +112,16 @@ void ReportTrail() {
   printf("\n");
 }
 
-constexpr size_t kGuestStack = 8 * 1024 * 1024;
+// The guest stack, and where in it the stack pointer starts.
+//
+// Not at the very top. On a real system a function is entered with a caller's
+// frame above it, and code reads into that region -- arguments passed on the
+// stack, a saved frame pointer chain. Starting at the top means every such
+// read lands past the end of the allocation, which is a fault with no cause
+// worth investigating. Leaving headroom above the pointer makes those reads
+// land in memory that exists.
+constexpr size_t kGuestStack = 64 * 1024 * 1024;
+constexpr size_t kStackHeadroom = 16 * 1024 * 1024;
 
 // Kept free of C++ objects: MSVC will not put structured exception handling in
 // a frame that also needs unwinding.
@@ -169,6 +178,41 @@ int CallGuarded(Arm64Ctx* c, uint64_t target, unsigned long* code) {
   return RunWithRecovery(c, target);
 #endif
 }
+
+// Lifted functions call one another as ordinary C functions, so the guest's
+// call depth is the *host* stack's depth. A default thread stack is a megabyte
+// or so, which real engine code exhausts quickly -- and a stack overflow is the
+// one fault structured exception handling cannot reliably be asked to survive,
+// because the guard page it needs is what just went. Giving the thread room is
+// cheaper than diagnosing it repeatedly.
+struct EntryCall {
+  Arm64Ctx* ctx;
+  uint64_t target;
+  int rc;
+  unsigned long code;
+  char trap[256];
+};
+
+#if defined(_WIN32)
+DWORD WINAPI RunEntry(void* p) {
+  EntryCall* e = static_cast<EntryCall*>(p);
+  e->rc = CallGuarded(e->ctx, e->target, &e->code);
+  if (e->rc == 1) snprintf(e->trap, sizeof(e->trap), "%s", arc_last_trap());
+  if (e->rc != 0) {
+    // The trail is per-thread, so it has to be read here.
+    const size_t n = arc_trace_count();
+    if (n) {
+      printf("  last calls out of the guest, most recent first:\n   ");
+      for (size_t i = 0; i < n && i < 12; ++i) {
+        const char* what = arc_trace_at(i);
+        printf(" %s", what ? what : "?");
+      }
+      printf("\n");
+    }
+  }
+  return 0;
+}
+#endif
 
 const char* FaultName(unsigned long code) {
 #if defined(_WIN32)
@@ -295,10 +339,13 @@ int main(int argc, char** argv) {
   }
 
   std::vector<uint8_t> stack(kGuestStack);
+  const uint64_t stack_top =
+      (reinterpret_cast<uint64_t>(stack.data()) + kGuestStack -
+       kStackHeadroom) & ~15ULL;
   Arm64Ctx ctx;
   memset(&ctx, 0, sizeof(ctx));
   ctx.image_base = reinterpret_cast<uint64_t>(g_image.base());
-  ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestStack - 64) & ~15ULL;
+  ctx.sp = stack_top;
 
   const std::vector<uint64_t>& ctors = g_image.init_array();
   const size_t total = ctor_limit > 0 && static_cast<size_t>(ctor_limit) < ctors.size()
@@ -313,7 +360,7 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < total; ++i) {
     // Each constructor starts from a clean frame; a previous failure must not
     // leave the stack pointer somewhere strange.
-    ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestStack - 64) & ~15ULL;
+    ctx.sp = stack_top;
     unsigned long code = 0;
     const int rc = CallGuarded(&ctx, ctors[i], &code);
     if (rc == 0) {
@@ -361,9 +408,17 @@ int main(int argc, char** argv) {
                  const std::pair<std::string, size_t>& b) {
                 return a.second > b.second;
               });
-    for (size_t i = 0; i < trap_sites.size() && i < 12; ++i)
-      printf("  %6zu x %s\n", trap_sites[i].second,
-             trap_sites[i].first.c_str());
+    for (size_t i = 0; i < trap_sites.size() && i < 12; ++i) {
+      // A trap message carries the address it could not resolve; saying which
+      // image that lands in turns "one unlifted target" into a place to look.
+      const std::string& msg = trap_sites[i].first;
+      std::string where;
+      const size_t at = msg.find("0x");
+      if (at != std::string::npos)
+        where = ExplainAddress(strtoull(msg.c_str() + at, nullptr, 16));
+      printf("  %6zu x %s%s%s\n", trap_sites[i].second, msg.c_str(),
+             where.empty() ? "" : "\n             -- ", where.c_str());
+    }
   }
   if (!fault_sites.empty()) {
     printf("\ndistinct fault addresses (%zu)\n", fault_sites.size());
@@ -390,29 +445,43 @@ int main(int argc, char** argv) {
     }
     printf("\ncalling %s at %#llx\n", entry,
            static_cast<unsigned long long>(addr - ctx.image_base));
-    ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestStack - 64) & ~15ULL;
+    ctx.sp = stack_top;
     // A JNI entry point takes the environment first and the object that owns
     // the method second. Neither has anything behind it here, but both have to
     // be non-null: the engine dereferences the environment immediately.
     memset(ctx.x, 0, sizeof(ctx.x));
     ctx.x[0] = arc_jni_env();
     ctx.x[1] = reinterpret_cast<uint64_t>(&ctx);  // a stand-in `this`
-    arc_trace_clear();
-    unsigned long code = 0;
-    const int rc = CallGuarded(&ctx, addr, &code);
+    EntryCall call{};
+    call.ctx = &ctx;
+    call.target = addr;
+#if defined(_WIN32)
+    // 512 MB reserved. It is address space, not memory: only the pages the
+    // guest actually touches are ever committed.
+    HANDLE th = CreateThread(nullptr, 512u << 20, RunEntry, &call, 0, nullptr);
+    if (th) {
+      WaitForSingleObject(th, INFINITE);
+      CloseHandle(th);
+    } else {
+      call.rc = CallGuarded(&ctx, addr, &call.code);
+    }
+#else
+    call.rc = CallGuarded(&ctx, addr, &call.code);
+#endif
+    const int rc = call.rc;
+    const unsigned long code = call.code;
     printf("  JNI:\n");
     arc_jni_report();
     if (rc == 0)
       printf("  returned, x0 = %#llx\n",
              static_cast<unsigned long long>(ctx.x[0]));
     else if (rc == 1)
-      printf("  %s\n", arc_last_trap());
+      printf("  %s\n", call.trap);
     else {
       const std::string what = ExplainAddress(g_fault_address);
       printf("  %s on %s of %#llx%s%s\n", FaultName(code), g_fault_kind,
              static_cast<unsigned long long>(g_fault_address),
              what.empty() ? "" : " -- ", what.c_str());
-      ReportTrail();
     }
   }
   return 0;
