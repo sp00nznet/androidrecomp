@@ -77,6 +77,13 @@ VAS_INFO = {
     "1B": (1, "u8", 8),     "1H": (1, "u16", 16),
     "1S": (1, "u32", 32),
 }
+# Structured load/store: the interleave factor. `ld1` is the odd one out --
+# given several registers it fills them consecutively rather than
+# de-interleaving, which is the same rule stated with a stride of one.
+STRUCT_N = {"ld1": 1, "ld2": 2, "ld3": 3, "ld4": 4,
+            "st1": 1, "st2": 2, "st3": 3, "st4": 4}
+REPL_N = {"ld1r": 1, "ld2r": 2, "ld3r": 3, "ld4r": 4}
+
 VAS_NAMES = {getattr(a64, n): n.replace("ARM64_VAS_", "")
              for n in dir(a64) if n.startswith("ARM64_VAS_")}
 
@@ -302,23 +309,115 @@ class Lifter:
         return (["{ Arm64Vec _t; _t.u64[0] = 0; _t.u64[1] = 0;"] + body +
                 [f"  (c)->q[{self.vreg_index(dest)}] = _t; }}"])
 
-    def vec_result_keep(self, dest, body):
+    def vec_result_keep(self, dest, body, clear_top=False):
         """Like vec_result, but starting from what the register already holds.
 
-        The `2` forms of the narrowing instructions write one half of the
-        destination and leave the other untouched, so they cannot start from
-        zero the way every other vector result does.
+        Two unrelated kinds of instruction need this. The `2` forms of the
+        narrowing instructions write one half of the destination and leave the
+        other untouched. The accumulating forms read the destination as an
+        operand, so they cannot start from zero either -- but they are still
+        ordinary results, and a 64-bit arrangement clears the top half of the
+        register the way every other 64-bit result does. Hence `clear_top`:
+        the narrowing forms are always 128-bit and must not do it.
         """
         idx = self.vreg_index(dest)
-        return ([f"{{ Arm64Vec _t = (c)->q[{idx}];"] + body +
+        tail = ["  _t.u64[1] = 0;"] if clear_top else []
+        return ([f"{{ Arm64Vec _t = (c)->q[{idx}];"] + body + tail +
                 [f"  (c)->q[{idx}] = _t; }}"])
 
     @staticmethod
     def signed_view(bits: int) -> str:
         return {8: "i8", 16: "i16", 32: "i32", 64: "i64"}[bits]
 
+    def emit_vector_mem(self, insn, ops, m):
+        """ldN/stN and the replicating ldNr.
+
+        Four shapes share an emitter because they differ only in which byte of
+        the memory stream a lane comes from:
+
+            ld1 {v0, v1}      consecutive whole registers, no interleave
+            ldN {v0..vN}      N-way de-interleave: lane e of register r is
+                              element e*N + r of the stream
+            ldNr {v0}         one element per register, broadcast to its lanes
+            ldN {v0.s}[i]     one element per register, into lane i alone
+
+        The write-back is computed here instead of through `writeback`, which
+        would silently produce nothing: these encode the post-index increment
+        as "however much was transferred" rather than as an immediate, so
+        capstone reports the instruction as writing back and leaves no operand
+        saying by how much.
+        """
+        regs = []
+        for o in ops:
+            if o.type == a64.ARM64_OP_MEM:
+                break
+            regs.append(o)
+        mem = next((o for o in ops if o.type == a64.ARM64_OP_MEM), None)
+        if mem is None or not regs:
+            raise Unsupported(f"{m} operands")
+        info = self.vas_of(regs[0])
+        if not info:
+            raise Unsupported(f"{m} without arrangement")
+        lanes, view, bits = info
+        eb = bits // 8
+        store = m.startswith("st")
+        # The index belongs to the whole register list, and capstone hangs it
+        # off the last entry -- the earlier ones report no lane at all. Asking
+        # only the first would read -1 and quietly take the whole-register
+        # path, which is a different instruction.
+        lane = max(self.lane_of(r) for r in regs)
+        ld, st = f"arc_ld{bits}", f"arc_st{bits}"
+
+        lines = ["{ const uint64_t _pa = " + self.mem_address(mem, insn) + ";"]
+        if lane >= 0:
+            # A single-lane transfer leaves the rest of the register alone.
+            total = len(regs) * eb
+            for r, reg in enumerate(regs):
+                slot = self.vec_elem(reg, lane, view)
+                lines.append(f"  {st}(_pa + {r * eb}, {slot});" if store
+                             else f"  {slot} = {ld}(_pa + {r * eb});")
+        elif m in REPL_N:
+            total = len(regs) * eb
+            for r, reg in enumerate(regs):
+                idx = self.vreg_index(reg)
+                lines.append(f"  {{ const uint{bits}_t _e = {ld}(_pa + {r * eb});")
+                lines.append("    Arm64Vec _t; _t.u64[0] = 0; _t.u64[1] = 0;")
+                lines.extend(f"    _t.{view}[{i}] = _e;" for i in range(lanes))
+                lines.append(f"    (c)->q[{idx}] = _t; }}")
+        else:
+            total = len(regs) * lanes * eb
+            stride = STRUCT_N[m]
+            for r, reg in enumerate(regs):
+                # A 64-bit arrangement writes the low half and clears the top,
+                # which filling lane by lane would not do on its own.
+                if not store and lanes * bits == 64:
+                    lines.append(f"  arc_v_clear(c, {self.vreg_index(reg)});")
+                for e in range(lanes):
+                    off = ((r * lanes + e) if stride == 1
+                           else (e * stride + r)) * eb
+                    slot = self.vec_elem(reg, e, view)
+                    lines.append(f"  {st}(_pa + {off}, {slot});" if store
+                                 else f"  {slot} = {ld}(_pa + {off});")
+
+        if insn.writeback:
+            bidx, _, b_sp = reg_of(self.md, mem.mem.base)
+            trailing = [o for o in ops[len(regs) + 1:]
+                        if o.type == a64.ARM64_OP_REG]
+            if trailing:
+                iidx, _, _ = reg_of(self.md, trailing[0].reg)
+                delta = f"ARC_X_R(c, {iidx})"
+            else:
+                delta = f"UINT64_C({total})"
+            lines.append(f"  (c)->sp = (c)->sp + {delta};" if b_sp else
+                         f"  ARC_X_W(c, {bidx}, ARC_X_R(c, {bidx}) + {delta});")
+        lines.append("}")
+        return lines
+
     def emit_vector(self, insn, ops):
         m = insn.mnemonic
+
+        if m in STRUCT_N or m in REPL_N:
+            return self.emit_vector_mem(insn, ops, m)
 
         # A whole-register move is by far the most common vector instruction in
         # a real engine, and it is only a copy. `orr vD, vN, vN` is the same
@@ -381,8 +480,12 @@ class Lifter:
             return self.vec_result(ops[0], [
                 f"  _t.{view}[{i}] = UINT64_C({value});" for i in range(lanes)])
 
-        # Lane to general register.
-        if m in ("umov", "smov") and not self.is_vector(ops[0]):
+        # Lane to general register. `mov w0, v1.s[2]` is the assembler's
+        # preferred spelling of `umov`, so it arrives here under that name.
+        if (m in ("umov", "smov")
+                or (m == "mov" and len(ops) == 2 and self.is_vector(ops[1])
+                    and self.fp_of(ops[0]) is None)) \
+                and not self.is_vector(ops[0]):
             src = ops[1]
             info = self.vas_of(src)
             view = info[1] if info else "u32"
@@ -392,6 +495,21 @@ class Lifter:
                 w = 64 if self.dest_is64(ops[0]) else 32
                 expr = f"arc_sext{w}({expr}, {bits})"
             return [self.write(ops[0], expr)]
+
+        # Lane to scalar register. Naming a scalar destination is what makes
+        # this different from a lane-to-lane move: the write clears the rest
+        # of the register rather than leaving the other lanes alone.
+        if m in ("mov", "dup") and len(ops) == 2 and not self.is_vector(ops[0]) \
+                and self.fp_of(ops[0]) is not None and self.is_vector(ops[1]):
+            idx, kind = self.fp_of(ops[0])
+            sinfo = self.vas_of(ops[1])
+            src_view = sinfo[1] if sinfo else "u64"
+            value = self.vec_elem(ops[1], max(self.lane_of(ops[1]), 0), src_view)
+            if kind == "q":
+                n = self.vreg_index(ops[1])
+                return [f"(c)->q[{idx}] = (c)->q[{n}];"]
+            fn = "arc_du_w" if kind == "d" else "arc_su_w"
+            return [f"{fn}(c, {idx}, {value});"]
 
         # Into a single lane, from another lane or from a general register.
         if self.is_vector(ops[0]) and self.lane_of(ops[0]) >= 0 and \
@@ -598,6 +716,228 @@ class Lifter:
                 body.append(f"  _t.{view}[{i}] = ({self.vec_source(ops[1], i, fview)}"
                             f" {flt_cmp[m]} {r}) ? {ones} : 0;")
             return self.vec_result(ops[0], body)
+
+        # Multiply-accumulate. Genuinely fused: a separate multiply and add
+        # would round twice, and the difference accumulates.
+        if m in ("fmla", "fmls") and fview and len(ops) == 3:
+            f = "f" if bits == 32 else ""
+            neg = "-" if m == "fmls" else ""
+            return self.vec_result_keep(ops[0], [
+                f"  _t.{fview}[{i}] = fma{f}({neg}"
+                f"{self.vec_source(ops[1], i, fview)},"
+                f" {self.vec_source(ops[2], i, fview)}, _t.{fview}[{i}]);"
+                for i in range(lanes)], clear_top=lanes * bits == 64)
+
+        if m in ("mla", "mls") and len(ops) == 3:
+            c = "+" if m == "mla" else "-"
+            return self.vec_result_keep(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(_t.{view}[{i}] {c}"
+                f" (uint{bits}_t)({self.vec_source(ops[1], i, view)} *"
+                f" {self.vec_source(ops[2], i, view)}));"
+                for i in range(lanes)], clear_top=lanes * bits == 64)
+
+        # A window of `lanes` bytes taken from the two sources laid end to end.
+        if m == "ext" and len(ops) == 4 and ops[3].type == a64.ARM64_OP_IMM:
+            n = ops[3].imm
+            return self.vec_result(ops[0], [
+                f"  _t.u8[{i}] = " + (self.vec_elem(ops[1], n + i, "u8")
+                                      if n + i < lanes else
+                                      self.vec_elem(ops[2], n + i - lanes, "u8"))
+                + ";" for i in range(lanes)])
+
+        # Shift right and accumulate, rather than replace.
+        if m in ("usra", "ssra") and len(ops) == 3 \
+                and ops[2].type == a64.ARM64_OP_IMM:
+            src_view = sview if m == "ssra" else view
+            return self.vec_result_keep(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(_t.{view}[{i}] +"
+                f" (uint{bits}_t)({self.vec_source(ops[1], i, src_view)} >>"
+                f" {ops[2].imm}));" for i in range(lanes)],
+                clear_top=lanes * bits == 64)
+
+        # Widening multiply and its accumulating forms. All read one half of a
+        # narrower source; the `2` spelling reads the top half.
+        if m in ("umull", "umull2", "smull", "smull2", "umlal", "umlal2",
+                 "smlal", "smlal2", "umlsl", "umlsl2", "smlsl", "smlsl2") \
+                and len(ops) == 3:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            signed = m.startswith("s")
+            base = slanes - lanes if m.endswith("2") else 0
+            src_view = self.signed_view(sbits) if signed else s_view
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            product = [f"(uint{bits}_t)(({cast})"
+                       f"({self.vec_elem(ops[1], base + i, src_view)}) *"
+                       f" ({cast})({self.vec_source(ops[2], base + i, src_view)}))"
+                       for i in range(lanes)]
+            if "mul" in m:
+                return self.vec_result(ops[0], [
+                    f"  _t.{view}[{i}] = {product[i]};" for i in range(lanes)])
+            c = "-" if "mlsl" in m else "+"
+            return self.vec_result_keep(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(_t.{view}[{i}] {c}"
+                f" {product[i]});" for i in range(lanes)],
+                clear_top=lanes * bits == 64)
+
+        # Widening add: both operands are halves of narrower registers.
+        if m in ("uaddl", "uaddl2", "saddl", "saddl2", "usubl", "usubl2",
+                 "ssubl", "ssubl2") and len(ops) == 3:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            signed = m.startswith("s")
+            base = slanes - lanes if m.endswith("2") else 0
+            src_view = self.signed_view(sbits) if signed else s_view
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            c = "-" if "sub" in m else "+"
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(({cast})"
+                f"({self.vec_elem(ops[1], base + i, src_view)}) {c} ({cast})"
+                f"({self.vec_elem(ops[2], base + i, src_view)}));"
+                for i in range(lanes)])
+
+        # Narrowing shift: `shrn` fills the low half, `shrn2` the high half.
+        if m in ("shrn", "shrn2", "rshrn", "rshrn2") and len(ops) == 3 \
+                and ops[2].type == a64.ARM64_OP_IMM:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            n = ops[2].imm
+            # The rounding form adds half a unit of the last bit shifted out.
+            rnd = f" + (UINT64_C(1) << {n - 1})" if m.startswith("r") and n else ""
+            def narrowed(i):
+                return (f"(uint{bits}_t)((uint{sbits}_t)("
+                        f"{self.vec_elem(ops[1], i, s_view)}{rnd}) >> {n})")
+            if m.endswith("2"):
+                return self.vec_result_keep(ops[0], [
+                    f"  _t.{view}[{lanes - slanes + i}] = {narrowed(i)};"
+                    for i in range(slanes)])
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {narrowed(i)};" for i in range(slanes)])
+
+        # Absolute difference, and the accumulating form.
+        if m in ("uabd", "sabd", "uaba", "saba") and len(ops) == 3:
+            v = sview if m[0] == "s" else view
+            def absdiff(i):
+                a = self.vec_source(ops[1], i, v)
+                b = self.vec_source(ops[2], i, v)
+                return f"(uint{bits}_t)({a} > {b} ? {a} - {b} : {b} - {a})"
+            # `uaba` accumulates, `uabd` replaces -- and they differ only in
+            # the last letter, so this has to test the end of the name.
+            if m.endswith("a"):
+                return self.vec_result_keep(ops[0], [
+                    f"  _t.{view}[{i}] = (uint{bits}_t)(_t.{view}[{i}] +"
+                    f" {absdiff(i)});" for i in range(lanes)],
+                    clear_top=lanes * bits == 64)
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {absdiff(i)};" for i in range(lanes)])
+
+        # Halving add, rounded or truncated. Computed a lane width up, so the
+        # sum cannot wrap before it is halved.
+        if m in ("uhadd", "urhadd", "shadd", "srhadd") and len(ops) == 3 \
+                and bits < 64:
+            signed = m[0] == "s"
+            v = sview if signed else view
+            wide = (f"int{bits * 2}_t" if signed else f"uint{bits * 2}_t")
+            rnd = " + 1" if "rhadd" in m else ""
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)((({wide})"
+                f"{self.vec_source(ops[1], i, v)} + ({wide})"
+                f"{self.vec_source(ops[2], i, v)}{rnd}) >> 1);"
+                for i in range(lanes)])
+
+        sat = {"sqadd": "arc_sqadd", "sqsub": "arc_sqsub",
+               "uqadd": "arc_uqadd", "uqsub": "arc_uqsub",
+               "sqdmulh": "arc_sqdmulh", "sqrdmulh": "arc_sqrdmulh"}
+        if m in sat and len(ops) == 3:
+            if bits >= 64:
+                raise Unsupported(f"{m} on 64-bit lanes")
+            v = sview if m[0] == "s" else view
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t){sat[m]}{bits}("
+                f"{self.vec_source(ops[1], i, v)},"
+                f" {self.vec_source(ops[2], i, v)});" for i in range(lanes)])
+
+        # Signed source, unsigned narrower destination: anything negative
+        # clamps to zero rather than wrapping to a large positive.
+        if m in ("sqshrun", "sqshrun2", "sqxtun", "sqxtun2"):
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, _, sbits = sinfo
+            n = (ops[2].imm if len(ops) > 2
+                 and ops[2].type == a64.ARM64_OP_IMM else 0)
+            hi = (1 << bits) - 1
+            ssv = self.signed_view(sbits)
+
+            def clamped(i):
+                v = (f"((int{sbits}_t)({self.vec_elem(ops[1], i, ssv)})"
+                     f" >> {n})")
+                return (f"(uint{bits}_t)({v} < 0 ? 0 :"
+                        f" {v} > {hi} ? {hi} : {v})")
+            if m.endswith("2"):
+                return self.vec_result_keep(ops[0], [
+                    f"  _t.{view}[{lanes - slanes + i}] = {clamped(i)};"
+                    for i in range(slanes)])
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {clamped(i)};" for i in range(slanes)])
+
+        # Permutes. Each names which elements of the two sources interleave:
+        # `zip` takes one half of each, `uzp` takes alternate elements of the
+        # pair laid end to end, `trn` takes matching even or odd positions.
+        if m in ("zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2") \
+                and len(ops) == 3:
+            half = lanes // 2
+            body = []
+            for i in range(lanes):
+                if m.startswith("zip"):
+                    base = half if m == "zip2" else 0
+                    src = ops[1] if i % 2 == 0 else ops[2]
+                    e = base + i // 2
+                elif m.startswith("uzp"):
+                    odd = 1 if m == "uzp2" else 0
+                    src = ops[1] if i < half else ops[2]
+                    e = 2 * (i if i < half else i - half) + odd
+                else:
+                    odd = 1 if m == "trn2" else 0
+                    src = ops[1] if i % 2 == 0 else ops[2]
+                    e = (i & ~1) + odd
+                body.append(f"  _t.{view}[{i}] = {self.vec_elem(src, e, view)};")
+            return self.vec_result(ops[0], body)
+
+        minmax = {"umax": ">", "umin": "<", "smax": ">", "smin": "<"}
+        if m in minmax and len(ops) == 3:
+            v = sview if m[0] == "s" else view
+            body = []
+            for i in range(lanes):
+                a = self.vec_source(ops[1], i, v)
+                b = self.vec_source(ops[2], i, v)
+                body.append(f"  _t.{view}[{i}] = (uint{bits}_t)("
+                            f"{a} {minmax[m]} {b} ? {a} : {b});")
+            return self.vec_result(ops[0], body)
+
+        # Table lookup. The registers between the destination and the index
+        # are the table, and they are consecutive by encoding.
+        if m in ("tbl", "tbx") and len(ops) >= 3:
+            table, index = ops[1:-1], ops[-1]
+            first, n = self.vreg_index(table[0]), len(table)
+            body = []
+            for i in range(lanes):
+                e = self.vec_source(index, i, "u8")
+                if m == "tbl":
+                    body.append(f"  _t.u8[{i}] = arc_tbl(c, {first}, {n}, {e});")
+                else:
+                    body.append(f"  {{ const uint8_t _i = {e};")
+                    body.append(f"    if (_i < {n * 16}) _t.u8[{i}] ="
+                                f" arc_tbl(c, {first}, {n}, _i); }}")
+            if m == "tbl":
+                return self.vec_result(ops[0], body)
+            return self.vec_result_keep(ops[0], body,
+                                        clear_top=lanes * bits == 64)
 
         raise Unsupported(f"vector {m}")
 

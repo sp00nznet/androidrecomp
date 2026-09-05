@@ -398,6 +398,59 @@ ARC_SHL(32)
 ARC_SHL(64)
 #undef ARC_SHL
 
+// --- saturating lane arithmetic --------------------------------------------
+// Clamping instead of wrapping is the entire reason these instructions exist:
+// pixel and audio code relies on an overflowing sum sticking at full scale
+// rather than coming out the other end as a dark pixel or a click. Computed
+// one width up, which is why 64-bit lanes are not defined here -- they have no
+// wider type to be computed in, and no title has yet used them.
+#define ARC_SAT(bits, lo, hi)                                                 \
+  static inline int##bits##_t arc_clamp##bits(int64_t r) {                    \
+    return (int##bits##_t)(r > (hi) ? (hi) : r < (lo) ? (lo) : r);            \
+  }                                                                           \
+  static inline int##bits##_t arc_sqadd##bits(int##bits##_t a,                \
+                                              int##bits##_t b) {              \
+    return arc_clamp##bits((int64_t)a + (int64_t)b);                          \
+  }                                                                           \
+  static inline int##bits##_t arc_sqsub##bits(int##bits##_t a,                \
+                                              int##bits##_t b) {              \
+    return arc_clamp##bits((int64_t)a - (int64_t)b);                          \
+  }                                                                           \
+  static inline uint##bits##_t arc_uqadd##bits(uint##bits##_t a,              \
+                                               uint##bits##_t b) {            \
+    uint##bits##_t r = (uint##bits##_t)(a + b);                               \
+    return r < a ? (uint##bits##_t)~(uint##bits##_t)0 : r;                    \
+  }                                                                           \
+  static inline uint##bits##_t arc_uqsub##bits(uint##bits##_t a,              \
+                                               uint##bits##_t b) {            \
+    return a < b ? (uint##bits##_t)0 : (uint##bits##_t)(a - b);               \
+  }                                                                           \
+  /* Doubling multiply, keeping the high half: (2*a*b) >> bits. Saturates    \
+     only where both operands are the most negative value. */                 \
+  static inline int##bits##_t arc_sqdmulh##bits(int##bits##_t a,              \
+                                                int##bits##_t b) {            \
+    return arc_clamp##bits(((int64_t)a * (int64_t)b) >> (bits - 1));          \
+  }                                                                           \
+  /* The rounding form adds half a unit before discarding the low half. */    \
+  static inline int##bits##_t arc_sqrdmulh##bits(int##bits##_t a,             \
+                                                 int##bits##_t b) {           \
+    int64_t r = (int64_t)a * (int64_t)b * 2 + ((int64_t)1 << (bits - 1));     \
+    return arc_clamp##bits(r >> bits);                                        \
+  }
+ARC_SAT(8, INT8_MIN, INT8_MAX)
+ARC_SAT(16, INT16_MIN, INT16_MAX)
+ARC_SAT(32, INT32_MIN, INT32_MAX)
+#undef ARC_SAT
+
+// A table lookup reads a byte from up to four consecutive registers treated as
+// one run of bytes. The register number wraps at 32, and an index past the end
+// of the table is not an error: `tbl` answers zero and `tbx` leaves the
+// destination byte alone, which is what makes them useful as a permute with a
+// built-in mask.
+static inline uint8_t arc_tbl(const Arm64Ctx *c, int base, int n, uint8_t i) {
+  return i < n * 16 ? c->q[(base + (i >> 4)) & 31].u8[i & 15] : (uint8_t)0;
+}
+
 // --- bit manipulation ------------------------------------------------------
 // Sign-extending a field means shifting its top bit up to the register's top
 // and back down arithmetically. Spelled once here rather than inline in the

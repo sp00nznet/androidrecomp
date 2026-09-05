@@ -119,9 +119,10 @@ def harvest(path: str, per_form: int, only: set[str] | None):
 
 def build_dll(lifter: Lifter, cases: list, workdir: str) -> ctypes.CDLL | None:
     """Emit one C function per case and compile them into a shared library."""
-    src = ['#include "arm64_context.h"', "",
-           "void arc_dispatch(Arm64Ctx* c, uint64_t t) { (void)c; (void)t; }",
-           ""]
+    # No `arc_dispatch` stub: the runtime owns that symbol now, and defining it
+    # here as well is a duplicate at link time. A single instruction under test
+    # never dispatches anyway.
+    src = ['#include "arm64_context.h"', ""]
     exports = []
     for i, (form, insn, lines) in enumerate(cases):
         name = f"t{i}"
