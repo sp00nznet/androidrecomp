@@ -295,6 +295,10 @@ DWORD WINAPI RunEntry(void* p) {
     // after the join.
     ReportTrail();
   }
+  // Hand the context back before this thread ends, or the next step cannot
+  // take it: a context left current on a thread that no longer exists is not
+  // available to claim elsewhere.
+  if (e->window) e->window->ReleaseCurrent();
   return 0;
 }
 #endif
@@ -325,16 +329,25 @@ int main(int argc, char** argv) {
   setvbuf(stderr, nullptr, _IONBF, 0);
 
   const char* lib = nullptr;
-  const char* entry = nullptr;
-  const char* entry_args = nullptr;
+  // An engine's startup is a sequence, not a call. cocos2d-x builds its
+  // Application in the first JNI method Android invokes and only then accepts
+  // the one that initialises the renderer, so a host that calls the second
+  // without the first finds a null singleton. Each --entry adds a step; an
+  // --args after one belongs to it.
+  std::vector<std::pair<std::string, std::string>> entries;
   long ctor_limit = 0;
   bool want_window = false;
   const char* gl_version = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--entry=", 8) == 0)
-      entry = argv[i] + 8;
-    else if (strncmp(argv[i], "--args=", 7) == 0)
-      entry_args = argv[i] + 7;
+      entries.emplace_back(argv[i] + 8, std::string());
+    else if (strncmp(argv[i], "--args=", 7) == 0) {
+      if (entries.empty()) {
+        fprintf(stderr, "--args must follow an --entry\n");
+        return 2;
+      }
+      entries.back().second = argv[i] + 7;
+    }
     else if (strcmp(argv[i], "--window") == 0)
       want_window = true;
     else if (strncmp(argv[i], "--gl=", 5) == 0)
@@ -561,7 +574,10 @@ int main(int argc, char** argv) {
     for (const std::string& f : first_failures) printf("%s\n", f.c_str());
   }
 
-  if (entry) {
+  for (const auto& step : entries) {
+    const char* entry = step.first.c_str();
+    const char* entry_args = step.second.empty() ? nullptr
+                                                 : step.second.c_str();
     const uint64_t addr = g_image.Lookup(entry);
     if (!addr) {
       fprintf(stderr, "\nno symbol named %s\n", entry);
