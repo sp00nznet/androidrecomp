@@ -327,13 +327,13 @@ int Waitpid(int, int*, int) { return -1; }
 int Kill(int, int) { return 0; }
 void Openlog(const char*, int, int) {}
 void Closelog() {}
-void Syslog(int, const char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
-  va_end(ap);
-  fputc('\n', stderr);
-}
+// No `syslog` here on purpose. It is variadic, and a variadic guest call
+// cannot be marshalled by the fixed-arity thunk: its arguments are spread
+// across the general registers, the vector registers and the stack by rules
+// the thunk has no way to recover. shim_varargs registers it as a
+// context-taking native, which can. A second fixed-arity binding for the same
+// name resolved only because the varargs layer happens to be asked first, and
+// would have marshalled the call wrongly the day that order changed.
 void AndroidSetAbortMessage(const char* msg) {
   fprintf(stderr, "abort: %s\n", msg ? msg : "");
 }
@@ -415,7 +415,6 @@ const Entry kTable[] = {
     E("fork", Fork),                E("execl", Execl),
     E("waitpid", Waitpid),          E("kill", Kill),
     E("openlog", Openlog),          E("closelog", Closelog),
-    E("syslog", Syslog),
     E("android_set_abort_message", AndroidSetAbortMessage),
 
     E("sigaction", Sigaction),      E("sigaddset", Sigaddset),

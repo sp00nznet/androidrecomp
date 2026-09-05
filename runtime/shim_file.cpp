@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <random>
 #include <string>
 
 #include "shim.h"
@@ -168,7 +170,33 @@ int Fstat(int fd, GuestStat* out) {
 #endif
 }
 
+// `/dev/urandom` is not a file to be translated; it is the interface to the
+// system's entropy, and the host has its own. Without it the C++ runtime's
+// std::random_device throws out of a *static initialiser* -- so the engine
+// terminates before anything runs, and the only clue is an abort message
+// several frames into the terminate handler. Worth an explicit answer.
+constexpr int kRandomFd = 0x7000000;
+
+bool IsRandomDevice(const char* path) {
+  return path && (strcmp(path, "/dev/urandom") == 0 ||
+                  strcmp(path, "/dev/random") == 0);
+}
+
+void FillRandom(void* buf, size_t n) {
+  static std::mutex lock;
+  static std::random_device source;
+  std::lock_guard<std::mutex> held(lock);
+  auto* out = static_cast<unsigned char*>(buf);
+  size_t i = 0;
+  while (i < n) {
+    const unsigned int bits = source();
+    for (size_t b = 0; b < sizeof(bits) && i < n; ++b, ++i)
+      out[i] = static_cast<unsigned char>(bits >> (b * 8));
+  }
+}
+
 int Open(const char* path, int flags, ...) {
+  if (IsRandomDevice(path)) return kRandomFd;
 #if defined(_WIN32)
   return _open(path, TranslateOpenFlags(flags), _S_IREAD | _S_IWRITE);
 #else
@@ -178,6 +206,7 @@ int Open(const char* path, int flags, ...) {
 int Open2(const char* path, int flags) { return Open(path, flags); }
 
 int Close(int fd) {
+  if (fd == kRandomFd) return 0;
 #if defined(_WIN32)
   return _close(fd);
 #else
@@ -185,6 +214,10 @@ int Close(int fd) {
 #endif
 }
 int64_t Read(int fd, void* buf, uint64_t n) {
+  if (fd == kRandomFd) {
+    FillRandom(buf, static_cast<size_t>(n));
+    return static_cast<int64_t>(n);
+  }
 #if defined(_WIN32)
   return _read(fd, buf, static_cast<unsigned>(n));
 #else
