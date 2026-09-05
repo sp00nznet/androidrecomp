@@ -543,6 +543,26 @@ class Lifter:
             return self.vec_result(d, [f"  _t.{view}[{i}] = ({value});"
                                        for i in range(lanes)])
 
+        # Scalar arithmetic that takes one operand from a lane, as in
+        # `fmul s1, s4, v19.s[1]`. The destination is a scalar register and has
+        # no arrangement; the lane index on the last operand is the only thing
+        # that makes this look like a vector instruction at all.
+        if m in ("fmul", "fmulx", "fmla", "fmls") and len(ops) == 3 \
+                and not self.is_vector(ops[0]) \
+                and self.fp_of(ops[0]) is not None \
+                and self.is_vector(ops[2]) and self.lane_of(ops[2]) >= 0:
+            kind = self.fp_of(ops[0])[1]
+            w = "32" if kind == "s" else "64"
+            fview = "f32" if kind == "s" else "f64"
+            lane = self.vec_elem(ops[2], self.lane_of(ops[2]), fview)
+            n = self.fp_read(ops[1])
+            if m in ("fmul", "fmulx"):
+                return [self.fp_write(ops[0], f"arc_fmul{w}({n}, {lane})")]
+            f = "f" if w == "32" else ""
+            sign = "-" if m == "fmls" else ""
+            return [self.fp_write(
+                ops[0], f"fma{f}({sign}{n}, {lane}, {self.fp_read(ops[0])})")]
+
         # Horizontal reductions collapse the whole vector into one value, so
         # the destination is a scalar register and carries no arrangement of
         # its own. That is why they have to be answered here, before anything
@@ -1307,6 +1327,13 @@ class Lifter:
             return [self.fp_write(
                 ops[0],
                 f"arc_{m}{w}({self.fp_read(ops[1])}, {self.fp_read(ops[2])})")]
+        # Negated multiply: one instruction, and the negation is of the
+        # product rather than of either operand.
+        if m == "fnmul":
+            w = "32" if self.fp_kind(ops[0]) == "s" else "64"
+            return [self.fp_write(
+                ops[0], f"(-arc_fmul{w}({self.fp_read(ops[1])},"
+                        f" {self.fp_read(ops[2])}))")]
         if m == "fneg":
             return [self.fp_write(ops[0], f"(-({self.fp_read(ops[1])}))")]
         if m == "fabs":
