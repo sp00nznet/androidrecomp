@@ -165,33 +165,40 @@ constexpr SlotInfo kKnown[] = {
     {61, "CallVoidMethod", false},      {94, "GetFieldID", true},
     {95, "GetObjectField", true},       {96, "GetBooleanField", false},
     {100, "GetIntField", false},        {101, "GetLongField", false},
-    {102, "GetFloatField", false},      {104, "GetStaticMethodID", true},
-    {135, "GetStaticFieldID", true},    {136, "GetStaticObjectField", true},
-    {141, "GetStaticIntField", false},  {154, "NewString", true},
-    {155, "GetStringLength", false},    {156, "GetStringChars", true},
-    {157, "ReleaseStringChars", false}, {158, "NewStringUTF", true},
-    {159, "GetStringUTFLength", false}, {160, "GetStringUTFChars", true},
-    {161, "ReleaseStringUTFChars", false},
-    {162, "GetArrayLength", false},     {163, "NewObjectArray", true},
-    {164, "GetObjectArrayElement", true},
-    {165, "SetObjectArrayElement", false},
-    {166, "NewBooleanArray", true},     {167, "NewByteArray", true},
-    {168, "NewCharArray", true},        {169, "NewShortArray", true},
-    {170, "NewIntArray", true},         {171, "NewLongArray", true},
-    {172, "NewFloatArray", true},       {173, "NewDoubleArray", true},
-    {174, "GetBooleanArrayElements", true},
-    {175, "GetByteArrayElements", true},
-    {176, "GetCharArrayElements", true},
-    {177, "GetShortArrayElements", true},
-    {178, "GetIntArrayElements", true},
-    {179, "GetLongArrayElements", true},
-    {180, "GetFloatArrayElements", true},
-    {181, "GetDoubleArrayElements", true},
-    {206, "RegisterNatives", false},    {210, "GetJavaVM", false},
-    {217, "NewWeakGlobalRef", true},
+    {102, "GetFloatField", false},
+    // The nine that were missing, and whose absence shifted every index after
+    // them nine places low.
+    {104, "SetObjectField", false},     {105, "SetBooleanField", false},
+    {106, "SetByteField", false},       {107, "SetCharField", false},
+    {108, "SetShortField", false},      {109, "SetIntField", false},
+    {110, "SetLongField", false},       {111, "SetFloatField", false},
+    {112, "SetDoubleField", false},     {113, "GetStaticMethodID", true},
+    {144, "GetStaticFieldID", true},    {145, "GetStaticObjectField", true},
+    {150, "GetStaticIntField", false},  {163, "NewString", true},
+    {164, "GetStringLength", false},    {165, "GetStringChars", true},
+    {166, "ReleaseStringChars", false}, {167, "NewStringUTF", true},
+    {168, "GetStringUTFLength", false}, {169, "GetStringUTFChars", true},
+    {170, "ReleaseStringUTFChars", false},
+    {171, "GetArrayLength", false},     {172, "NewObjectArray", true},
+    {173, "GetObjectArrayElement", true},
+    {174, "SetObjectArrayElement", false},
+    {175, "NewBooleanArray", true},     {176, "NewByteArray", true},
+    {177, "NewCharArray", true},        {178, "NewShortArray", true},
+    {179, "NewIntArray", true},         {180, "NewLongArray", true},
+    {181, "NewFloatArray", true},       {182, "NewDoubleArray", true},
+    {183, "GetBooleanArrayElements", true},
+    {184, "GetByteArrayElements", true},
+    {185, "GetCharArrayElements", true},
+    {186, "GetShortArrayElements", true},
+    {187, "GetIntArrayElements", true},
+    {188, "GetLongArrayElements", true},
+    {189, "GetFloatArrayElements", true},
+    {190, "GetDoubleArrayElements", true},
+    {215, "RegisterNatives", false},    {219, "GetJavaVM", false},
+    {226, "NewWeakGlobalRef", true},
     // ExceptionCheck must answer false, or the engine believes a throw is
     // pending after every call and unwinds instead of continuing.
-    {219, "ExceptionCheck", false},     {220, "NewDirectByteBuffer", true},
+    {228, "ExceptionCheck", false},     {229, "NewDirectByteBuffer", true},
 
     // The invocation interface, offset past the environment's slots.
     {kVmBase + 3, "DestroyJavaVM", false},
@@ -245,19 +252,19 @@ void Handle(size_t index, Arm64Ctx* c) {
       arc_s_w(c, 0, f && f->kind == 'f' ? static_cast<float>(f->real) : 0.0f);
       return;
     }
-    case 155:    // GetStringLength
-    case 159: {  // GetStringUTFLength
+    case 164:    // GetStringLength
+    case 168: {  // GetStringUTFLength
       const char* s = reinterpret_cast<const char*>(c->x[1]);
       c->x[0] = s ? strlen(s) : 0;
       return;
     }
-    case 156:    // GetStringChars
-    case 160: {  // GetStringUTFChars -- a jstring already holds its own text
+    case 165:    // GetStringChars
+    case 169: {  // GetStringUTFChars -- a jstring already holds its own text
       c->x[0] = c->x[1];
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
-    case 210: {  // GetJavaVM(env, JavaVM** out)
+    case 219: {  // GetJavaVM(env, JavaVM** out)
       // Writing the VM out is the whole point of the call. Left unwritten, the
       // caller reads whatever that variable happened to hold and branches
       // through it as though it were a table of functions.
