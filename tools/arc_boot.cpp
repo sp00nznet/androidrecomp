@@ -371,6 +371,7 @@ int main(int argc, char** argv) {
     // Each constructor starts from a clean frame; a previous failure must not
     // leave the stack pointer somewhere strange.
     ctx.sp = stack_top;
+    arc_frame_clear();
     unsigned long code = 0;
     const int rc = CallGuarded(&ctx, ctors[i], &code);
     if (rc == 0) {
@@ -407,6 +408,11 @@ int main(int argc, char** argv) {
                  what.empty() ? "" : " -- ", what.c_str());
       }
       first_failures.push_back(buf);
+      if (first_failures.size() == 1) {
+        printf("%s
+", buf);
+        ReportFrames();
+      }
     }
   }
 

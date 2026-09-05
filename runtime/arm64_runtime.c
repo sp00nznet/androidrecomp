@@ -6,6 +6,11 @@
 
 #include "arm64_context.h"
 
+#include <setjmp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #define ARC_THREAD_LOCAL __declspec(thread)
@@ -112,15 +117,23 @@ uint64_t arc_smulh(uint64_t a, uint64_t b) {
 #endif
 }
 
+// The thread pointer. Bionic points TPIDR_EL0 at a per-thread control block,
+// and compiled code indexes off it and dereferences without checking -- so
+// returning zero is not "no value", it is a null pointer with a small offset
+// added, which faults at a low address that looks like a lifter bug.
+//
+// Nothing here reads meaningful values out of the block; the guest wants it for
+// its own thread-local storage. It only has to be real, zeroed, writable memory
+// of a plausible size.
+#define ARC_TLS_BLOCK 16384
 static ARC_THREAD_LOCAL uint64_t t_tpidr;
-uint64_t arc_tpidr_read(void) { return t_tpidr; }
-void arc_tpidr_write(uint64_t v) { t_tpidr = v; }
 
-#include <setjmp.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+uint64_t arc_tpidr_read(void) {
+  if (!t_tpidr) t_tpidr = (uint64_t)(uintptr_t)calloc(1, ARC_TLS_BLOCK);
+  return t_tpidr;
+}
+
+void arc_tpidr_write(uint64_t v) { t_tpidr = v; }
 
 static ARC_THREAD_LOCAL jmp_buf* t_recovery;
 static ARC_THREAD_LOCAL char t_last_trap[256];
