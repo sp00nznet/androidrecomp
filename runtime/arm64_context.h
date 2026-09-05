@@ -571,6 +571,13 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
 typedef const char* (*ArcExplainFn)(uint64_t address);
 void arc_set_explain(ArcExplainFn fn);
 
+// The registered host function nearest below an address, and how far above it
+// the address falls. An indirect branch into host code that the dispatcher
+// does not recognise is otherwise a bare number: this says which shim it
+// landed in the middle of, which is usually the whole answer. NULL if nothing
+// is registered below it.
+const char* arc_native_near(uint64_t address, uint64_t* delta);
+
 // Call guest code from the host, for the shim entry points that take a
 // callback: pthread_once's initialiser, dl_iterate_phdr's visitor, a
 // comparator. Those pointers are guest code, and calling one as a host

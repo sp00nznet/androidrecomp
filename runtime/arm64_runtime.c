@@ -322,6 +322,24 @@ uint64_t arc_call_guest(uint64_t fn, const uint64_t* args, int n) {
   return result;
 }
 
+const char* arc_native_near(uint64_t address, uint64_t* delta) {
+  const char* best = NULL;
+  uint64_t at = 0;
+  size_t i;
+  for (i = 0; i < g_native_count; ++i)
+    if (g_natives[i].address <= address && g_natives[i].address >= at) {
+      at = g_natives[i].address;
+      best = g_natives[i].name;
+    }
+  for (i = 0; i < g_ctx_native_count; ++i)
+    if (g_ctx_natives[i].address <= address && g_ctx_natives[i].address >= at) {
+      at = g_ctx_natives[i].address;
+      best = g_ctx_natives[i].name;
+    }
+  if (best && delta) *delta = address - at;
+  return best;
+}
+
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
   // Context-taking natives first: they are a strict superset of what the
   // thunk can express, so a name registered both ways wants this one.

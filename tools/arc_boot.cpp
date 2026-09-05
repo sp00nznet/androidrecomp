@@ -81,6 +81,21 @@ std::string ExplainAddress(uint64_t addr) {
       return buf;
     }
   }
+  // Not in a guest image, so if it is executable it is ours. The dispatcher
+  // knows every host function it was told about, and naming the one an address
+  // sits inside is usually the whole answer.
+  {
+    uint64_t delta = 0;
+    if (const char* near = arc_native_near(addr, &delta)) {
+      if (delta < 0x1000) {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "%#llx into the host's %s",
+                 static_cast<unsigned long long>(delta), near);
+        return buf;
+      }
+    }
+  }
+
   // Nothing we allocated deliberately. The operating system still knows what
   // is there, which distinguishes a wild pointer from a real region touched
   // the wrong way -- and that is the difference between hunting a lifter bug
