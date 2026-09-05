@@ -86,11 +86,13 @@ std::string ExplainAddress(uint64_t addr) {
   // sits inside is usually the whole answer.
   {
     uint64_t delta = 0;
-    if (const char* near = arc_native_near(addr, &delta)) {
+    // Not `near`: MSVC still keeps that as a keyword from its segmented
+    // memory days, and using it here is a syntax error with no hint as to why.
+    if (const char* host_fn = arc_native_near(addr, &delta)) {
       if (delta < 0x1000) {
         char buf[192];
         snprintf(buf, sizeof(buf), "%#llx into the host's %s",
-                 static_cast<unsigned long long>(delta), near);
+                 static_cast<unsigned long long>(delta), host_fn);
         return buf;
       }
     }
