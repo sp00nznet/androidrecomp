@@ -101,6 +101,15 @@ std::string ExplainAddress(uint64_t addr) {
   return "not in any mapped image";
 }
 
+// Same answer, in the shape the runtime can take. A dispatch miss is reported
+// from inside the library, which knows the branch went somewhere it does not
+// recognise but not that the somewhere is an unresolved import.
+const char* ExplainForRuntime(uint64_t addr) {
+  static thread_local std::string text;
+  text = ExplainAddress(addr);
+  return text.empty() ? nullptr : text.c_str();
+}
+
 // Decode a packed frame back into the image it came from and the offset
 // inside it, which is what a disassembler wants.
 void ReportFrames() {
@@ -332,6 +341,7 @@ int main(int argc, char** argv) {
   // The JNI table is reached the same way an import is -- the guest loads a
   // slot out of it and branches -- so its entries have to be known to the
   // bridge as well.
+  arc_set_explain(&ExplainForRuntime);
   arc_jni_register();
   arc::ShimRegisterVarargs();
 

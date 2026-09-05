@@ -556,6 +556,14 @@ void arc_register_ctx_native(uint64_t address, const char* name, ArcCtxFn fn);
 // Called by the generated dispatcher when the lifted table has no entry.
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
 
+// What an address is, in words, for the host to fill in. The runtime knows an
+// indirect branch went somewhere it does not recognise; only the host knows
+// that the somewhere is an unresolved import's slot, and which import. Without
+// this the trap names a bare address and the answer takes arithmetic against a
+// load address that changes every run. Returns NULL when it has nothing to say.
+typedef const char* (*ArcExplainFn)(uint64_t address);
+void arc_set_explain(ArcExplainFn fn);
+
 // Call guest code from the host, for the shim entry points that take a
 // callback: pthread_once's initialiser, dl_iterate_phdr's visitor, a
 // comparator. Those pointers are guest code, and calling one as a host

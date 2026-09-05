@@ -266,6 +266,10 @@ static ArcDispatchFn g_dispatch;
 
 void arc_set_dispatch(ArcDispatchFn fn) { g_dispatch = fn; }
 
+static ArcExplainFn g_explain;
+
+void arc_set_explain(ArcExplainFn fn) { g_explain = fn; }
+
 void arc_dispatch(Arm64Ctx* c, uint64_t target) {
   if (g_dispatch) {
     g_dispatch(c, target);
@@ -350,11 +354,15 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
     c->x[0] = r;
     return;
   }
-  char msg[128];
-  snprintf(msg, sizeof(msg),
-           "indirect branch to %#llx, neither lifted nor a known import",
-           (unsigned long long)target);
-  arc_trap(c, msg);
+  {
+    char msg[256];
+    const char* what = g_explain ? g_explain(target) : NULL;
+    snprintf(msg, sizeof(msg),
+             "indirect branch to %#llx, neither lifted nor a known import%s%s",
+             (unsigned long long)target, what ? " -- " : "",
+             what ? what : "");
+    arc_trap(c, msg);
+  }
 }
 
 // The fallback for a host with no lifted program is above, in arc_dispatch
