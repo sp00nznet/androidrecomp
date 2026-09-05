@@ -10,10 +10,16 @@ namespace arc {
 
 Window::~Window() { Close(); }
 
-bool Window::Open(const char* title, int width, int height, std::string* err) {
+bool Window::Open(const char* title, int width, int height, std::string* err,
+                  int major, int minor) {
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
     if (err) *err = SDL_GetError();
     return false;
+  }
+
+  if (major) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, major);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor);
   }
 
   // The engine speaks GLES2 (plus a fixed-function GLESv1_CM tail). Desktop GL
@@ -132,7 +138,7 @@ std::string Window::Describe() const {
 #else  // no SDL2
 
 Window::~Window() = default;
-bool Window::Open(const char*, int, int, std::string* err) {
+bool Window::Open(const char*, int, int, std::string* err, int, int) {
   if (err) *err = "built without SDL2";
   return false;
 }

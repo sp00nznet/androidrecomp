@@ -19,7 +19,13 @@ class Window {
  public:
   ~Window();
 
-  bool Open(const char* title, int width, int height, std::string* err);
+  // `major`/`minor` request a particular GL version; 0 takes whatever the
+  // driver offers, which has been GL 2.1 in practice. That default suits an
+  // engine with a fixed-function GLESv1_CM tail, and is old for one written
+  // against GLES2/GL3 -- so which to ask for is a property of the title, not
+  // of the kit, and the caller decides.
+  bool Open(const char* title, int width, int height, std::string* err,
+            int major = 0, int minor = 0);
 
   // Drains the event queue. Returns false once the user has asked to close,
   // which is the host's cue to call the engine's destroy path.

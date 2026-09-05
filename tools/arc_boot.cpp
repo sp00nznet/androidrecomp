@@ -273,6 +273,7 @@ int main(int argc, char** argv) {
   const char* entry_args = nullptr;
   long ctor_limit = 0;
   bool want_window = false;
+  const char* gl_version = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--entry=", 8) == 0)
       entry = argv[i] + 8;
@@ -280,6 +281,8 @@ int main(int argc, char** argv) {
       entry_args = argv[i] + 7;
     else if (strcmp(argv[i], "--window") == 0)
       want_window = true;
+    else if (strncmp(argv[i], "--gl=", 5) == 0)
+      gl_version = argv[i] + 5;
     else if (strncmp(argv[i], "--constructors=", 15) == 0)
       ctor_limit = strtol(argv[i] + 15, nullptr, 10);
     else
@@ -300,8 +303,11 @@ int main(int argc, char** argv) {
   // holds a surface before it calls in.
   arc::Window window;
   if (want_window) {
+    int gl_major = 0, gl_minor = 0;
+    if (gl_version) sscanf(gl_version, "%d.%d", &gl_major, &gl_minor);
     std::string window_err;
-    if (!window.Open("androidrecomp", 1280, 720, &window_err)) {
+    if (!window.Open("androidrecomp", 1280, 720, &window_err, gl_major,
+                     gl_minor)) {
       fprintf(stderr, "window failed: %s\n", window_err.c_str());
       return 1;
     }
