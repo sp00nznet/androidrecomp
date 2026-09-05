@@ -20,7 +20,26 @@
 
 namespace arc {
 
+// EGL's own loader, which the engine uses for the entry points it resolves
+// lazily rather than through its import table. Leaving it unbound costs more
+// than one symbol: the guest branches *through* the empty slot and stops
+// there, which is what a cocos2d-x GL view does before it ever opens. Bound
+// unconditionally, so the slot always holds something callable -- with no
+// context it answers null, which the engine can see and act on, rather than
+// jumping into nothing.
+uint64_t EglGetProcAddress(const char* name) {
+#if defined(ARC_HAVE_SDL2)
+  if (!name || !SDL_GL_GetCurrentContext()) return 0;
+  return reinterpret_cast<uint64_t>(SDL_GL_GetProcAddress(name));
+#else
+  (void)name;
+  return 0;
+#endif
+}
+
 uint64_t ShimResolveGL(const char* name) {
+  if (strcmp(name, "eglGetProcAddress") == 0)
+    return reinterpret_cast<uint64_t>(&EglGetProcAddress);
 #if defined(ARC_HAVE_SDL2)
   if (strncmp(name, "gl", 2) != 0) return 0;
   // No context, no GL driver to ask. The window is opened before the engine is
