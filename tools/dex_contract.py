@@ -208,6 +208,54 @@ def dex_blobs(path: str):
         yield path, fh.read()
 
 
+
+def library_exports(path: str) -> set[str]:
+    """The `Java_*` symbols a library actually exports."""
+    try:
+        from elftools.elf.elffile import ELFFile
+    except ImportError:
+        sys.exit("cross-checking needs pyelftools")
+    with open(path, "rb") as fh:
+        elf = ELFFile(fh)
+        table = elf.get_section_by_name(".dynsym")
+        if table is None:
+            return set()
+        return {sym.name for sym in table.iter_symbols()
+                if sym.name.startswith("Java_")
+                and sym["st_shndx"] != "SHN_UNDEF"}
+
+
+def report_disagreement(declared: set[str], exported: set[str]) -> None:
+    """Say where the two sources of truth differ, and why they might.
+
+    A dex says what *this* package declares native, with signatures. A library
+    says what the engine makes available. They are not the same list and
+    neither contains the other, because one binary is usually built once and
+    shipped to several storefronts: the exports are the union across those
+    builds, while any single package's dex declares only its own.
+
+    So the intersection is what can be called *and* is known to be wanted here,
+    and each difference is worth a line rather than a silent choice.
+    """
+    only_dex = sorted(declared - exported)
+    only_lib = sorted(exported - declared)
+    if only_dex:
+        print(f"\n# {len(only_dex)} declared native here but not exported by "
+              "the library:")
+        print("#   normally provided by another .so in the package: a package")
+        print("#   declares natives for every library it ships, and this was")
+        print("#   checked against one of them.")
+        for name in only_dex:
+            print(f"#   {name}")
+    if only_lib:
+        print(f"\n# {len(only_lib)} exported by the library but not declared "
+              "native in this package:")
+        print("#   most likely another storefront's build -- the library is "
+              "shared, the dex is not.")
+        for name in only_lib:
+            print(f"#   {name}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -218,12 +266,18 @@ def main() -> None:
                     help="list the class's fields instead of its methods")
     ap.add_argument("--contract", action="store_true",
                     help="emit a contract file of native entry points")
+    ap.add_argument("--library",
+                    help="cross-check against a .so's exports")
     args = ap.parse_args()
 
-    if not args.klass and not args.grep:
-        sys.exit("give --class or --grep")
+    # A contract is normally wanted whole: every native entry point the package
+    # declares, which is the thing a host has to be able to call. Filters are
+    # available but not required for it.
+    if not args.klass and not args.grep and not args.contract:
+        sys.exit("give --class or --grep, or --contract for all of them")
 
     found = 0
+    declared_all: set[str] = set()
     for name, blob in dex_blobs(args.target):
         try:
             dex = Dex(blob)
@@ -242,12 +296,15 @@ def main() -> None:
                 if args.grep and args.grep not in pretty:
                     continue
                 by_name.setdefault((klass, method), []).append(params)
+            # Accumulated across every dex, not emitted per dex. A package is
+            # routinely multidex, and a name declared in one of them is not
+            # missing from the others -- reporting per file would call most of
+            # the contract absent five times over.
             for (klass, method), overloads in sorted(by_name.items()):
                 inner = klass[1:-1] if klass.startswith("L") else klass
                 for params in overloads:
-                    print(jni_name(inner, method,
-                                   params if len(overloads) > 1 else None))
-                    found += 1
+                    declared_all.add(jni_name(inner, method,
+                                              params if len(overloads) > 1 else None))
             continue
         if args.fields:
             for klass, field, ftype in dex.fields():
@@ -274,6 +331,16 @@ def main() -> None:
                 pass
             print(f"{klass}.{method}({', '.join(params)}) -> {ret}")
             found += 1
+    if args.contract:
+        exported = library_exports(args.library) if args.library else None
+        emit = sorted(declared_all & exported) if exported is not None \
+            else sorted(declared_all)
+        for name in emit:
+            print(name)
+        found = len(emit)
+        if exported is not None:
+            report_disagreement(declared_all, exported)
+
     if not found:
         print("no matching class found", file=sys.stderr)
         sys.exit(1)
