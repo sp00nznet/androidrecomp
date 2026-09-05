@@ -264,12 +264,7 @@ int Once(uint32_t* control, uint64_t fn) {
   uint32_t expected = 0;
   auto* state = reinterpret_cast<std::atomic<uint32_t>*>(control);
   if (state->compare_exchange_strong(expected, 1)) {
-    std::vector<uint8_t> stack(kGuestThreadStack);
-    Arm64Ctx ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestThreadStack -
-              kGuestThreadHeadroom) & ~15ULL;
-    arc_dispatch(&ctx, fn);
+    arc_call_guest(fn, nullptr, 0);
     state->store(2);
     return 0;
   }

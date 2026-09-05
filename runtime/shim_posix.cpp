@@ -21,6 +21,7 @@
 // from the host is safe. Bionic's `FILE` is the case where the rule bites, and
 // `__sF` is deliberately left unresolved rather than guessed at.
 
+#include <algorithm>
 #include <cctype>
 #include <cstdarg>
 #include <cstdint>
@@ -31,9 +32,12 @@
 #include <cwchar>
 #include <cmath>
 #include <cwctype>
+#include <numeric>
+#include <vector>
 #include <chrono>
 #include <thread>
 
+#include "arm64_context.h"
 #include "shim.h"
 
 #if defined(_WIN32)
@@ -322,6 +326,31 @@ int Getentropy(void* buf, size_t len) {
 // before. Give this a real registry if a title starts leaning on them.
 int CxaThreadAtexit(void (*)(void*), void*, void*) { return 0; }
 
+// The comparator is guest code, so it is dispatched rather than called -- left
+// to the host's qsort, the engine's own comparison function would be invoked
+// as a host function pointer and fault on execute. Sorting indices into a copy
+// keeps the comparator seeing stable addresses while the array is permuted,
+// which a comparator is entitled to assume for the duration of one call.
+void Qsort(void* base, uint64_t n, uint64_t size, uint64_t compare) {
+  if (!base || !compare || !size || n < 2) return;
+  auto* bytes = static_cast<uint8_t*>(base);
+  const std::vector<uint8_t> copy(bytes, bytes + n * size);
+  std::vector<uint64_t> order(static_cast<size_t>(n));
+  std::iota(order.begin(), order.end(), uint64_t{0});
+  std::stable_sort(order.begin(), order.end(),
+                   [&](uint64_t a, uint64_t b) {
+                     const uint64_t args[2] = {
+                         reinterpret_cast<uint64_t>(copy.data() + a * size),
+                         reinterpret_cast<uint64_t>(copy.data() + b * size)};
+                     return static_cast<int32_t>(
+                                arc_call_guest(compare, args, 2) & 0xFFFFFFFFu) <
+                            0;
+                   });
+  for (uint64_t i = 0; i < n; ++i)
+    memcpy(bytes + i * size, copy.data() + order[i] * size,
+           static_cast<size_t>(size));
+}
+
 struct Entry {
   const char* name;
   void* fn;
@@ -415,6 +444,7 @@ const Entry kTable[] = {
     E("sincosf", Sincosf),
     E("getentropy", Getentropy),
     E("__cxa_thread_atexit_impl", CxaThreadAtexit),
+    E("qsort", Qsort),
     E("printf", printf),
     E("sprintf", sprintf),
     E("snprintf", snprintf),

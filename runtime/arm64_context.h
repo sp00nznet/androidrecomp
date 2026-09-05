@@ -556,6 +556,20 @@ void arc_register_ctx_native(uint64_t address, const char* name, ArcCtxFn fn);
 // Called by the generated dispatcher when the lifted table has no entry.
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
 
+// Call guest code from the host, for the shim entry points that take a
+// callback: pthread_once's initialiser, dl_iterate_phdr's visitor, a
+// comparator. Those pointers are guest code, and calling one as a host
+// function pointer runs ARM instructions on an x86 processor -- which surfaces
+// as an access violation on execute, at an address inside the game's own
+// image, and so reads as a bad pointer in the guest rather than as the host
+// calling it wrongly. Every one of these has to come through here instead.
+//
+// The callback gets a stack of its own rather than the host's, because lifted
+// code addresses its frame through the guest's stack pointer. A fresh one per
+// call keeps this safe to re-enter, which matters: an unwinder's callback can
+// perfectly well take a lock or throw.
+uint64_t arc_call_guest(uint64_t fn, const uint64_t* args, int n);
+
 // --- what the guest was doing -----------------------------------------------
 // A fault in lifted code reports an address and nothing else: there is no host
 // call stack to walk, because the guest's frames are C frames belonging to

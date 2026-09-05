@@ -274,6 +274,50 @@ void arc_dispatch(Arm64Ctx* c, uint64_t target) {
   arc_dispatch_miss(c, target);
 }
 
+// Big enough for an unwinder or a C++ initialiser, which is what these
+// callbacks usually are, and small enough to allocate per call.
+#define ARC_CALLBACK_STACK (4u << 20)
+#define ARC_CALLBACK_HEADROOM 4096
+
+// One stack per thread, kept and reused, because a comparator is called once
+// per comparison and allocating megabytes each time would cost more than the
+// sort. The busy flag is what keeps that safe: a callback is entitled to end
+// up here again -- an unwinder's visitor can throw, an initialiser can sort --
+// and the nested call takes a stack of its own rather than writing over the
+// frames of the call it is nested inside.
+static ARC_THREAD_LOCAL void* t_callback_stack;
+static ARC_THREAD_LOCAL int t_callback_busy;
+
+uint64_t arc_call_guest(uint64_t fn, const uint64_t* args, int n) {
+  Arm64Ctx ctx;
+  int i, reused = 0;
+  void* stack;
+  uint64_t result;
+
+  if (!t_callback_busy) {
+    if (!t_callback_stack) t_callback_stack = malloc(ARC_CALLBACK_STACK);
+    stack = t_callback_stack;
+    reused = 1;
+  } else {
+    stack = malloc(ARC_CALLBACK_STACK);
+  }
+  if (!stack) return 0;
+  if (reused) t_callback_busy = 1;
+
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.sp = (((uint64_t)(uintptr_t)stack + ARC_CALLBACK_STACK -
+             ARC_CALLBACK_HEADROOM)) & ~(uint64_t)15;
+  for (i = 0; i < n && i < 8; ++i) ctx.x[i] = args[i];
+  arc_dispatch(&ctx, fn);
+  result = ctx.x[0];
+
+  if (reused)
+    t_callback_busy = 0;
+  else
+    free(stack);
+  return result;
+}
+
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
   // Context-taking natives first: they are a strict superset of what the
   // thunk can express, so a name registered both ways wants this one.

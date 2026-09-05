@@ -26,6 +26,7 @@
 #include <mutex>
 #include <vector>
 
+#include "arm64_context.h"
 #include "elf_image.h"
 #include "shim.h"
 
@@ -262,7 +263,9 @@ struct GuestPhdrInfo {
   uint16_t dlpi_phnum;
 };
 
-int DlIteratePhdr(int (*callback)(GuestPhdrInfo*, uint64_t, void*), void* data) {
+// The visitor is guest code -- this is how the C++ unwinder finds each image's
+// .eh_frame -- so it is dispatched, not called.
+int DlIteratePhdr(uint64_t callback, void* data) {
   std::vector<const ElfImage*> images;
   {
     std::lock_guard<std::mutex> g(g_images_lock);
@@ -274,7 +277,11 @@ int DlIteratePhdr(int (*callback)(GuestPhdrInfo*, uint64_t, void*), void* data) 
     info.dlpi_name = "";
     info.dlpi_phdr = img->phdrs();
     info.dlpi_phnum = static_cast<uint16_t>(img->phnum());
-    int rc = callback(&info, sizeof(info), data);
+    const uint64_t args[3] = {reinterpret_cast<uint64_t>(&info),
+                              sizeof(info),
+                              reinterpret_cast<uint64_t>(data)};
+    const int rc = static_cast<int32_t>(
+        arc_call_guest(callback, args, 3) & 0xFFFFFFFFu);
     if (rc != 0) return rc;
   }
   return 0;
