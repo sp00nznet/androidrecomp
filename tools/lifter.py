@@ -85,6 +85,12 @@ STRUCT_N = {"ld1": 1, "ld2": 2, "ld3": 3, "ld4": 4,
             "st1": 1, "st2": 2, "st3": 3, "st4": 4}
 REPL_N = {"ld1r": 1, "ld2r": 2, "ld3r": 3, "ld4r": 4}
 
+# How far a switch index can reach when it is extended rather than read from a
+# table. Only the byte widths are listed on purpose: they bound the reachable
+# set to something small enough to enumerate, and a wider extend bounds nothing.
+EXTEND_RANGE = {getattr(a64, "ARM64_EXT_SXTB", -1): (-128, 127),
+                getattr(a64, "ARM64_EXT_UXTB", -2): (0, 255)}
+
 VAS_NAMES = {getattr(a64, n): n.replace("ARM64_VAS_", "")
              for n in dir(a64) if n.startswith("ARM64_VAS_")}
 
@@ -1769,6 +1775,7 @@ class Lifter:
         const: dict[int, int] = {}
         load: dict[int, tuple[int, int, bool]] = {}
         pend: dict[int, tuple[tuple[int, int, bool], int, int]] = {}
+        pend_reg: dict[int, tuple[int, int, tuple[int, int]]] = {}
         tables: dict[int, list[int]] = {}
         widths = {"ldrsw": (4, True), "ldrh": (2, False), "ldrb": (1, False),
                   "ldrsh": (2, True), "ldrsb": (1, True)}
@@ -1782,6 +1789,7 @@ class Lifter:
                     const[d] = ops[1].imm
                     load.pop(d, None)
                     pend.pop(d, None)
+                    pend_reg.pop(d, None)
                 elif m == "add" and len(ops) == 3 \
                         and ops[2].type == a64.ARM64_OP_IMM \
                         and num(ops[1]) in const:
@@ -1789,6 +1797,7 @@ class Lifter:
                     const[d] = const[num(ops[1])] + ops[2].imm
                     load.pop(d, None)
                     pend.pop(d, None)
+                    pend_reg.pop(d, None)
                 elif m in widths:
                     # Read what the sources hold before invalidating the
                     # destination: these instructions routinely load into a
@@ -1804,6 +1813,7 @@ class Lifter:
                             table = base + mem.mem.disp
                     const.pop(d, None)
                     pend.pop(d, None)
+                    pend_reg.pop(d, None)
                     load.pop(d, None)
                     if table is not None:
                         width, signed = widths[m]
@@ -1820,6 +1830,7 @@ class Lifter:
                     const.pop(d, None)
                     load.pop(d, None)
                     pend.pop(d, None)
+                    pend_reg.pop(d, None)
                     # One side is the entry just loaded, the other the base the
                     # offset is relative to; which way round differs by
                     # encoding, so accept either.
@@ -1827,20 +1838,39 @@ class Lifter:
                         pend[d] = (load_a, const_b, shift)
                     elif load_b is not None and const_a is not None:
                         pend[d] = (load_b, const_a, shift)
+                    else:
+                        # No table at all: some switches compute the target
+                        # straight from the index, `base + (i << 2)`, with the
+                        # base an `adr` to a label in this very function. There
+                        # is nothing to read, so the reachable set comes from
+                        # how far the index can reach -- which is why only the
+                        # byte-wide extends are taken. A wider one would not
+                        # bound anything, and guessing there would invent jump
+                        # targets rather than find them.
+                        ext = EXTEND_RANGE.get(getattr(ops[2], "ext", 0))
+                        base = next((v for v in (const_a, const_b)
+                                     if v is not None and start <= v < end),
+                                    None)
+                        if ext and base is not None:
+                            pend_reg[d] = (base, shift, ext)
                 elif m == "br" and len(ops) == 1:
                     d = num(ops[0])
-                    if d not in pend:
-                        continue
-                    (table, width, signed), base, shift = pend[d]
                     targets: list[int] = []
-                    for i in range(4096):
-                        v = self.read_image(table + i * width, width, signed)
-                        if v is None:
-                            break
-                        t = (base + (v << shift)) & 0xFFFFFFFFFFFFFFFF
-                        if not (start <= t < end) or t % 4:
-                            break
-                        targets.append(t)
+                    if d in pend:
+                        (table, width, signed), base, shift = pend[d]
+                        for i in range(4096):
+                            v = self.read_image(table + i * width, width, signed)
+                            if v is None:
+                                break
+                            t = (base + (v << shift)) & 0xFFFFFFFFFFFFFFFF
+                            if not (start <= t < end) or t % 4:
+                                break
+                            targets.append(t)
+                    elif d in pend_reg:
+                        base, shift, (lo, hi) = pend_reg[d]
+                        targets = [t for t in
+                                   (base + (i << shift) for i in range(lo, hi + 1))
+                                   if start <= t < end and not t % 4]
                     if targets:
                         tables[insn.address] = targets
                 elif ops and ops[0].type == a64.ARM64_OP_REG:
@@ -1850,6 +1880,7 @@ class Lifter:
                     const.pop(d, None)
                     load.pop(d, None)
                     pend.pop(d, None)
+                    pend_reg.pop(d, None)
             except Unsupported:
                 continue
         return tables
