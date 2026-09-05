@@ -30,6 +30,7 @@
 #include "jni_env.h"
 #include "lifted.h"
 #include "shim.h"
+#include "window.h"
 
 namespace {
 
@@ -261,11 +262,14 @@ int main(int argc, char** argv) {
   const char* entry = nullptr;
   const char* entry_args = nullptr;
   long ctor_limit = 0;
+  bool want_window = false;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--entry=", 8) == 0)
       entry = argv[i] + 8;
     else if (strncmp(argv[i], "--args=", 7) == 0)
       entry_args = argv[i] + 7;
+    else if (strcmp(argv[i], "--window") == 0)
+      want_window = true;
     else if (strncmp(argv[i], "--constructors=", 15) == 0)
       ctor_limit = strtol(argv[i] + 15, nullptr, 10);
     else
@@ -273,10 +277,26 @@ int main(int argc, char** argv) {
   }
   if (!lib) {
     fprintf(stderr,
-            "usage: %s [--constructors=N] [--entry=SYMBOL] [--args=N,N,...]"
-            " <library.so>\n",
+            "usage: %s [--window] [--constructors=N] [--entry=SYMBOL]"
+            " [--args=N,N,...] <library.so>\n",
             argv[0]);
     return 2;
+  }
+
+  // Before the engine is loaded, not after. GL imports bind by asking the
+  // driver for each name and that needs a current context, so an engine loaded
+  // first has its GL slots left unbound -- and an unbound slot is not a missing
+  // function, it is a branch into nothing. Same order Android uses, where Java
+  // holds a surface before it calls in.
+  arc::Window window;
+  if (want_window) {
+    std::string window_err;
+    if (!window.Open("androidrecomp", 1280, 720, &window_err)) {
+      fprintf(stderr, "window failed: %s\n", window_err.c_str());
+      return 1;
+    }
+    printf("window     %dx%d, %s\n", window.width(), window.height(),
+           window.Describe().c_str());
   }
 
   const std::filesystem::path path(lib);
