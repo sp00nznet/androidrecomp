@@ -172,12 +172,37 @@ typedef struct {
   ArcCtxFn fn;
 } CtxNative;
 
-#define ARC_MAX_CTX_NATIVES 64
+// Large enough for a whole JNI table -- 233 environment entries plus the
+// invocation interface -- with room for the variadic handlers beside it. It
+// was 64, which is smaller than the JNI table alone, so every slot past the
+// sixty-fourth was dropped. The guest then branched to a real stub address the
+// dispatcher had no record of, and the report said the branch went nowhere
+// rather than that the table was full.
+#define ARC_MAX_CTX_NATIVES 512
 static CtxNative g_ctx_natives[ARC_MAX_CTX_NATIVES];
 static size_t g_ctx_native_count;
 
+// Overflowing either table is a configuration mistake, and one that produces a
+// symptom pointing anywhere but here. Say so, once, rather than dropping the
+// registration in silence.
+static void arc_full(const char* which, const char* name) {
+  static int said[2];
+  const int i = which[0] == 'c' ? 0 : 1;
+  if (said[i]) return;
+  said[i] = 1;
+  fprintf(stderr,
+          "arc: the %s table is full; %s and everything after it is "
+          "unregistered, and calls to them will look like branches to "
+          "nowhere\n",
+          which, name ? name : "?");
+}
+
 void arc_register_ctx_native(uint64_t address, const char* name, ArcCtxFn fn) {
-  if (!address || g_ctx_native_count >= ARC_MAX_CTX_NATIVES) return;
+  if (!address) return;
+  if (g_ctx_native_count >= ARC_MAX_CTX_NATIVES) {
+    arc_full("context native", name);
+    return;
+  }
   for (size_t i = 0; i < g_ctx_native_count; ++i)
     if (g_ctx_natives[i].address == address) return;
   g_ctx_natives[g_ctx_native_count].address = address;
@@ -187,7 +212,11 @@ void arc_register_ctx_native(uint64_t address, const char* name, ArcCtxFn fn) {
 }
 
 void arc_register_native(uint64_t address, const char* name) {
-  if (!address || g_native_count >= ARC_MAX_NATIVES) return;
+  if (!address) return;
+  if (g_native_count >= ARC_MAX_NATIVES) {
+    arc_full("native", name);
+    return;
+  }
   for (size_t i = 0; i < g_native_count; ++i)
     if (g_natives[i].address == address) return;
   g_natives[g_native_count].address = address;
