@@ -3,10 +3,14 @@
 > A toolkit for turning Android games' native engines into native desktop
 > applications. Bring your own APK.
 
-**Status: the shim layer is essentially closed.** On its first real target —
-*The Simpsons: Tapped Out*'s 28 MB Scorpio engine — **770 of 776 imports
-resolve**, and the window comes up with a live GL context. No lifter yet, so it
-runs on arm64 hosts only. See [Milestones](#milestones).
+**Status: the shim layer and the lifter are both essentially closed**, on two
+unrelated engines. *The Simpsons: Tapped Out*'s 28 MB Scorpio engine resolves
+**770 of 776 imports**, brings up a window with a live GL context, and runs
+1,494 of its 1,527 static constructors. *Family Guy: The Quest for Stuff*'s
+cocos2d-x engine lifted at **99.0% of functions with no title-specific work at
+all** — the first evidence that the kit generalises — and now runs **1,200 of
+its 1,202 constructors** at 99.7% of functions and 99.99% of instructions. See
+[Milestones](#milestones).
 
 ---
 
@@ -184,6 +188,23 @@ started reading address 9. Every affected function had been counted as lifting
 successfully. Locating the memory operand by search rather than by position
 fixed it, and the sweep went from 90 failures back to none.
 
+The structured load/store work produced three more, two of them about the
+disassembler rather than the architecture:
+
+- **The post-index increment is not in the operand list.** These encode it as
+  "however much was transferred" rather than as an immediate, so capstone
+  reports the instruction as writing back and leaves no operand saying by how
+  much. Taking it from the generic write-back path produced a silent zero, and
+  every loop built on `ld1 {v0.4s}, [x0], #16` read the same 16 bytes forever.
+- **The lane index of a register list belongs to the last register.** In
+  `st3 {v16.b, v17.b, v18.b}[1]` only `v18` reports lane 1; the others report
+  none. Reading it from the first gave -1, which is not an error — it is the
+  whole-register form, a different instruction that stores 48 bytes instead of
+  three.
+- `uabd` and `uaba` differ only in the final letter, and the test for the
+  accumulating spelling looked at the second. Plain `uabd` accumulated into its
+  destination.
+
 All of these produce plausible wrong numbers rather than crashes, which is what
 makes an independent oracle worth more than careful reading.
 
@@ -207,6 +228,40 @@ a tenth of a percent — but they are scattered roughly one per function, so
 handling them moved function completeness seven points. Late in the tail, the
 instruction column stops being informative entirely: what matters is how widely
 a form is *spread*, not how often it occurs.
+
+The second engine repeated the pattern with a different tail. Structured
+load/store (`ld1`/`st1` through `ld4`/`st4`, and the replicating `ld1r`) and
+fused multiply-accumulate were together about 5,000 instructions — under a tenth
+of a percent — but they cluster in exactly the hand-vectorised routines an
+engine leans on:
+
+| | instructions | functions |
+|---|---|---|
+| shared emitters, before any of this | 99.86% | 99.0% |
+| + structured memory, `fmla`, widening/narrowing, saturating, permutes | 99.99% | 99.7% |
+
+## Function coverage is not function *discovery*
+
+A third number sits behind both columns, and it is the one that was actually
+holding the second engine back: how many functions the lifter is ever handed.
+
+`.eh_frame` describes what can be unwound through, which is not the same set as
+what can be called. A leaf that never throws is entitled to no entry at all. The
+linker-synthesised PLT appears in none of it. And a function reached only
+through a vtable is named by no call site either.
+
+Each of those is recovered differently, and all three were needed:
+
+- **The PLT** is a fixed 16 bytes per entry, so it is lifted mechanically.
+- **Call targets nothing defines** are already known — they are exactly the
+  addresses the lifter turns into trapping stubs. Lifting them instead, and
+  repeating until no new ones appear, recovers the undescribed leaves.
+- **Gaps** — runs of executable bytes no function covers — catch what remains,
+  which is everything reached only as an address in data.
+
+On the second engine that recovered 1,519 functions and took the stubs standing
+in for undescribed call targets from hundreds to one. Nothing about it is
+title-specific.
 
 ## Building and running the lifted program
 
@@ -260,7 +315,16 @@ thing per run, one that keeps going tells you the shape of what is left.
 
 On this engine, **1,494 of 1,527 constructors run**, and `init` then executes
 far enough to print the engine's own startup banner through the logging shim
-and make 73 JNI calls before it stops.
+and make 96 JNI calls before it stops. On the second engine — a different
+vendor, a different renderer, no title-specific work — **1,200 of 1,202 run**.
+
+Constructors are also a good measure precisely because a whole boot is not one:
+the failures come back as a histogram, and a histogram is diagnosable. Thirty-six
+of the second engine's constructors failed at address `0x28`, one address, one
+signature — which is a single cause, not thirty-six bugs. It was `TPIDR_EL0`,
+the thread pointer, which the shim answered with zero: Bionic points it at a
+per-thread block and compiled code indexes off it without checking, so zero is
+not "no value" but a null pointer with a small offset added.
 
 Two things had to exist first, and both are general.
 
@@ -355,13 +419,18 @@ ELF.
 - [ ] **Audio.** openal-soft in place of a shipped `libopenal.so`. A shipped
       OpenAL resolves plenty but pulls in `libOpenSLES` — its backend is
       Android's, and it is the one library worth replacing rather than loading.
-- [ ] **Lifter.** ARM64 → C, boundaries from `.eh_frame`, indirect branches via
-      an address → function-pointer table. Over the whole 62,008-function
-      engine: **99.93% of instructions lift, and 98.6% of functions lift
-      completely.** What remains is a long tail of narrow NEON forms — lane
-      widening and narrowing, `ld1`/`st1`, horizontal reductions — plus the
-      `svc` sites, which need the shim rather than the lifter.
+- [x] **Lifter.** ARM64 → C. Boundaries from `.eh_frame`, the PLT, call sites
+      and the gaps between them; indirect branches via an address →
+      function-pointer table. On the second engine, **99.99% of instructions
+      and 99.7% of functions lift completely**, and 750 of 750 differential
+      cases across 68 operand forms agree with the oracle. What remains is a
+      long tail of narrow forms — horizontal reductions, a few scalar FP
+      spellings — plus the `svc` sites, which need the shim rather than the
+      lifter.
 
 ## Ports using this
 
 - **tstorecomp** — *The Simpsons: Tapped Out*.
+- **fgrecomp** — *Family Guy: The Quest for Stuff*. The kit's first
+  second target, and the one that showed how much of it was general: 99.0% of
+  functions lifted on the first run with no changes to the toolkit at all.

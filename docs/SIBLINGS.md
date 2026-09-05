@@ -142,3 +142,48 @@ first.
 **A contract can cover more than one title.** One Griffin host contract covers
 three games. That is an argument for putting engine-level contracts somewhere
 they can be shared, rather than in a single port.
+
+## What flows back the other way
+
+Everything below was found while working on Family Guy and is not specific to
+it. All of it applies unchanged to tstorecomp, which should be regenerated on
+top of it.
+
+**The thread pointer has to be real.** `TPIDR_EL0` was answered with zero. Both
+engines fault at address `0x28` during static initialisation because of it —
+thirty-six times in one, six in the other. Bionic points that register at a
+per-thread control block and compiled code indexes off it without checking, so
+returning zero is not "no value", it is a null pointer with a small offset
+added. An identical fault signature across two unrelated titles was the clue:
+it cannot be a fact about either of them.
+
+**`.eh_frame` is one of four sources of function boundaries, not the only one.**
+It describes what can be unwound through. A leaf that never throws is entitled
+to no entry, the linker-synthesised PLT appears in none of it, and a function
+reached only through a vtable is named by no call site either. Recovering call
+targets that nothing defines, and then sweeping the gaps between everything
+known, found 1,519 more functions in one engine and took the trapping stubs from
+hundreds to one. This is the single highest-value change in the set, and the
+older port has never had it.
+
+**The instruction tail is narrower than it looks, and shared.** Structured
+load/store, fused multiply-accumulate, the widening and narrowing forms, the
+saturating family, permutes and table lookup were about 5,000 instructions in
+one engine — under a tenth of a percent — but they cluster in hand-vectorised
+routines, so covering them moved function completeness from 99.0% to 99.7%.
+The same emitters serve any target.
+
+**Two disassembler details cost real bugs**, and would cost them again in any
+port that adds structured memory support independently. The post-index increment
+of `ldN`/`stN` is absent from the operand list, because the instruction encodes
+it as the size of the transfer; taking it from the generic write-back path
+yields a silent zero. And the lane index of a register list is reported on the
+*last* register only — reading it from the first gives -1, which is not an error
+but a different instruction.
+
+**A vendored toolkit is not the toolkit.** Each port carries `androidrecomp` as
+a submodule, so edits to a standalone clone do not reach a port's build. Two
+separate diagnoses in one session were confounded by this: a fix appeared to
+have no effect, and a rebuild reported nothing to do, because the port was
+building a pinned older commit. Change the kit, push it, then move the port's
+submodule — in that order, every time.
