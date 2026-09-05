@@ -538,6 +538,17 @@ const char* arc_trace_at(size_t back);  // 0 is the most recent
 void arc_trace_clear(void);
 
 typedef void (*Arc64Fn)(Arm64Ctx*);
+
+// Dispatch belongs to the library, and a lifted program plugs into it.
+//
+// The other way round does not work: the shim itself has to dispatch -- a
+// guest thread's entry point is a guest address, not a host function -- so if
+// the only definition lived in generated code, the library would reference a
+// symbol nothing in it provides and every host without a lifted program would
+// fail to link. With no lifted program installed, a branch goes straight to
+// the native bridge, which is exactly right for a host that only has imports.
+typedef void (*ArcDispatchFn)(Arm64Ctx*, uint64_t);
+void arc_set_dispatch(ArcDispatchFn fn);
 void arc_dispatch(Arm64Ctx* c, uint64_t target);
 
 #ifdef __cplusplus

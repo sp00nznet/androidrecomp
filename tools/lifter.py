@@ -1551,7 +1551,11 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
         fh.write("};\n\n")
         fh.write("uint64_t arc_image_bases[ARC_IMAGE_COUNT];\n"
                  "static uint64_t g_spans[ARC_IMAGE_COUNT];\n\n"
+                 "static void arc_dispatch_lifted(Arm64Ctx*, uint64_t);\n\n"
                  "void arc_set_image(size_t index, uint64_t base, uint64_t span) {\n"
+                 "  // Every host announces its images, so this is where the\n"
+                 "  // lifted dispatcher installs itself.\n"
+                 "  arc_set_dispatch(arc_dispatch_lifted);\n"
                  "  if (index >= ARC_IMAGE_COUNT) return;\n"
                  "  arc_image_bases[index] = base;\n"
                  "  g_spans[index] = span;\n"
@@ -1559,7 +1563,7 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
                  "const char* arc_image_name(size_t index) {\n"
                  "  return index < ARC_IMAGE_COUNT ? kNames[index] : 0;\n"
                  "}\n\n")
-        fh.write("""void arc_dispatch(Arm64Ctx* c, uint64_t target) {
+        fh.write("""static void arc_dispatch_lifted(Arm64Ctx* c, uint64_t target) {
   for (size_t im = 0; im < ARC_IMAGE_COUNT; ++im) {
     const uint64_t base = arc_image_bases[im];
     if (!base || target < base || target >= base + g_spans[im]) continue;

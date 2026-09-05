@@ -249,6 +249,18 @@ void arc_frame_clear(void) {
   t_frame_seen = 0;
 }
 
+static ArcDispatchFn g_dispatch;
+
+void arc_set_dispatch(ArcDispatchFn fn) { g_dispatch = fn; }
+
+void arc_dispatch(Arm64Ctx* c, uint64_t target) {
+  if (g_dispatch) {
+    g_dispatch(c, target);
+    return;
+  }
+  arc_dispatch_miss(c, target);
+}
+
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
   // Context-taking natives first: they are a strict superset of what the
   // thunk can express, so a name registered both ways wants this one.
@@ -288,16 +300,8 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
   arc_trap(c, msg);
 }
 
-// --- dispatch without a lifted program -------------------------------------
-// arc_dispatch is normally emitted by the lifter, over the table of recovered
-// function starts. A host built before any lifting exists -- triage, loading,
-// bringing the shim up on an arm64 machine -- still references it through
-// shim_pthread, so without this the library cannot link at all.
-//
-// ponytail: every branch is a miss when nothing is lifted, and arc_dispatch_miss
-// already does the right thing with one: resolve it against the registered
-// natives, or trap loudly. Replaced by the generated dispatcher once
-// ARC_LIFTED_DIR is set.
-#if !defined(ARC_LIFTED)
-void arc_dispatch(Arm64Ctx* c, uint64_t target) { arc_dispatch_miss(c, target); }
-#endif
+// The fallback for a host with no lifted program is above, in arc_dispatch
+// itself: with nothing installed it goes straight to arc_dispatch_miss, which
+// resolves the branch against the registered natives or traps loudly. That is
+// the right behaviour for triage, loading, or bringing the shim up on an arm64
+// machine, and it needs no compile-time flag to select it.
