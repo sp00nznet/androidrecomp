@@ -510,9 +510,12 @@ int main(int argc, char** argv) {
     if (rc == 0)
       printf("  returned, x0 = %#llx\n",
              static_cast<unsigned long long>(ctx.x[0]));
-    else if (rc == 1)
+    else if (rc == 1) {
+      // A trap says what went wrong but not where. It is the same question a
+      // fault raises, and was already answered there.
       printf("  %s\n", call.trap);
-    else {
+      ReportFrames();
+    } else {
       const std::string what = ExplainAddress(g_fault_address);
       printf("  %s on %s of %#llx%s%s\n", FaultName(code), g_fault_kind,
              static_cast<unsigned long long>(g_fault_address),
