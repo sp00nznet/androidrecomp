@@ -209,20 +209,27 @@ def dex_blobs(path: str):
 
 
 
-def library_exports(path: str) -> set[str]:
-    """The `Java_*` symbols a library actually exports."""
+def library_exports(paths: list[str]) -> set[str]:
+    """The `Java_*` symbols a package's libraries actually export.
+
+    Takes every library rather than one, because "not in this .so" and "not in
+    the package" are different answers and only the second one means anything.
+    """
     try:
         from elftools.elf.elffile import ELFFile
     except ImportError:
         sys.exit("cross-checking needs pyelftools")
-    with open(path, "rb") as fh:
-        elf = ELFFile(fh)
-        table = elf.get_section_by_name(".dynsym")
-        if table is None:
-            return set()
-        return {sym.name for sym in table.iter_symbols()
-                if sym.name.startswith("Java_")
-                and sym["st_shndx"] != "SHN_UNDEF"}
+    found: set[str] = set()
+    for path in paths:
+        with open(path, "rb") as fh:
+            elf = ELFFile(fh)
+            table = elf.get_section_by_name(".dynsym")
+            if table is None:
+                continue
+            found |= {sym.name for sym in table.iter_symbols()
+                      if sym.name.startswith("Java_")
+                      and sym["st_shndx"] != "SHN_UNDEF"}
+    return found
 
 
 def report_disagreement(declared: set[str], exported: set[str]) -> None:
@@ -240,11 +247,16 @@ def report_disagreement(declared: set[str], exported: set[str]) -> None:
     only_dex = sorted(declared - exported)
     only_lib = sorted(exported - declared)
     if only_dex:
-        print(f"\n# {len(only_dex)} declared native here but not exported by "
-              "the library:")
-        print("#   normally provided by another .so in the package: a package")
-        print("#   declares natives for every library it ships, and this was")
-        print("#   checked against one of them.")
+        print(f"\n# {len(only_dex)} declared native here but exported by none "
+              "of the libraries checked.")
+        print("#   Pass every .so in the package before reading anything into")
+        print("#   this: a package declares natives for all of them at once.")
+        print("#   If it still comes up empty, the remaining explanation is")
+        print("#   that they are bound through RegisterNatives rather than by")
+        print("#   name -- a method registered that way needs no export at")
+        print("#   all -- or that they are simply unused in this build. Either")
+        print("#   way there is no symbol for a host to call, so they cannot")
+        print("#   go in a contract.")
         for name in only_dex:
             print(f"#   {name}")
     if only_lib:
@@ -266,8 +278,9 @@ def main() -> None:
                     help="list the class's fields instead of its methods")
     ap.add_argument("--contract", action="store_true",
                     help="emit a contract file of native entry points")
-    ap.add_argument("--library",
-                    help="cross-check against a .so's exports")
+    ap.add_argument("--library", nargs="+", metavar="SO",
+                    help="cross-check against the exports of these libraries; "
+                         "pass every .so in the package, not just the engine")
     args = ap.parse_args()
 
     # A contract is normally wanted whole: every native entry point the package

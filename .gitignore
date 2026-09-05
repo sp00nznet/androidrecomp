@@ -69,3 +69,9 @@ build-lifted/
 fnverify.txt
 obj_test/
 generated_test/
+
+# Boot and build logs: our own output, but full of the game binary's
+# addresses and banners, and occasionally enormous.
+boot.out
+boot.err
+*.log
