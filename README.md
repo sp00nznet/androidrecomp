@@ -8,8 +8,8 @@ unrelated engines. *The Simpsons: Tapped Out*'s 28 MB Scorpio engine resolves
 **770 of 776 imports**, brings up a window with a live GL context, and runs
 1,521 of its 1,527 static constructors. *Family Guy: The Quest for Stuff*'s
 cocos2d-x engine lifted at **99.0% of functions with no title-specific work at
-all** — the first evidence that the kit generalises — and now runs **1,201 of
-its 1,202 constructors** at 99.8% of functions and 100.00% of instructions. See
+all** — the first evidence that the kit generalises — and now runs **all 1,202 of
+its constructors** at 99.8% of functions and 100.00% of instructions. See
 [Milestones](#milestones).
 
 ---
@@ -316,7 +316,7 @@ thing per run, one that keeps going tells you the shape of what is left.
 On this engine, **1,521 of 1,527 constructors run**, and `init` then executes
 far enough to print the engine's own startup banner through the logging shim
 and make 96 JNI calls before it stops. On the second engine — a different
-vendor, a different renderer, no title-specific work — **1,201 of 1,202 run**.
+vendor, a different renderer, no title-specific work — **all 1,202 run**.
 
 Constructors are also a good measure precisely because a whole boot is not one:
 the failures come back as a histogram, and a histogram is diagnosable. Thirty-six
