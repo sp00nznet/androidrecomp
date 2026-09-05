@@ -51,6 +51,15 @@ class ElfImage {
   // host contract is discovered in the first place.
   std::vector<std::string> ExportsWithPrefix(const char* prefix) const;
 
+  // The defined function symbol containing a host address, and how far into it
+  // that address falls. Empty when nothing covers it.
+  //
+  // A frame trail of bare offsets costs a disassembly session per line; the
+  // same trail with names is usually the answer on sight. Worth having because
+  // shipped Android libraries keep their .dynsym -- the engines seen so far
+  // carry thousands of named functions, C++ mangling and all.
+  std::string SymbolAt(uint64_t addr, uint64_t* offset) const;
+
   // Apply the segment page protections recorded in the program headers. Only
   // meaningful when the image will actually execute (arm64 host); harmless
   // otherwise. Kept separate from Load() so relocation runs against writable

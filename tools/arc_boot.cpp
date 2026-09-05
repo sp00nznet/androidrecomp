@@ -49,13 +49,15 @@ struct Mapping {
   std::string name;
   uint64_t base;
   uint64_t span;
+  const arc::ElfImage* image;
 };
 std::vector<Mapping> g_mappings;
 
 // The generated program knows which images it covers, by name. Matching on the
 // name rather than on load order means the host may map them in any sequence.
-void AnnounceImage(const std::string& name, uint64_t base, uint64_t span) {
-  g_mappings.push_back({name, base, span});
+void AnnounceImage(const std::string& name, uint64_t base, uint64_t span,
+                   const arc::ElfImage* image) {
+  g_mappings.push_back({name, base, span, image});
   for (size_t i = 0; i < ARC_IMAGE_COUNT; ++i) {
     const char* known = arc_image_name(i);
     if (known && name == known) {
@@ -122,8 +124,25 @@ void ReportFrames() {
     const size_t image = static_cast<size_t>(packed >> 56);
     const uint64_t off = packed & 0x00FFFFFFFFFFFFFFull;
     const char* name = arc_image_name(image);
-    printf("    %-22s +%#llx\n", name ? name : "?",
-           static_cast<unsigned long long>(off));
+    // A shipped library keeps its .dynsym, so most of these have a name on
+    // record -- which is the difference between a trail that has to be
+    // disassembled line by line and one that can simply be read.
+    std::string sym;
+    uint64_t within = 0;
+    for (const Mapping& m : g_mappings) {
+      if (name && m.image && m.name == name) {
+        sym = m.image->SymbolAt(m.base + off, &within);
+        break;
+      }
+    }
+    if (sym.empty()) {
+      printf("    %-22s +%#llx\n", name ? name : "?",
+             static_cast<unsigned long long>(off));
+    } else {
+      printf("    %-22s +%#llx  %s+%#llx\n", name ? name : "?",
+             static_cast<unsigned long long>(off), sym.c_str(),
+             static_cast<unsigned long long>(within));
+    }
   }
 }
 
@@ -331,7 +350,8 @@ int main(int argc, char** argv) {
     auto img = std::make_unique<arc::ElfImage>();
     if (img->Load(p.string(), resolve, &err)) {
       arc::ShimRegisterImage(img.get());
-      AnnounceImage(need, reinterpret_cast<uint64_t>(img->base()), img->span());
+      AnnounceImage(need, reinterpret_cast<uint64_t>(img->base()),
+                    img->span(), img.get());
       g_deps.push_back(std::move(img));
     }
   }
@@ -341,7 +361,8 @@ int main(int argc, char** argv) {
   }
   arc::ShimRegisterImage(&g_image);
   AnnounceImage(path.filename().string(),
-                reinterpret_cast<uint64_t>(g_image.base()), g_image.span());
+                reinterpret_cast<uint64_t>(g_image.base()), g_image.span(),
+                &g_image);
 
   // Every import the shim satisfied is a host address the guest will reach by
   // branching through its GOT. The dispatcher has to be able to tell those

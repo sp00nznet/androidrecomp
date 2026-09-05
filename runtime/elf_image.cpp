@@ -40,6 +40,7 @@ struct Sym {
   uint16_t shndx;
   uint64_t value, size;
 };
+constexpr uint8_t kSttFunc = 2;  // the low nibble of Sym::info
 struct Rela {
   uint64_t offset, info;
   int64_t addend;
@@ -352,6 +353,25 @@ uint64_t ElfImage::Lookup(const char* name) const {
       return reinterpret_cast<uint64_t>(base_) + s->value;
   }
   return 0;
+}
+
+std::string ElfImage::SymbolAt(uint64_t addr, uint64_t* offset) const {
+  const uint64_t origin = reinterpret_cast<uint64_t>(base_);
+  if (!symtab_ || !strtab_ || addr < origin) return std::string();
+  const uint64_t rel = addr - origin;
+  const Sym* best = nullptr;
+  for (size_t i = 0; i < symcount_; ++i) {
+    const Sym* s = reinterpret_cast<const Sym*>(symtab_ + i * sizeof(Sym));
+    if (s->shndx == SHN_UNDEF || (s->info & 0xf) != kSttFunc) continue;
+    if (s->value > rel) continue;
+    if (s->size && rel >= s->value + s->size) continue;
+    // Nearest start wins. Plenty of symbols carry no size, and without this a
+    // sizeless one would swallow every function laid out after it.
+    if (!best || s->value > best->value) best = s;
+  }
+  if (!best) return std::string();
+  if (offset) *offset = rel - best->value;
+  return strtab_ + best->name;
 }
 
 std::vector<std::string> ElfImage::ExportsWithPrefix(const char* prefix) const {
