@@ -146,6 +146,25 @@ void ReportFrames() {
   }
 }
 
+// The guest register file at the moment of a fault.
+//
+// Lifted code keeps its registers in the context rather than in C locals, so
+// unlike a host crash this state is simply there to be read. It is the
+// difference between "faulted reading 0" and seeing which register held the
+// null and what the ones around it were -- an object pointer that survived a
+// null check, with a zero where its vtable should be, says something quite
+// different from a null argument.
+void ReportRegisters(const Arm64Ctx* c) {
+  printf("  guest registers:\n");
+  for (int i = 0; i < 31; i += 4) {
+    printf("   ");
+    for (int j = i; j < i + 4 && j < 31; ++j)
+      printf("  x%-2d=%016llx", j, static_cast<unsigned long long>(c->x[j]));
+    printf("\n");
+  }
+  printf("     sp =%016llx\n", static_cast<unsigned long long>(c->sp));
+}
+
 void ReportTrail() {
   const size_t n = arc_trace_count();
   if (!n) return;
@@ -482,6 +501,7 @@ int main(int argc, char** argv) {
       if (first_failures.size() == 1) {
         printf("%s\n", buf);
         ReportFrames();
+        if (rc == 2) ReportRegisters(&ctx);
       }
     }
   }
@@ -593,6 +613,7 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(g_fault_address),
              what.empty() ? "" : " -- ", what.c_str());
       ReportFrames();
+      ReportRegisters(&ctx);
     }
   }
   return 0;
