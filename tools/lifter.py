@@ -1830,20 +1830,47 @@ def recover_extents(targets, extents, text):
         span = next(((a, e) for a, e in text if a <= t < e), None)
         if span is None:
             continue
-        # A target inside something already described is an internal label,
-        # not a function of its own.
+        # A target inside a described range is a second entry point into it,
+        # not a mistake: one unwind entry can cover several entries, and a
+        # local one can be called directly. Emitting it as its own function
+        # duplicates the tail it shares, which costs nothing but bytes.
         i = bisect.bisect_right(ends, (t, float("inf"))) - 1
         if i >= 0 and ends[i][0] <= t < ends[i][1]:
-            continue
-        end = span[1]
-        j = bisect.bisect_right(starts, t)
-        if j < len(starts):
-            end = min(end, starts[j])
+            end = ends[i][1]
+        else:
+            end = span[1]
+            j = bisect.bisect_right(starts, t)
+            if j < len(starts):
+                end = min(end, starts[j])
         k = bisect.bisect_right(ordered, t)
         if k < len(ordered):
             end = min(end, ordered[k])
         if t < end <= t + RECOVER_MAX:
             out.append((t, end - t))
+    return out
+
+
+def uncovered_starts(extents, text):
+    """The start of every run of executable bytes no function covers.
+
+    Call-site recovery only finds what something names. An indirect call --
+    a virtual dispatch, a jump table -- takes its target out of data, so no
+    call site mentions it and `referenced` never sees it. Sweeping the gaps
+    between described functions finds those, on the same assumption a
+    disassembler makes: executable bytes that nothing claims are code that
+    nothing described.
+    """
+    out = []
+    for a, e in text:
+        pos = a
+        for s, x in sorted(extents):
+            if x <= pos or s >= e:
+                continue
+            if s > pos:
+                out.append(pos)
+            pos = max(pos, x)
+        if pos < e:
+            out.append(pos)
     return out
 
 
@@ -1894,9 +1921,13 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
                 break
             # Whatever is still referenced and undefined is a function that no
             # unwind entry described. Lifting those turns up further ones, so
-            # this runs until it stops finding any.
-            pending = recover_extents(lifter.referenced - set(defined),
-                                      extents, text)
+            # this runs until it stops finding any. The first pass also sweeps
+            # the gaps, which is the only way to reach a function that exists
+            # solely as an address in a vtable.
+            targets = lifter.referenced - set(defined)
+            if not recovered:
+                targets |= set(uncovered_starts(extents, text))
+            pending = recover_extents(targets, extents, text)
             extents += [(a, a + s) for a, s in pending]
             recovered += len(pending)
         stubs = sorted(set(unlifted) | (lifter.referenced - set(defined)))
