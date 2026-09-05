@@ -121,6 +121,10 @@ class Lifter:
         # computation are scoped to it, because two images have overlapping
         # offsets and different bases.
         self.image_index = 0
+        # Everything mapped from the current image, for reading jump tables,
+        # and the tables found in the function being lifted.
+        self.image_sections: list[tuple[int, bytes]] = []
+        self.cur_tables: dict[int, list[int]] = {}
 
     # --- operand helpers ---------------------------------------------------
 
@@ -1213,6 +1217,22 @@ class Lifter:
                     f"UINT64_C({insn.address + 4}));",
                     f"arc_dispatch(c, {self.read(ops[0])});"]
         if m == "br":
+            targets = self.cur_tables.get(insn.address)
+            if targets:
+                # A switch: the branch stays inside this function, so it is a
+                # jump and not a call. The dispatcher is still the fallback,
+                # because the table's length was inferred rather than read.
+                seen, lines = set(), [
+                    f"switch ({self.read(ops[0])} - {self.base_expr()}) {{"]
+                for t in targets:
+                    if t in seen:
+                        continue
+                    seen.add(t)
+                    lines.append(f"  case UINT64_C({t}): goto L_{t:x};")
+                lines.append("  default: break;")
+                lines.append("}")
+                lines.append(f"arc_dispatch(c, {self.read(ops[0])}); return;")
+                return lines
             return [f"arc_dispatch(c, {self.read(ops[0])}); return;"]
         if m in ("ret", "retaa", "retab"):
             return ["return;"]
@@ -1711,6 +1731,129 @@ class Lifter:
 
     # --- function level -----------------------------------------------------
 
+    def read_image(self, addr: int, width: int, signed: bool):
+        """One little-endian value from anywhere in the current image."""
+        for base, blob in self.image_sections:
+            off = addr - base
+            if 0 <= off and off + width <= len(blob):
+                v = int.from_bytes(blob[off:off + width], "little")
+                if signed and v >> (width * 8 - 1):
+                    v -= 1 << (width * 8)
+                return v
+        return None
+
+    def jump_tables(self, insns, start: int, end: int) -> dict[int, list[int]]:
+        """Where a switch's indirect branch can actually land.
+
+        A `switch` compiles to a table of offsets and a `br` through it, and
+        the targets are *inside* the function doing the branching. Handing that
+        to the global dispatcher asks it to find a function beginning halfway
+        through this one, which it correctly cannot -- so those branches have
+        to become local jumps, and their targets have to be labels.
+
+        Two encodings occur in practice and both are read here: signed 32-bit
+        offsets added to the table's own address, and unsigned 16- or 8-bit
+        entries scaled by four and added to a separately computed base. What
+        they share is the shape `target = base + (entry << shift)`, which is
+        all this needs to recognise.
+
+        Nothing in the instruction stream says how long a table is -- the
+        bounds check that precedes it does, and reading that would mean
+        understanding the comparison. So entries are read until one lands
+        outside this function, which is the same limit the bounds check was
+        enforcing.
+        """
+        def num(op):
+            return reg_of(self.md, op.reg)[0]
+
+        const: dict[int, int] = {}
+        load: dict[int, tuple[int, int, bool]] = {}
+        pend: dict[int, tuple[tuple[int, int, bool], int, int]] = {}
+        tables: dict[int, list[int]] = {}
+        widths = {"ldrsw": (4, True), "ldrh": (2, False), "ldrb": (1, False),
+                  "ldrsh": (2, True), "ldrsb": (1, True)}
+
+        for insn in insns:
+            m, ops = insn.mnemonic, insn.operands
+            try:
+                if m in ("adrp", "adr") and len(ops) == 2 \
+                        and ops[1].type == a64.ARM64_OP_IMM:
+                    d = num(ops[0])
+                    const[d] = ops[1].imm
+                    load.pop(d, None)
+                    pend.pop(d, None)
+                elif m == "add" and len(ops) == 3 \
+                        and ops[2].type == a64.ARM64_OP_IMM \
+                        and num(ops[1]) in const:
+                    d = num(ops[0])
+                    const[d] = const[num(ops[1])] + ops[2].imm
+                    load.pop(d, None)
+                    pend.pop(d, None)
+                elif m in widths:
+                    # Read what the sources hold before invalidating the
+                    # destination: these instructions routinely load into a
+                    # register that is also the index or the base, and clearing
+                    # it first would lose the value being read.
+                    d = num(ops[0])
+                    mem = next((o for o in ops
+                                if o.type == a64.ARM64_OP_MEM), None)
+                    table = None
+                    if mem is not None and mem.mem.index:
+                        base = const.get(reg_of(self.md, mem.mem.base)[0])
+                        if base is not None:
+                            table = base + mem.mem.disp
+                    const.pop(d, None)
+                    pend.pop(d, None)
+                    load.pop(d, None)
+                    if table is not None:
+                        width, signed = widths[m]
+                        load[d] = (table, width, signed)
+                elif m == "add" and len(ops) == 3 \
+                        and ops[2].type == a64.ARM64_OP_REG:
+                    d, a, b = num(ops[0]), num(ops[1]), num(ops[2])
+                    shift = ops[2].shift.value if ops[2].shift.type else 0
+                    # `add x8, x8, x9` is the usual spelling, so the
+                    # destination is normally one of the sources. Sample both
+                    # before the destination is cleared.
+                    load_a, load_b = load.get(a), load.get(b)
+                    const_a, const_b = const.get(a), const.get(b)
+                    const.pop(d, None)
+                    load.pop(d, None)
+                    pend.pop(d, None)
+                    # One side is the entry just loaded, the other the base the
+                    # offset is relative to; which way round differs by
+                    # encoding, so accept either.
+                    if load_a is not None and const_b is not None:
+                        pend[d] = (load_a, const_b, shift)
+                    elif load_b is not None and const_a is not None:
+                        pend[d] = (load_b, const_a, shift)
+                elif m == "br" and len(ops) == 1:
+                    d = num(ops[0])
+                    if d not in pend:
+                        continue
+                    (table, width, signed), base, shift = pend[d]
+                    targets: list[int] = []
+                    for i in range(4096):
+                        v = self.read_image(table + i * width, width, signed)
+                        if v is None:
+                            break
+                        t = (base + (v << shift)) & 0xFFFFFFFFFFFFFFFF
+                        if not (start <= t < end) or t % 4:
+                            break
+                        targets.append(t)
+                    if targets:
+                        tables[insn.address] = targets
+                elif ops and ops[0].type == a64.ARM64_OP_REG:
+                    # Anything else writing a register invalidates what was
+                    # known about it. Being wrong here fabricates jump targets.
+                    d = num(ops[0])
+                    const.pop(d, None)
+                    load.pop(d, None)
+                    pend.pop(d, None)
+            except Unsupported:
+                continue
+        return tables
+
     def lift_function(self, addr: int, size: int, code: bytes) -> str | None:
         insns = list(self.md.disasm(code, addr))
         end = addr + size
@@ -1722,6 +1865,13 @@ class Lifter:
                 if (op.type == a64.ARM64_OP_IMM and insn.group(a64.ARM64_GRP_JUMP)
                         and addr <= op.imm < end):
                     labels.add(op.imm)
+
+        # A switch lands inside this function too, through a table rather than
+        # an immediate, so those targets are labels as well -- and they have to
+        # be found before the labels are collected, not while emitting.
+        self.cur_tables = self.jump_tables(insns, addr, end)
+        for targets in self.cur_tables.values():
+            labels.update(targets)
 
         body: list[str] = []
         ok = True
@@ -1757,6 +1907,20 @@ def code_sections(elf: ELFFile) -> list[tuple[int, bytes]]:
     for name in (".text", ".plt"):
         sec = elf.get_section_by_name(name)
         if sec is not None:
+            out.append((sec["sh_addr"], sec.data()))
+    return out
+
+
+def data_sections(elf: ELFFile) -> list[tuple[int, bytes]]:
+    """Every allocated section with bytes in the file.
+
+    Wider than `code_sections` because a switch's jump table is data, and the
+    compiler puts it wherever it likes -- beside the code it belongs to, or off
+    in `.rodata`. Reading one means being able to read anything mapped.
+    """
+    out = []
+    for sec in elf.iter_sections():
+        if sec["sh_flags"] & 0x2 and sec["sh_type"] != "SHT_NOBITS":
             out.append((sec["sh_addr"], sec.data()))
     return out
 
@@ -1894,8 +2058,9 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
 
     per_image = []          # (name, defined[], stub_targets[])
     written = 0
-    for index, (name, funcs, sections) in enumerate(images):
+    for index, (name, funcs, sections, data) in enumerate(images):
         lifter.image_index = index
+        lifter.image_sections = data
         lifter.referenced = set()
         defined, unlifted = [], []
         done = 0
@@ -2045,7 +2210,8 @@ def main() -> None:
             images.append((os.path.basename(lib),
                            sorted(functions_from_eh_frame(elf) +
                                   functions_from_plt(elf)),
-                           code_sections(elf)))
+                           code_sections(elf),
+                           data_sections(elf)))
 
     lifter = Lifter()
 
@@ -2053,6 +2219,7 @@ def main() -> None:
         emit_program(lifter, images, args.out, args.shards, args.limit)
     else:
         funcs, sections = images[0][1], images[0][2]
+        lifter.image_sections = images[0][3]
         done = failed = 0
         for start, size in funcs:
             if args.limit and done + failed >= args.limit:
