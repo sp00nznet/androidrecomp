@@ -21,6 +21,7 @@ forms standing between here and the rest.
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import os
 import sys
@@ -1804,6 +1805,48 @@ def functions_from_eh_frame(elf: ELFFile) -> list[tuple[int, int]]:
     return out
 
 
+# A function recovered from a call site alone runs until the next thing known
+# to start. That is right wherever the compiler laid functions out one after
+# another, which is everywhere here -- but a gap that is really data would be
+# disassembled as one enormous function, so the span is capped. Nothing in
+# either title comes close to it.
+RECOVER_MAX = 64 * 1024
+
+
+def recover_extents(targets, extents, text):
+    """(address, size) for call targets no unwind entry describes.
+
+    `.eh_frame` describes what can be unwound through, which is not the same
+    as everything that can be called: a leaf that never throws, or hand-written
+    assembly, is entitled to no entry at all and is then reachable only from
+    its call sites. Those arrive here as references to addresses nothing
+    defines, and stubbing them turns a working function into a trap.
+    """
+    starts = sorted(a for a, _ in extents)
+    ends = sorted(extents)
+    ordered = sorted(targets)
+    out = []
+    for t in ordered:
+        span = next(((a, e) for a, e in text if a <= t < e), None)
+        if span is None:
+            continue
+        # A target inside something already described is an internal label,
+        # not a function of its own.
+        i = bisect.bisect_right(ends, (t, float("inf"))) - 1
+        if i >= 0 and ends[i][0] <= t < ends[i][1]:
+            continue
+        end = span[1]
+        j = bisect.bisect_right(starts, t)
+        if j < len(starts):
+            end = min(end, starts[j])
+        k = bisect.bisect_right(ordered, t)
+        if k < len(ordered):
+            end = min(end, ordered[k])
+        if t < end <= t + RECOVER_MAX:
+            out.append((t, end - t))
+    return out
+
+
 def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
                  limit: int) -> None:
     """Write one lifted program covering every image given.
@@ -1829,24 +1872,38 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
         lifter.referenced = set()
         defined, unlifted = [], []
         done = 0
-        for start_addr, size in funcs:
+        extents = [(a, a + s) for a, s in funcs]
+        text = [(a, a + len(b)) for a, b in sections]
+        pending, recovered = list(funcs), 0
+        while pending:
+            for start_addr, size in pending:
+                if limit and done >= limit:
+                    break
+                body = bytes_at(sections, start_addr, size)
+                if body is None:
+                    continue
+                done += 1
+                code = lifter.lift_function(start_addr, size, body)
+                defined.append(start_addr)
+                if code is None:
+                    unlifted.append(start_addr)
+                    continue
+                handles[written % shards].write(code + "\n")
+                written += 1
             if limit and done >= limit:
                 break
-            body = bytes_at(sections, start_addr, size)
-            if body is None:
-                continue
-            done += 1
-            code = lifter.lift_function(start_addr, size, body)
-            defined.append(start_addr)
-            if code is None:
-                unlifted.append(start_addr)
-                continue
-            handles[written % shards].write(code + "\n")
-            written += 1
+            # Whatever is still referenced and undefined is a function that no
+            # unwind entry described. Lifting those turns up further ones, so
+            # this runs until it stops finding any.
+            pending = recover_extents(lifter.referenced - set(defined),
+                                      extents, text)
+            extents += [(a, a + s) for a, s in pending]
+            recovered += len(pending)
         stubs = sorted(set(unlifted) | (lifter.referenced - set(defined)))
         per_image.append((name, sorted(set(defined) | set(stubs)), stubs,
                           len(defined) - len(unlifted)))
-        print(f"  {name}: {len(defined) - len(unlifted):,} lifted, "
+        print(f"  {name}: {len(defined) - len(unlifted):,} lifted "
+              f"({recovered:,} recovered from call sites), "
               f"{len(unlifted):,} did not lift, {len(stubs) - len(unlifted):,} "
               f"stubs for targets outside .eh_frame")
 
