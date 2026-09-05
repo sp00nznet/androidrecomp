@@ -150,6 +150,51 @@ def jni_packages(exports: list[str]) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda kv: -kv[1])
 
 
+def available_abis(path: str) -> list[str]:
+    """Which native ABIs the package actually ships."""
+    seen = set()
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            for i in z.infolist():
+                parts = i.filename.split("/")
+                if len(parts) > 2 and parts[0] == "lib" and parts[-1].endswith(".so"):
+                    seen.add(parts[1])
+    else:
+        lib = os.path.join(path, "lib")
+        if os.path.isdir(lib):
+            for entry in os.listdir(lib):
+                if os.path.isdir(os.path.join(lib, entry)):
+                    seen.add(entry)
+    return sorted(seen)
+
+
+def gate_abi(path: str, abi: str) -> None:
+    """Refuse to go further when the package ships nothing we can lift.
+
+    Borrowed from iparecomp, where the equivalent gate is FairPlay encryption:
+    a triage that reports numbers regardless of whether the target is even a
+    candidate is worse than one that stops, because the numbers look like
+    progress.
+
+    A 32-bit-only package is not a rare case. Google's 64-bit requirement only
+    ever applied to apps still shipping updates, so the delisted catalogue --
+    which is most of what is worth preserving -- is frozen at armeabi-v7a.
+    """
+    abis = available_abis(path)
+    if abi in abis:
+        return
+    print(f"# STOP -- no `{abi}` in this package\n")
+    print(f"Ships: {', '.join(abis) if abis else 'no native libraries at all'}\n")
+    if any(a.startswith("armeabi") for a in abis):
+        print("This is a 32-bit ARM package. Lifting it needs an ARM32 "
+              "front end, which is a different instruction set with two "
+              "encodings interleaved -- not a shim gap. Nothing below this "
+              "line would be about the code that would actually run.")
+    else:
+        print("Nothing here matches what this toolchain lifts.")
+    sys.exit(2)
+
+
 def read_lib(path: str, abi: str) -> tuple[str, bytes]:
     """Return (name, bytes) of the largest .so for `abi`, from an APK or a dir."""
     candidates: dict[str, int] = {}
@@ -241,6 +286,17 @@ def probe(name: str, blob: bytes) -> dict:
 
 def render(rep: dict) -> str:
     L = [f"# Triage: `{os.path.basename(rep['lib'])}`", ""]
+    # Not a stop: the rest of the numbers still inform the decision. But it is
+    # the single figure that decides whether the lifter has a job or a
+    # research project, so it goes first and it is loud.
+    if rep["eh_coverage"] < 0.90:
+        L += ["> **Function boundaries are not free here.** `.eh_frame` covers "
+              f"only {rep['eh_coverage']:.1%} of `.text`. Recovering the rest "
+              "means inferring where functions begin from control flow, which "
+              "is the hardest problem in static recompilation and the one "
+              "unwind tables normally make disappear. Treat every number below "
+              "as describing the part of the binary that can be found.", ""]
+
     L += [f"- machine: `{rep['machine']}`",
           f"- file: {rep['bytes'] / 1e6:.1f} MB, `.text`: {rep['text_size'] / 1e6:.1f} MB "
           f"@ `0x{rep['text_addr']:x}`",
@@ -295,6 +351,7 @@ def main() -> None:
     ap.add_argument("--out", help="write the markdown report here instead of stdout")
     args = ap.parse_args()
 
+    gate_abi(args.target, args.abi)
     name, blob = read_lib(args.target, args.abi)
     md = render(probe(name, blob))
     if args.out:
