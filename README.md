@@ -6,9 +6,9 @@
 **Status: the shim layer and the lifter are both essentially closed**, on two
 unrelated engines. *The Simpsons: Tapped Out*'s 28 MB Scorpio engine resolves
 **770 of 776 imports**, brings up a window with a live GL context, and runs
-1,494 of its 1,527 static constructors. *Family Guy: The Quest for Stuff*'s
+1,521 of its 1,527 static constructors. *Family Guy: The Quest for Stuff*'s
 cocos2d-x engine lifted at **99.0% of functions with no title-specific work at
-all** — the first evidence that the kit generalises — and now runs **1,200 of
+all** — the first evidence that the kit generalises — and now runs **1,201 of
 its 1,202 constructors** at 99.7% of functions and 99.99% of instructions. See
 [Milestones](#milestones).
 
@@ -313,10 +313,10 @@ without needing a window, a JNI environment or a server. Failures are recovered
 rather than fatal — a boot that dies on the first bad constructor tells you one
 thing per run, one that keeps going tells you the shape of what is left.
 
-On this engine, **1,494 of 1,527 constructors run**, and `init` then executes
+On this engine, **1,521 of 1,527 constructors run**, and `init` then executes
 far enough to print the engine's own startup banner through the logging shim
 and make 96 JNI calls before it stops. On the second engine — a different
-vendor, a different renderer, no title-specific work — **1,200 of 1,202 run**.
+vendor, a different renderer, no title-specific work — **1,201 of 1,202 run**.
 
 Constructors are also a good measure precisely because a whole boot is not one:
 the failures come back as a histogram, and a histogram is diagnosable. Thirty-six
