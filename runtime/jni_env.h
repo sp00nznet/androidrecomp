@@ -23,6 +23,10 @@ extern "C" {
 // A JNIEnv* for the guest, in guest terms: an address it can put in x0.
 uint64_t arc_jni_env(void);
 
+// The object an entry point is invoked on. Its fields are answered by the
+// accessors rather than read out of it, so this only has to be a valid handle.
+uint64_t arc_jni_object(void);
+
 // Registers every slot with the native bridge, so an indirect branch into the
 // table is recognised as a call out to the host rather than a missing function.
 void arc_jni_register(void);

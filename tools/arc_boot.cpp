@@ -461,7 +461,7 @@ int main(int argc, char** argv) {
     // be non-null: the engine dereferences the environment immediately.
     memset(ctx.x, 0, sizeof(ctx.x));
     ctx.x[0] = arc_jni_env();
-    ctx.x[1] = reinterpret_cast<uint64_t>(&ctx);  // a stand-in `this`
+    ctx.x[1] = arc_jni_object();  // the object the method was called on
     EntryCall call{};
     call.ctx = &ctx;
     call.target = addr;

@@ -25,43 +25,16 @@ uint64_t g_table = reinterpret_cast<uint64_t>(g_slots);
 size_t g_hits[kSlots];
 size_t g_total;
 
-// Handles come out of a zeroed arena rather than being a made-up constant, so
-// that a caller which dereferences one reads zeroes instead of faulting. That
-// buys a surprising amount of progress: most of what a startup path does with
-// a handle is pass it back in, and the rest reads a field it can tolerate
-// finding empty.
-//
-// Blocks are generous on purpose. A handle standing in for an object or an
-// array gets read at whatever offsets the engine believes that type has, and a
-// block big enough to absorb those reads keeps it moving instead of faulting
-// just past the end of a tight allocation.
+// --- the arena -------------------------------------------------------------
+// Handles are blocks from a zeroed arena, reserved low in the address space. A
+// handle is opaque in principle, but code with a 32-bit lineage stores one in
+// an int, and a raw heap pointer does not survive that -- it reappears in
+// arithmetic as a large negative number.
 constexpr size_t kArenaSize = 32u << 20;
 constexpr size_t kBlock = 64u << 10;
 unsigned char* g_arena;
 size_t g_arena_used;
 
-// A string handed back to the guest is not merely a pointer -- something will
-// measure it. An arena block is zeroed, so every string read out of Java came
-// back empty, and the engine's own string handling then computed a length of
-// zero minus one and asked memcpy for eighteen exabytes. Non-empty placeholder
-// text costs nothing and keeps that arithmetic in range.
-uint64_t Allocate();
-const char kPlaceholder[] = "androidrecomp";
-
-uint64_t AllocateString() {
-  const uint64_t p = Allocate();
-  if (p) memcpy(reinterpret_cast<void*>(p), kPlaceholder, sizeof(kPlaceholder));
-  return p;
-}
-
-// The arena is placed low in the address space on purpose. A handle is opaque
-// to the guest in principle, but code that came from a 32-bit lineage stores
-// one in an int somewhere, and a raw 64-bit heap pointer does not survive that.
-// A truncated handle then reappears in arithmetic as a large negative number --
-// which is exactly the shape of an allocation size seen in the trail.
-//
-// Keeping handles inside 32 bits makes such a truncation harmless, and costs
-// nothing: the guest only ever passes them back.
 unsigned char* ReserveLowArena() {
 #if defined(_WIN32)
   for (uintptr_t at = 0x10000000; at < 0x60000000; at += 0x1000000) {
@@ -79,14 +52,83 @@ uint64_t Allocate() {
     if (!g_arena) return 0;
   }
   if (g_arena_used + kBlock > kArenaSize) g_arena_used = 0;  // wrap; nothing frees
-  uint64_t p = reinterpret_cast<uint64_t>(g_arena + g_arena_used);
+  const uint64_t p = reinterpret_cast<uint64_t>(g_arena + g_arena_used);
   g_arena_used += kBlock;
   return p;
 }
 
-// The standard JNINativeInterface layout. Only the entries worth recognising
-// are named; the rest report as a bare index, which is enough to go and look
-// one up if a title starts using it.
+// A string handle carries its text, because something will measure it. An
+// empty one is not harmless: the engine takes the length, subtracts one, and
+// hands the result to memcpy.
+uint64_t AllocateText(const char* text) {
+  const uint64_t p = Allocate();
+  if (p && text) {
+    const size_t n = strlen(text);
+    memcpy(reinterpret_cast<void*>(p), text, n < kBlock ? n + 1 : kBlock - 1);
+  }
+  return p;
+}
+
+// --- the object the engine is actually asking about ------------------------
+//
+// A JNI entry point is handed the object its Java declaration named, and reads
+// its configuration out of it field by field. Answering every read with zero
+// is why initialisation could not proceed: the engine was promised a device
+// description, found nothing, and did arithmetic on the nothing.
+//
+// The field names are read out of the dex -- see tools/dex_contract.py. The
+// values are ours to choose; what matters is that they are the right shape and
+// that a string is never empty.
+struct Field {
+  const char* name;
+  char kind;  // 's' text, 'i' integer, 'f' float, 'z' boolean
+  const char* text;
+  int64_t number;
+  double real;
+};
+
+const Field kFields[] = {
+    {"appPath", 's', "/assets", 0, 0},
+    {"appBundle", 's', "androidrecomp.host", 0, 0},
+    {"appVersion", 's', "1.0", 0, 0},
+    {"clientVersion", 's', "1.0", 0, 0},
+    {"deviceName", 's', "androidrecomp", 0, 0},
+    {"deviceVersion", 's', "1.0", 0, 0},
+    {"manufacturerName", 's', "generic", 0, 0},
+    {"language", 's', "en", 0, 0},
+    {"locale", 's', "en_US", 0, 0},
+    {"width", 'i', nullptr, 1280, 0},
+    {"height", 'i', nullptr, 720, 0},
+    {"orientation", 'i', nullptr, 0, 0},
+    {"model", 'i', nullptr, 0, 0},
+    {"dpiFromCategory", 'i', nullptr, 320, 0},
+    {"miNavBarHeight", 'i', nullptr, 0, 0},
+    {"density", 'f', nullptr, 0, 2.0},
+    {"densityDPI", 'f', nullptr, 0, 320.0},
+    {"mbExternalStorageUnusable", 'z', nullptr, 0, 0},
+};
+constexpr size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
+
+// Field ids are small and unlike handles, so a mix-up between the two is loud
+// rather than plausible.
+constexpr uint64_t kFieldIdBase = 0x0F1E1D00;
+
+const Field* FieldFromId(uint64_t id) {
+  const uint64_t index = id - kFieldIdBase;
+  return index < kFieldCount ? &kFields[index] : nullptr;
+}
+
+uint64_t FieldIdFor(const char* name) {
+  if (name) {
+    for (size_t i = 0; i < kFieldCount; ++i)
+      if (strcmp(kFields[i].name, name) == 0) return kFieldIdBase + i;
+  }
+  // Unknown field: still a usable id, and it reads as zero of its type.
+  return kFieldIdBase + kFieldCount;
+}
+
+// --- slot behaviour --------------------------------------------------------
+
 struct SlotInfo {
   int index;
   const char* name;
@@ -94,64 +136,34 @@ struct SlotInfo {
 };
 
 constexpr SlotInfo kKnown[] = {
-    {4, "GetVersion", false},
-    {5, "DefineClass", true},
-    {6, "FindClass", true},
-    {10, "GetSuperclass", true},
-    {13, "Throw", false},
-    {14, "ThrowNew", false},
-    {15, "ExceptionOccurred", false},   // null means "no exception pending"
-    {16, "ExceptionDescribe", false},
-    {17, "ExceptionClear", false},
-    {21, "NewGlobalRef", true},
-    {22, "DeleteGlobalRef", false},
-    {23, "DeleteLocalRef", false},
-    {24, "IsSameObject", false},
-    {25, "NewLocalRef", true},
-    {27, "AllocObject", true},
-    {28, "NewObject", true},
-    {31, "GetObjectClass", true},
-    {32, "IsInstanceOf", false},
-    {33, "GetMethodID", true},
-    {34, "CallObjectMethod", true},
-    {61, "CallVoidMethod", false},
-    {94, "GetFieldID", true},
-    {95, "GetObjectField", true},
-    {96, "GetBooleanField", false},
-    {100, "GetIntField", false},
-    {101, "GetLongField", false},
-    {102, "GetFloatField", false},
-    {104, "GetStaticMethodID", true},
-    {135, "GetStaticFieldID", true},
-    {136, "GetStaticObjectField", true},
-    {141, "GetStaticIntField", false},
-    {154, "NewString", true},
-    {158, "NewStringUTF", true},
-    {160, "GetStringUTFChars", true},
+    {4, "GetVersion", false},           {5, "DefineClass", true},
+    {6, "FindClass", true},             {10, "GetSuperclass", true},
+    {13, "Throw", false},               {14, "ThrowNew", false},
+    {15, "ExceptionOccurred", false},   {16, "ExceptionDescribe", false},
+    {17, "ExceptionClear", false},      {21, "NewGlobalRef", true},
+    {22, "DeleteGlobalRef", false},     {23, "DeleteLocalRef", false},
+    {24, "IsSameObject", false},        {25, "NewLocalRef", true},
+    {27, "AllocObject", true},          {28, "NewObject", true},
+    {29, "NewObjectV", true},           {30, "NewObjectA", true},
+    {31, "GetObjectClass", true},       {32, "IsInstanceOf", false},
+    {33, "GetMethodID", true},          {34, "CallObjectMethod", true},
+    {61, "CallVoidMethod", false},      {94, "GetFieldID", true},
+    {95, "GetObjectField", true},       {96, "GetBooleanField", false},
+    {100, "GetIntField", false},        {101, "GetLongField", false},
+    {102, "GetFloatField", false},      {104, "GetStaticMethodID", true},
+    {135, "GetStaticFieldID", true},    {136, "GetStaticObjectField", true},
+    {141, "GetStaticIntField", false},  {154, "NewString", true},
+    {155, "GetStringLength", false},    {156, "GetStringChars", true},
+    {157, "ReleaseStringChars", false}, {158, "NewStringUTF", true},
+    {159, "GetStringUTFLength", false}, {160, "GetStringUTFChars", true},
     {161, "ReleaseStringUTFChars", false},
-    {162, "GetArrayLength", false},
-    {163, "NewObjectArray", true},
+    {162, "GetArrayLength", false},     {163, "NewObjectArray", true},
     {164, "GetObjectArrayElement", true},
-    // Anything that hands back an object, an array or a buffer has to return
-    // something non-null. A zero here is not merely "no answer" -- the caller
-    // computes a length or a pointer difference from it, and the result of
-    // that arithmetic becomes an allocation size. One zero-returning array slot
-    // was enough to produce a calloc for eighteen exabytes.
-    {29, "NewObjectV", true},
-    {30, "NewObjectA", true},
-    {155, "GetStringLength", false},
-    {156, "GetStringChars", true},   // measured by the caller; see below
-    {157, "ReleaseStringChars", false},
-    {159, "GetStringUTFLength", false},
     {165, "SetObjectArrayElement", false},
-    {166, "NewBooleanArray", true},
-    {167, "NewByteArray", true},
-    {168, "NewCharArray", true},
-    {169, "NewShortArray", true},
-    {170, "NewIntArray", true},
-    {171, "NewLongArray", true},
-    {172, "NewFloatArray", true},
-    {173, "NewDoubleArray", true},
+    {166, "NewBooleanArray", true},     {167, "NewByteArray", true},
+    {168, "NewCharArray", true},        {169, "NewShortArray", true},
+    {170, "NewIntArray", true},         {171, "NewLongArray", true},
+    {172, "NewFloatArray", true},       {173, "NewDoubleArray", true},
     {174, "GetBooleanArrayElements", true},
     {175, "GetByteArrayElements", true},
     {176, "GetCharArrayElements", true},
@@ -160,21 +172,11 @@ constexpr SlotInfo kKnown[] = {
     {179, "GetLongArrayElements", true},
     {180, "GetFloatArrayElements", true},
     {181, "GetDoubleArrayElements", true},
-    {182, "ReleaseBooleanArrayElements", false},
-    {183, "ReleaseByteArrayElements", false},
-    {184, "ReleaseCharArrayElements", false},
-    {185, "ReleaseShortArrayElements", false},
-    {186, "ReleaseIntArrayElements", false},
-    {187, "ReleaseLongArrayElements", false},
-    {188, "ReleaseFloatArrayElements", false},
-    {189, "ReleaseDoubleArrayElements", false},
-    {206, "RegisterNatives", false},
-    {210, "GetJavaVM", false},
+    {206, "RegisterNatives", false},    {210, "GetJavaVM", false},
     {217, "NewWeakGlobalRef", true},
     // ExceptionCheck must answer false, or the engine believes a throw is
     // pending after every call and unwinds instead of continuing.
-    {219, "ExceptionCheck", false},
-    {220, "NewDirectByteBuffer", true},
+    {219, "ExceptionCheck", false},     {220, "NewDirectByteBuffer", true},
 };
 
 const SlotInfo* Lookup(size_t index) {
@@ -183,31 +185,74 @@ const SlotInfo* Lookup(size_t index) {
   return nullptr;
 }
 
-extern "C" uint64_t arc_jni_called(size_t index) {
-  if (index < kSlots) ++g_hits[index];
-  ++g_total;
-  const SlotInfo* info = Lookup(index);
-  arc_trace_note(info ? info->name : "JNI slot");
-  if (info) {
-    if (!info->returns_handle) return 0;
-    // Anything the caller will read as text needs to contain some.
-    const bool textual = index == 156 || index == 160 || index == 154 ||
-                         index == 158;
-    return textual ? AllocateString() : Allocate();
-  }
-  // Not one we recognise. Erring towards a handle is the safer default: one
-  // the caller ignores costs a block of arena, whereas a zero it treats as a
-  // pointer or a count turns into arithmetic on nothing.
-  return Allocate();
+const char* NameOf(size_t index) {
+  const SlotInfo* s = Lookup(index);
+  return s ? s->name : "JNI slot";
 }
 
-// Every slot has the same shape as the native bridge's thunk, so a call
-// arriving through it lands correctly. The index is a template parameter purely
-// so that each slot gets its own address.
+// Every slot takes the context, so it can read its arguments and put a result
+// in the right register. A float return lives in v0, which an
+// integer-returning thunk has no way to express.
+void Handle(size_t index, Arm64Ctx* c) {
+  if (index < kSlots) ++g_hits[index];
+  ++g_total;
+
+  switch (index) {
+    case 94: {  // GetFieldID(env, class, name, signature)
+      c->x[0] = FieldIdFor(reinterpret_cast<const char*>(c->x[2]));
+      return;
+    }
+    case 95: {  // GetObjectField(env, object, fieldID)
+      const Field* f = FieldFromId(c->x[2]);
+      c->x[0] = AllocateText(f && f->kind == 's' ? f->text : "");
+      return;
+    }
+    case 96: {  // GetBooleanField
+      const Field* f = FieldFromId(c->x[2]);
+      c->x[0] = f && f->kind == 'z' ? static_cast<uint64_t>(f->number) : 0;
+      return;
+    }
+    case 100:    // GetIntField
+    case 101: {  // GetLongField
+      const Field* f = FieldFromId(c->x[2]);
+      c->x[0] = f && f->kind == 'i' ? static_cast<uint64_t>(f->number) : 0;
+      return;
+    }
+    case 102: {  // GetFloatField -- the result belongs in v0, not x0
+      const Field* f = FieldFromId(c->x[2]);
+      arc_s_w(c, 0, f && f->kind == 'f' ? static_cast<float>(f->real) : 0.0f);
+      return;
+    }
+    case 155:    // GetStringLength
+    case 159: {  // GetStringUTFLength
+      const char* s = reinterpret_cast<const char*>(c->x[1]);
+      c->x[0] = s ? strlen(s) : 0;
+      return;
+    }
+    case 156:    // GetStringChars
+    case 160: {  // GetStringUTFChars -- a jstring already holds its own text
+      c->x[0] = c->x[1];
+      if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
+      return;
+    }
+    default:
+      break;
+  }
+
+  const SlotInfo* info = Lookup(index);
+  if (info) {
+    c->x[0] = info->returns_handle ? Allocate() : 0;
+    return;
+  }
+  // Not one we recognise. Erring towards a handle is safer: one the caller
+  // ignores costs a block of arena, whereas a zero it treats as a pointer or a
+  // count becomes arithmetic on nothing.
+  c->x[0] = Allocate();
+}
+
 template <size_t N>
-uint64_t Slot(uint64_t, uint64_t, uint64_t, uint64_t,
-              uint64_t, uint64_t, uint64_t, uint64_t) {
-  return arc_jni_called(N);
+void Slot(Arm64Ctx* c) {
+  Handle(N, c);
 }
 
 template <size_t... I>
@@ -226,8 +271,15 @@ extern "C" {
 uint64_t arc_jni_env(void) { return reinterpret_cast<uint64_t>(&g_table); }
 
 void arc_jni_register(void) {
-  for (size_t i = 0; i < kSlots; ++i) arc_register_native(g_slots[i], "jni");
+  for (size_t i = 0; i < kSlots; ++i)
+    arc_register_ctx_native(g_slots[i], NameOf(i),
+                            reinterpret_cast<ArcCtxFn>(g_slots[i]));
 }
+
+// The object handed to an entry point as its `this`. Nothing reads it
+// directly -- every access goes through a field accessor -- so a block of
+// arena is enough.
+uint64_t arc_jni_object(void) { return Allocate(); }
 
 size_t arc_jni_call_count(void) { return g_total; }
 
@@ -242,12 +294,9 @@ void arc_jni_report(void) {
     return;
   }
   printf("  %zu JNI calls across these slots:\n", g_total);
-  for (size_t i = 0; i < kSlots; ++i) {
-    if (!g_hits[i]) continue;
-    const SlotInfo* info = Lookup(i);
-    printf("    %6zu x  slot %3zu  %s\n", g_hits[i], i,
-           info ? info->name : "(unnamed)");
-  }
+  for (size_t i = 0; i < kSlots; ++i)
+    if (g_hits[i])
+      printf("    %6zu x  slot %3zu  %s\n", g_hits[i], i, NameOf(i));
 }
 
 }  // extern "C"
