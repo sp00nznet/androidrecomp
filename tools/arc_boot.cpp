@@ -155,6 +155,24 @@ void ReportFrames() {
 // null check, with a zero where its vtable should be, says something quite
 // different from a null argument.
 void ReportRegisters(const Arm64Ctx* c) {
+  // Only a program lifted with --pc-notes keeps this, and it is the one thing
+  // that turns "somewhere in this function" into an instruction.
+  if (c->pc) {
+    std::string sym;
+    uint64_t within = 0;
+    for (const Mapping& m : g_mappings) {
+      if (m.image && c->pc >= m.base && c->pc < m.base + m.span) {
+        sym = m.image->SymbolAt(c->pc, &within);
+        printf("  faulted at %s +%#llx%s%s", m.name.c_str(),
+               static_cast<unsigned long long>(c->pc - m.base),
+               sym.empty() ? "" : "  ", sym.c_str());
+        if (!sym.empty())
+          printf("+%#llx", static_cast<unsigned long long>(within));
+        printf("\n");
+        break;
+      }
+    }
+  }
   printf("  guest registers:\n");
   for (int i = 0; i < 31; i += 4) {
     printf("   ");

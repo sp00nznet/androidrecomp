@@ -131,6 +131,10 @@ class Lifter:
         # and the tables found in the function being lifted.
         self.image_sections: list[tuple[int, bytes]] = []
         self.cur_tables: dict[int, list[int]] = {}
+        # Record the guest address of every instruction as it runs. Off by
+        # default: it is a store per instruction, paid for only when something
+        # is being chased down.
+        self.pc_notes = False
 
     # --- operand helpers ---------------------------------------------------
 
@@ -2169,6 +2173,9 @@ class Lifter:
                 ok = False
                 lines = [f"/* UNSUPPORTED {insn.mnemonic} {insn.op_str} */"]
             body.append(f"  /* {insn.address:x}: {insn.mnemonic} {insn.op_str} */")
+            if self.pc_notes:
+                body.append(f"  (c)->pc = {self.base_expr()} +"
+                            f" UINT64_C({insn.address});")
             body.extend("  " + l for l in lines)
 
         if not ok:
@@ -2483,6 +2490,10 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="only lift the first N")
     ap.add_argument("--report", action="store_true",
                     help="print coverage instead of writing code")
+    ap.add_argument("--pc-notes", action="store_true",
+                    help="record the guest address of each instruction as it "
+                         "runs, so a fault names an instruction rather than a "
+                         "function; costs a store per instruction")
     args = ap.parse_args()
 
     images = []
@@ -2496,6 +2507,7 @@ def main() -> None:
                            data_sections(elf)))
 
     lifter = Lifter()
+    lifter.pc_notes = args.pc_notes
 
     if args.out:
         emit_program(lifter, images, args.out, args.shards, args.limit)

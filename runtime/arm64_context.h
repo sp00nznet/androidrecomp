@@ -51,6 +51,13 @@ typedef struct Arm64Ctx {
   // Where the image was mapped. Everything the instruction stream computes
   // from a PC is emitted as image_base + a constant.
   uint64_t image_base;
+
+  // The guest instruction being executed, kept up to date only by a program
+  // lifted with `--pc-notes`. A fault otherwise reports the function it landed
+  // in and leaves which instruction to inference, which is the difference
+  // between reading an answer and arguing towards one. It costs a store per
+  // instruction, so it is off unless asked for.
+  uint64_t pc;
 } Arm64Ctx;
 
 // --- register access -------------------------------------------------------
