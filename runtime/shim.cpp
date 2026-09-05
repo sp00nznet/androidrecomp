@@ -48,6 +48,18 @@ int AndroidLogWrite(int prio, const char* tag, const char* text) {
                  text ? text : "");
 }
 
+// The failed condition and the tag come through the first two registers, which
+// the thunk marshals correctly. The message after them is variadic and is not
+// read: it would need the context, and an assertion that reports which check
+// failed has already said the useful part.
+[[noreturn]] void AndroidLogAssert(const char* cond, const char* tag,
+                                   const char* fmt) {
+  fprintf(stderr, "assertion failed: %s (%s) %s\n", cond ? cond : "?",
+          tag ? tag : "?", fmt ? fmt : "");
+  arc_trap(nullptr, "the guest failed an assertion");
+  abort();
+}
+
 // Bionic's FORTIFY_SOURCE variants. Each takes the destination buffer's known
 // size as an extra argument and traps on overflow. We are not trying to
 // reproduce the diagnostics, only the semantics, so each forwards to the
@@ -115,6 +127,7 @@ const Entry kExplicit[] = {
     {"__android_log_print", reinterpret_cast<void*>(&AndroidLogPrint)},
     {"__android_log_vprint", reinterpret_cast<void*>(&AndroidLogVPrint)},
     {"__android_log_write", reinterpret_cast<void*>(&AndroidLogWrite)},
+    {"__android_log_assert", reinterpret_cast<void*>(&AndroidLogAssert)},
     {"__memcpy_chk", reinterpret_cast<void*>(&MemcpyChk)},
     {"__memmove_chk", reinterpret_cast<void*>(&MemmoveChk)},
     {"__strcpy_chk", reinterpret_cast<void*>(&StrcpyChk)},

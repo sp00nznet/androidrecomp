@@ -346,6 +346,46 @@ void AndroidSetAbortMessage(const char* msg) {
 // Signal delivery has no desktop counterpart worth reproducing: the host
 // process is not going to receive SIGPIPE from a loopback socket, and the
 // engine's handlers exist for Android's process lifecycle.
+// An alternate signal stack exists so a handler can run after the real stack
+// overflows. Nothing here delivers signals, so there is nothing to run and
+// nowhere for it to run: succeeding is the honest answer, and refusing would
+// send the engine down an error path for a facility it never uses.
+int Sigaltstack(const void*, void*) { return 0; }
+int Setitimer(int, const void*, void*) { return 0; }
+int Prctl(int, ...) { return 0; }
+
+// Enough of a filesystem to answer "is there room". Reporting zero free blocks
+// would have a title conclude the device is full before it starts.
+struct GuestStatfs {
+  uint64_t f_type, f_bsize, f_blocks, f_bfree, f_bavail;
+  uint64_t f_files, f_ffree;
+  uint64_t f_fsid;
+  uint64_t f_namelen, f_frsize, f_flags, f_spare[4];
+};
+int Statfs(const char*, GuestStatfs* out) {
+  if (!out) return -1;
+  memset(out, 0, sizeof(*out));
+  out->f_bsize = 4096;
+  out->f_frsize = 4096;
+  out->f_blocks = 64ull << 20;  // 256 GB at 4 KB blocks
+  out->f_bfree = 32ull << 20;
+  out->f_bavail = 32ull << 20;
+  out->f_files = 1u << 20;
+  out->f_ffree = 1u << 20;
+  out->f_namelen = 255;
+  return 0;
+}
+
+// epoll is how a Linux program waits on descriptors. A desktop port has no use
+// for the engine's own event loop -- the window owns that -- so these exist to
+// keep the setup path from failing, and a wait times out having seen nothing.
+// ponytail: real readiness if a title ever drives its networking through this.
+int EpollCreate(int) { return 0x7000001; }
+int EpollCreate1(int) { return 0x7000001; }
+int EpollCtl(int, int, int, void*) { return 0; }
+int EpollWait(int, void*, int, int) { return 0; }
+int Eventfd(unsigned, int) { return 0x7000002; }
+
 int Sigaction(int, const void*, void*) { return 0; }
 int Sigaddset(void*, int) { return 0; }
 int Sigdelset(void*, int) { return 0; }
@@ -421,6 +461,12 @@ const Entry kTable[] = {
     E("waitpid", Waitpid),          E("kill", Kill),
     E("openlog", Openlog),          E("closelog", Closelog),
     E("android_set_abort_message", AndroidSetAbortMessage),
+
+    E("sigaltstack", Sigaltstack),  E("setitimer", Setitimer),
+    E("prctl", Prctl),              E("statfs", Statfs),
+    E("epoll_create", EpollCreate), E("epoll_create1", EpollCreate1),
+    E("epoll_ctl", EpollCtl),       E("epoll_wait", EpollWait),
+    E("eventfd", Eventfd),
 
     E("sigaction", Sigaction),      E("sigaddset", Sigaddset),
     E("sigdelset", Sigdelset),      E("sigemptyset", Sigemptyset),

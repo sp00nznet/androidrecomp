@@ -277,6 +277,13 @@ int KeyCreate(uint32_t* key, void (*)(void*)) {
   return 0;
 }
 int KeyDelete(uint32_t) { return 0; }
+
+// Threads here are always joinable; nothing asks for a detached one and the
+// registry would keep its slot either way.
+int AttrGetdetachstate(const void*, int* state) {
+  if (state) *state = 0;  // PTHREAD_CREATE_JOINABLE
+  return 0;
+}
 void* Getspecific(uint32_t key) {
   return key < t_keys.values.size() ? t_keys.values[key] : nullptr;
 }
@@ -487,6 +494,7 @@ const Entry kTable[] = {
     E("pthread_rwlock_unlock", RwlockUnlock),
     E("pthread_once", Once),
     E("pthread_key_create", KeyCreate),
+    E("pthread_attr_getdetachstate", AttrGetdetachstate),
     E("pthread_key_delete", KeyDelete),
     E("pthread_getspecific", Getspecific),
     E("pthread_setspecific", Setspecific),

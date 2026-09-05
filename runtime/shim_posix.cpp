@@ -32,7 +32,9 @@
 #include <cwchar>
 #include <cmath>
 #include <cwctype>
+#include <mutex>
 #include <numeric>
+#include <random>
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -351,6 +353,36 @@ void Qsort(void* base, uint64_t n, uint64_t size, uint64_t compare) {
            static_cast<size_t>(size));
 }
 
+// The float-suffixed math the host defines inline rather than exporting, so a
+// by-name lookup misses them even though the code is there.
+float Frexpf(float v, int* e) { return frexpf(v, e); }
+float Ldexpf(float v, int e) { return ldexpf(v, e); }
+float Hypotf(float a, float b) { return hypotf(a, b); }
+int Isascii(int c) { return c >= 0 && c < 128; }
+
+// Bionic's memalign. malloc already returns memory aligned for any fundamental
+// type, which is what nearly every caller wants -- and the result has to stay
+// free()-able, so an aligned allocator whose blocks need their own release
+// function is not an option here.
+// ponytail: alignments above 16 are answered with 16. Give this a real
+// implementation, and a matching free, if a title asks for a cache line.
+void* Memalign(size_t /*alignment*/, size_t size) { return malloc(size); }
+
+uint32_t Arc4random() {
+  static std::mutex lock;
+  static std::random_device source;
+  std::lock_guard<std::mutex> held(lock);
+  return static_cast<uint32_t>(source());
+}
+
+// A FORTIFY variant: the checked forms take the set's size and trap on an
+// out-of-range descriptor. The semantics are what matter, not the diagnostic.
+void FdClrChk(int fd, void* set, size_t) {
+  if (!set || fd < 0) return;
+  auto* bits = static_cast<uint64_t*>(set);
+  bits[fd / 64] &= ~(uint64_t{1} << (fd % 64));
+}
+
 struct Entry {
   const char* name;
   void* fn;
@@ -445,6 +477,10 @@ const Entry kTable[] = {
     E("getentropy", Getentropy),
     E("__cxa_thread_atexit_impl", CxaThreadAtexit),
     E("qsort", Qsort),
+    E("frexpf", Frexpf),            E("ldexpf", Ldexpf),
+    E("hypotf", Hypotf),            E("isascii", Isascii),
+    E("memalign", Memalign),        E("arc4random", Arc4random),
+    E("__FD_CLR_chk", FdClrChk),
     E("printf", printf),
     E("sprintf", sprintf),
     E("snprintf", snprintf),
