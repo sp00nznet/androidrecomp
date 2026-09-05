@@ -543,6 +543,42 @@ class Lifter:
             return self.vec_result(d, [f"  _t.{view}[{i}] = ({value});"
                                        for i in range(lanes)])
 
+        # Horizontal reductions collapse the whole vector into one value, so
+        # the destination is a scalar register and carries no arrangement of
+        # its own. That is why they have to be answered here, before anything
+        # asks the destination for one: the source's arrangement is the only
+        # one there is. The `l` forms widen as they go, which is what keeps a
+        # sum of sixteen bytes from wrapping at eight bits.
+        across = {"addv": "+", "uaddlv": "+", "saddlv": "+",
+                  "umaxv": ">", "smaxv": ">", "uminv": "<", "sminv": "<"}
+        if m in across and len(ops) == 2 and not self.is_vector(ops[0]) \
+                and self.fp_of(ops[0]) is not None:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            signed = m[0] == "s"
+            src_view = self.signed_view(sbits) if signed else s_view
+            acc = "int64_t" if signed else "uint64_t"
+            idx, kind = self.fp_of(ops[0])
+            c = across[m]
+            lines = [f"{{ {acc} _r = ({acc})"
+                     f"({self.vec_elem(ops[1], 0, src_view)});"]
+            for i in range(1, slanes):
+                v = f"({acc})({self.vec_elem(ops[1], i, src_view)})"
+                if c == "+":
+                    lines.append(f"  _r = ({acc})(_r + {v});")
+                else:
+                    lines.append(f"  {{ {acc} _v = {v};"
+                                 f" if (_v {c} _r) _r = _v; }}")
+            bits = FP_BYTES.get(kind, 8) * 8
+            value = "(uint64_t)_r"
+            if bits < 64:
+                value = f"((uint64_t)_r & UINT64_C({(1 << bits) - 1}))"
+            setter = "arc_du_w" if kind == "d" else "arc_su_w"
+            lines.append(f"  {setter}(c, {idx}, {value}); }}")
+            return lines
+
         info = self.vas_of(ops[0]) if self.is_vector(ops[0]) else None
         if not info:
             raise Unsupported(f"vector {m} without arrangement")
