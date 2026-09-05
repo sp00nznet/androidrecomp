@@ -543,6 +543,46 @@ class Lifter:
             return self.vec_result(d, [f"  _t.{view}[{i}] = ({value});"
                                        for i in range(lanes)])
 
+        # Pairwise reduction to a scalar: `faddp s0, v0.2s` adds the two lanes
+        # of its source together. Two operands and a scalar destination is what
+        # separates it from the three-operand vector form below.
+        if m in ("faddp", "addp") and len(ops) == 2 \
+                and not self.is_vector(ops[0]) \
+                and self.fp_of(ops[0]) is not None:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            _, s_view, sbits = sinfo
+            idx, kind = self.fp_of(ops[0])
+            if m == "faddp":
+                fv = {32: "f32", 64: "f64"}.get(sbits)
+                if not fv:
+                    raise Unsupported(f"{m} on {sbits}-bit lanes")
+                return [self.fp_write(
+                    ops[0], f"arc_fadd{sbits}({self.vec_elem(ops[1], 0, fv)},"
+                            f" {self.vec_elem(ops[1], 1, fv)})")]
+            setter = "arc_du_w" if kind == "d" else "arc_su_w"
+            return [f"{setter}(c, {idx}, ({self.vec_elem(ops[1], 0, s_view)}"
+                    f" + {self.vec_elem(ops[1], 1, s_view)}));"]
+
+        # `fmov d0, x8` moves the bits between a general register and a scalar
+        # -- no conversion, and no arrangement to find. It reaches here only
+        # because the other operand made it look like a vector instruction.
+        if m == "fmov" and len(ops) == 2 and not self.is_vector(ops[0]) \
+                and not self.is_vector(ops[1]):
+            dst_fp, src_fp = self.fp_of(ops[0]), self.fp_of(ops[1])
+            if dst_fp is not None and src_fp is None \
+                    and ops[1].type == a64.ARM64_OP_REG:
+                idx, kind = dst_fp
+                setter = "arc_du_w" if kind == "d" else "arc_su_w"
+                return [f"{setter}(c, {idx}, {self.read(ops[1])});"]
+            if dst_fp is None and src_fp is not None:
+                idx, kind = src_fp
+                width = "u64" if kind == "d" else "u32"
+                return [self.write(ops[0], f"(c)->q[{idx}].{width}[0]")]
+            if dst_fp is not None and ops[1].type == a64.ARM64_OP_FP:
+                return [self.fp_write(ops[0], repr(float(ops[1].fp)))]
+
         # Scalar arithmetic that takes one operand from a lane, as in
         # `fmul s1, s4, v19.s[1]`. The destination is a scalar register and has
         # no arrangement; the lane index on the last operand is the only thing
@@ -763,11 +803,15 @@ class Lifter:
                 f"{self.vec_source(ops[1], i, fview)});" for i in range(lanes)])
 
         # A comparison writes all-ones or zero into the lane, not 0 or 1.
+        # The `lt`/`le` spellings exist only against zero -- there is no
+        # register form, because it is the same instruction with the operands
+        # the other way round.
         int_cmp = {"cmeq": "==", "cmgt": ">", "cmge": ">=",
-                   "cmhi": ">", "cmhs": ">="}
-        flt_cmp = {"fcmeq": "==", "fcmgt": ">", "fcmge": ">="}
+                   "cmhi": ">", "cmhs": ">=", "cmlt": "<", "cmle": "<="}
+        flt_cmp = {"fcmeq": "==", "fcmgt": ">", "fcmge": ">=",
+                   "fcmlt": "<", "fcmle": "<="}
         if m in int_cmp:
-            v = sview if m in ("cmgt", "cmge") else view
+            v = sview if m in ("cmgt", "cmge", "cmlt", "cmle") else view
             body = []
             for i in range(lanes):
                 r = (self.vec_source(ops[2], i, v)
@@ -1005,6 +1049,150 @@ class Lifter:
                 return self.vec_result(ops[0], body)
             return self.vec_result_keep(ops[0], body,
                                         clear_top=lanes * bits == 64)
+
+        if m == "abs":
+            return self.vec_result(ops[0], [
+                f"  {{ int{bits}_t _v = {self.vec_source(ops[1], i, sview)};"
+                f" _t.{view}[{i}] = (uint{bits}_t)(_v < 0 ? -_v : _v); }}"
+                for i in range(lanes)])
+
+        # Reverse the elements inside each container. The number in the name is
+        # the container's width, not the element's -- `rev64 v0.8b` reverses
+        # eight bytes within each 64-bit half.
+        if m in ("rev64", "rev32", "rev16") and len(ops) == 2:
+            container = int(m[3:])
+            per = container // bits
+            if per < 2:
+                raise Unsupported(f"{m} on {bits}-bit lanes")
+            body = []
+            for i in range(lanes):
+                group, pos = divmod(i, per)
+                src = group * per + (per - 1 - pos)
+                body.append(f"  _t.{view}[{i}] ="
+                            f" {self.vec_elem(ops[1], src, view)};")
+            return self.vec_result(ops[0], body)
+
+        # Shift left long: widen to the destination's lane and shift by the
+        # source's element width, which is the only shift this instruction has.
+        if m in ("shll", "shll2") and len(ops) == 3:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            base = slanes - lanes if m.endswith("2") else 0
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)"
+                f"({self.vec_elem(ops[1], base + i, s_view)}) << {sbits};"
+                for i in range(lanes)])
+
+        # Widening absolute difference: both operands are halves of narrower
+        # registers, and the result cannot overflow the wider lane.
+        if m in ("uabdl", "uabdl2", "sabdl", "sabdl2") and len(ops) == 3:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            signed = m.startswith("s")
+            base = slanes - lanes if m.endswith("2") else 0
+            src_view = self.signed_view(sbits) if signed else s_view
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            body = []
+            for i in range(lanes):
+                a = f"({cast})({self.vec_elem(ops[1], base + i, src_view)})"
+                b = f"({cast})({self.vec_elem(ops[2], base + i, src_view)})"
+                body.append(f"  _t.{view}[{i}] = (uint{bits}_t)"
+                            f"({a} > {b} ? {a} - {b} : {b} - {a});")
+            return self.vec_result(ops[0], body)
+
+        # Signed saturating shift right, narrowing. The destination is signed
+        # here, unlike `sqshrun` where it is not.
+        if m in ("sqshrn", "sqshrn2") and len(ops) == 3 \
+                and ops[2].type == a64.ARM64_OP_IMM:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, _, sbits = sinfo
+            n = ops[2].imm
+            lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+            ssv = self.signed_view(sbits)
+
+            def clamp(i):
+                v = (f"((int{sbits}_t)({self.vec_elem(ops[1], i, ssv)})"
+                     f" >> {n})")
+                return (f"(uint{bits}_t)(int{bits}_t)({v} < {lo} ? {lo} :"
+                        f" {v} > {hi} ? {hi} : {v})")
+            if m.endswith("2"):
+                return self.vec_result_keep(ops[0], [
+                    f"  _t.{view}[{lanes - slanes + i}] = {clamp(i)};"
+                    for i in range(slanes)])
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {clamp(i)};" for i in range(slanes)])
+
+        # The immediate forms, which take two operands rather than three and
+        # read the destination as well as writing it.
+        if m in ("bic", "orr") and len(ops) == 2 \
+                and ops[1].type == a64.ARM64_OP_IMM:
+            value = ops[1].imm
+            if ops[1].shift.type == a64.ARM64_SFT_LSL and ops[1].shift.value:
+                value <<= ops[1].shift.value
+            value &= (1 << bits) - 1
+            if m == "bic":
+                value = (~value) & ((1 << bits) - 1)
+            c = "&" if m == "bic" else "|"
+            return self.vec_result_keep(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(_t.{view}[{i}] {c}"
+                f" UINT64_C({value}));" for i in range(lanes)],
+                clear_top=lanes * bits == 64)
+
+        # Floating-point width conversion. `l` widens the low half (or the top
+        # half, for the `2` form); `n` narrows into the low half, and `n2`
+        # fills the high half without disturbing the low one.
+        if m in ("fcvtl", "fcvtl2", "fcvtn", "fcvtn2") and len(ops) == 2:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, _, sbits = sinfo
+            src_f = {32: "f32", 64: "f64"}.get(sbits)
+            if not src_f or not fview:
+                raise Unsupported(f"{m} between {sbits} and {bits}")
+            ctype = "float" if bits == 32 else "double"
+            if m.startswith("fcvtl"):
+                base = slanes - lanes if m.endswith("2") else 0
+                return self.vec_result(ops[0], [
+                    f"  _t.{fview}[{i}] = ({ctype})"
+                    f"{self.vec_elem(ops[1], base + i, src_f)};"
+                    for i in range(lanes)])
+            if m.endswith("2"):
+                return self.vec_result_keep(ops[0], [
+                    f"  _t.{fview}[{lanes - slanes + i}] = ({ctype})"
+                    f"{self.vec_elem(ops[1], i, src_f)};"
+                    for i in range(slanes)])
+            return self.vec_result(ops[0], [
+                f"  _t.{fview}[{i}] = ({ctype})"
+                f"{self.vec_elem(ops[1], i, src_f)};" for i in range(slanes)])
+
+        # Pairwise add across two vectors: the destination's first half comes
+        # from adjacent pairs of the first source, the second half from the
+        # second source.
+        if m in ("addp", "faddp") and len(ops) == 3:
+            half = lanes // 2
+            body = []
+            for i in range(lanes):
+                src = ops[1] if i < half else ops[2]
+                j = (i if i < half else i - half) * 2
+                if m == "faddp":
+                    if not fview:
+                        raise Unsupported(f"{m} on {bits}-bit lanes")
+                    body.append(
+                        f"  _t.{fview}[{i}] = arc_fadd{bits}("
+                        f"{self.vec_elem(src, j, fview)},"
+                        f" {self.vec_elem(src, j + 1, fview)});")
+                else:
+                    body.append(
+                        f"  _t.{view}[{i}] = (uint{bits}_t)("
+                        f"{self.vec_elem(src, j, view)} +"
+                        f" {self.vec_elem(src, j + 1, view)});")
+            return self.vec_result(ops[0], body)
 
         raise Unsupported(f"vector {m}")
 
