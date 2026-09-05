@@ -30,7 +30,12 @@ namespace arc {
 uint64_t EglGetProcAddress(const char* name) {
 #if defined(ARC_HAVE_SDL2)
   if (!name || !SDL_GL_GetCurrentContext()) return 0;
-  return reinterpret_cast<uint64_t>(SDL_GL_GetProcAddress(name));
+  // Announced to the dispatcher, because the guest is about to branch to it.
+  // An import is announced when it binds at load time; a pointer produced this
+  // late has no such moment, and without one the branch lands on host code the
+  // dispatcher has never heard of and is reported as going nowhere.
+  return ShimHandOut(reinterpret_cast<uint64_t>(SDL_GL_GetProcAddress(name)),
+                     name);
 #else
   (void)name;
   return 0;

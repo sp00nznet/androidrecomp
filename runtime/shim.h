@@ -26,6 +26,15 @@ uint64_t ShimResolve(const char* name);
 // How many symbols layer 1 covers, for the coverage report.
 size_t ShimExplicitCount();
 
+// A host function pointer handed to the guest at run time, from `dlsym` or
+// `eglGetProcAddress`. Imports are announced to the dispatcher when they bind
+// at load time; a pointer produced later has no such moment, and this is it.
+// Without it the guest branches straight to host code the dispatcher has never
+// heard of, and the branch is reported as going nowhere. Returns the address,
+// so it can wrap a return value. Only ever pass a *host* address: registering
+// a guest one would have it called as if it were host code.
+uint64_t ShimHandOut(uint64_t address, const char* name);
+
 // Threads, semaphores and thread-local keys. Kept in its own file because it
 // carries real state rather than forwarding to something the host already has.
 uint64_t ShimResolvePthread(const char* name);

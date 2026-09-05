@@ -3,6 +3,9 @@
 #include "arm64_context.h"
 
 #include <cerrno>
+#include <deque>
+#include <string>
+#include <mutex>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -216,5 +219,24 @@ uint64_t ShimResolve(const char* name) {
 }
 
 size_t ShimExplicitCount() { return sizeof(kExplicit) / sizeof(kExplicit[0]); }
+
+uint64_t ShimHandOut(uint64_t address, const char* name) {
+  if (!address) return 0;
+  // The dispatcher keeps the name pointer rather than a copy of the string,
+  // and the caller's is the guest's own memory, so it is interned here. A
+  // deque and not a vector: a vector reallocates, and a short string keeps its
+  // characters inside the object itself, so every pointer handed out earlier
+  // would be left dangling. GL entry point names are all short.
+  static std::mutex lock;
+  static std::deque<std::string> interned;
+  const char* kept = "handed out at run time";
+  if (name && *name) {
+    std::lock_guard<std::mutex> held(lock);
+    interned.emplace_back(name);
+    kept = interned.back().c_str();
+  }
+  arc_register_native(address, kept);
+  return address;
+}
 
 }  // namespace arc

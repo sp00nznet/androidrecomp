@@ -247,10 +247,15 @@ const char* Dlerror() { return nullptr; }
 void* Dlsym(void*, const char* symbol) {
   {
     std::lock_guard<std::mutex> g(g_images_lock);
+    // A guest image's own symbol is guest code, and is deliberately *not*
+    // announced as a native: the dispatcher would then call ARM instructions
+    // as if they were host ones.
     for (const ElfImage* img : g_images)
       if (uint64_t a = img->Lookup(symbol)) return reinterpret_cast<void*>(a);
   }
-  return reinterpret_cast<void*>(ShimResolve(symbol));
+  // The shim's answer is host code, and the guest will branch straight to it.
+  return reinterpret_cast<void*>(
+      ShimHandOut(ShimResolve(symbol), symbol));
 }
 
 // The C++ unwinder walks this to find each image's .eh_frame, so exceptions
