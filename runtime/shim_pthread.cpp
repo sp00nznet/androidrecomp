@@ -253,11 +253,23 @@ int RwlockUnlock(uint32_t* l) {
 
 // pthread_once_t is a bare int, so it holds the state machine directly rather
 // than a registry id: 0 = untouched, 1 = running, 2 = done.
-int Once(uint32_t* control, void (*fn)(void)) {
+// The initialiser is guest code, so it is dispatched rather than called. A
+// guest function pointer invoked as a host one executes ARM instructions on an
+// x86 processor, which arrives as an access violation *on execute* -- a fault
+// that names an address inside the game's own image and looks for all the
+// world like a bad pointer in the guest, rather than like the host calling it
+// wrongly. Every shim entry point taking a callback has this hazard; a thread's
+// entry point already dispatches, and this is the same thing.
+int Once(uint32_t* control, uint64_t fn) {
   uint32_t expected = 0;
   auto* state = reinterpret_cast<std::atomic<uint32_t>*>(control);
   if (state->compare_exchange_strong(expected, 1)) {
-    fn();
+    std::vector<uint8_t> stack(kGuestThreadStack);
+    Arm64Ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestThreadStack -
+              kGuestThreadHeadroom) & ~15ULL;
+    arc_dispatch(&ctx, fn);
     state->store(2);
     return 0;
   }
