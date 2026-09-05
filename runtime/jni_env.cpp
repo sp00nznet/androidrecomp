@@ -333,9 +333,20 @@ extern "C" {
 uint64_t arc_jni_env(void) { return reinterpret_cast<uint64_t>(&g_table); }
 
 void arc_jni_register(void) {
-  for (size_t i = 0; i < kSlots; ++i)
+  uint64_t low = g_slots[0], high = g_slots[0];
+  for (size_t i = 0; i < kSlots; ++i) {
     arc_register_ctx_native(g_slots[i], NameOf(i),
                             reinterpret_cast<ArcCtxFn>(g_slots[i]));
+    if (g_slots[i] < low) low = g_slots[i];
+    if (g_slots[i] > high) high = g_slots[i];
+  }
+  // Printed because a branch through this table that the dispatcher does not
+  // recognise is otherwise indistinguishable from one that never came from
+  // here at all: with the extent in hand, an address either is a slot or is
+  // not, and there is nothing to reason about.
+  printf("jni        %zu slots at %p, stubs %#llx..%#llx\n", kSlots,
+         static_cast<void*>(&g_table), static_cast<unsigned long long>(low),
+         static_cast<unsigned long long>(high));
 }
 
 // The object handed to an entry point as its `this`. Nothing reads it
