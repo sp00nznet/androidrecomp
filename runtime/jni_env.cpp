@@ -13,7 +13,14 @@
 
 namespace {
 
-constexpr size_t kSlots = 256;
+// The environment's table, and eight more stubs behind it for the JavaVM's.
+// The two are separate interfaces the guest reaches identically -- a table of
+// function pointers, indexed and branched through -- so they share one pool of
+// stubs and the VM's indices are simply offset past the environment's.
+constexpr size_t kEnvSlots = 256;
+constexpr size_t kVmSlots = 8;
+constexpr size_t kVmBase = kEnvSlots;
+constexpr size_t kSlots = kEnvSlots + kVmSlots;
 
 // The table the guest sees, and the pointer that names it. A JNIEnv* is the
 // address of `g_table`, not of the table itself -- one more level of
@@ -21,6 +28,14 @@ constexpr size_t kSlots = 256;
 // a read rather than on a call.
 uint64_t g_slots[kSlots];
 uint64_t g_table = reinterpret_cast<uint64_t>(g_slots);
+
+// The invocation interface, which is how the engine reaches the VM rather than
+// one environment: three reserved entries, then DestroyJavaVM,
+// AttachCurrentThread, DetachCurrentThread, GetEnv and
+// AttachCurrentThreadAsDaemon. A JavaVM* is the address of `g_vm_table`, the
+// same double indirection as above.
+uint64_t g_vm_slots[kVmSlots];
+uint64_t g_vm_table = reinterpret_cast<uint64_t>(g_vm_slots);
 
 size_t g_hits[kSlots];
 size_t g_total;
@@ -177,6 +192,13 @@ constexpr SlotInfo kKnown[] = {
     // ExceptionCheck must answer false, or the engine believes a throw is
     // pending after every call and unwinds instead of continuing.
     {219, "ExceptionCheck", false},     {220, "NewDirectByteBuffer", true},
+
+    // The invocation interface, offset past the environment's slots.
+    {kVmBase + 3, "DestroyJavaVM", false},
+    {kVmBase + 4, "AttachCurrentThread", false},
+    {kVmBase + 5, "DetachCurrentThread", false},
+    {kVmBase + 6, "GetEnv", false},
+    {kVmBase + 7, "AttachCurrentThreadAsDaemon", false},
 };
 
 const SlotInfo* Lookup(size_t index) {
@@ -235,6 +257,34 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
+    case 210: {  // GetJavaVM(env, JavaVM** out)
+      // Writing the VM out is the whole point of the call. Left unwritten, the
+      // caller reads whatever that variable happened to hold and branches
+      // through it as though it were a table of functions.
+      if (c->x[1])
+        *reinterpret_cast<uint64_t*>(c->x[1]) =
+            reinterpret_cast<uint64_t>(&g_vm_table);
+      c->x[0] = 0;  // JNI_OK
+      return;
+    }
+
+    // The invocation interface. Attaching a thread and asking for its
+    // environment both hand back the one environment there is: nothing in it
+    // is per-thread, so every thread can share it.
+    case kVmBase + 4:    // AttachCurrentThread(vm, JNIEnv**, void*)
+    case kVmBase + 6:    // GetEnv(vm, void**, version)
+    case kVmBase + 7: {  // AttachCurrentThreadAsDaemon
+      if (c->x[1])
+        *reinterpret_cast<uint64_t*>(c->x[1]) =
+            reinterpret_cast<uint64_t>(&g_table);
+      c->x[0] = 0;
+      return;
+    }
+    case kVmBase + 3:  // DestroyJavaVM
+    case kVmBase + 5:  // DetachCurrentThread
+      c->x[0] = 0;
+      return;
+
     default:
       break;
   }
@@ -261,7 +311,12 @@ void FillSlots(std::index_sequence<I...>) {
 }
 
 struct Init {
-  Init() { FillSlots(std::make_index_sequence<kSlots>{}); }
+  Init() {
+    FillSlots(std::make_index_sequence<kSlots>{});
+    // The VM's table is the tail of the same pool, so the two interfaces are
+    // dispatched and named by one mechanism.
+    for (size_t i = 0; i < kVmSlots; ++i) g_vm_slots[i] = g_slots[kVmBase + i];
+  }
 } g_init;
 
 }  // namespace
