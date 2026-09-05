@@ -409,8 +409,7 @@ int main(int argc, char** argv) {
       }
       first_failures.push_back(buf);
       if (first_failures.size() == 1) {
-        printf("%s
-", buf);
+        printf("%s\n", buf);
         ReportFrames();
       }
     }
