@@ -473,6 +473,19 @@ int main(int argc, char** argv) {
          static_cast<void*>(g_image.base()));
   printf("imports    %zu host functions, %zu satisfied by unlifted guest "
          "images, %zu unresolved\n", natives, guest_side, g_unresolved.size());
+  // Named, not just counted. Every one is a branch the guest can take into
+  // nothing, so the list is the work queue -- and reading it beforehand is
+  // cheaper than meeting them one run at a time.
+  if (!g_unresolved.empty()) {
+    std::vector<std::string> names;
+    for (const auto& u : g_unresolved) names.push_back(u.second);
+    std::sort(names.begin(), names.end());
+    printf("           still needed:");
+    for (size_t i = 0; i < names.size(); ++i)
+      printf("%s%s", i && i % 6 == 0 ? "\n                        " : " ",
+             names[i].c_str());
+    printf("\n");
+  }
   printf("\nmapped images\n");
   for (const Mapping& m : g_mappings) {
     bool lifted = false;
