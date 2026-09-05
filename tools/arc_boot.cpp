@@ -250,10 +250,13 @@ int main(int argc, char** argv) {
 
   const char* lib = nullptr;
   const char* entry = nullptr;
+  const char* entry_args = nullptr;
   long ctor_limit = 0;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--entry=", 8) == 0)
       entry = argv[i] + 8;
+    else if (strncmp(argv[i], "--args=", 7) == 0)
+      entry_args = argv[i] + 7;
     else if (strncmp(argv[i], "--constructors=", 15) == 0)
       ctor_limit = strtol(argv[i] + 15, nullptr, 10);
     else
@@ -261,7 +264,8 @@ int main(int argc, char** argv) {
   }
   if (!lib) {
     fprintf(stderr,
-            "usage: %s [--constructors=N] [--entry=SYMBOL] <library.so>\n",
+            "usage: %s [--constructors=N] [--entry=SYMBOL] [--args=N,N,...]"
+            " <library.so>\n",
             argv[0]);
     return 2;
   }
@@ -467,6 +471,22 @@ int main(int argc, char** argv) {
     memset(ctx.x, 0, sizeof(ctx.x));
     ctx.x[0] = arc_jni_env();
     ctx.x[1] = arc_jni_object();  // the object the method was called on
+    // The method's own declared arguments follow those two. Passing nothing is
+    // not the same as passing nothing meaningful: an entry point given a zero
+    // width and height sets up a zero-sized surface and fails somewhere much
+    // later, which reads as a porting bug rather than as a missing argument.
+    if (entry_args) {
+      int slot = 2;
+      for (const char* p = entry_args; *p && slot < 8;) {
+        char* end = nullptr;
+        const long long v = strtoll(p, &end, 0);
+        if (end == p) break;
+        ctx.x[slot++] = static_cast<uint64_t>(v);
+        p = (*end == ',') ? end + 1 : end;
+      }
+      printf("  with %d argument(s) after the environment and object\n",
+             slot - 2);
+    }
     EntryCall call{};
     call.ctx = &ctx;
     call.target = addr;
