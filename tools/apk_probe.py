@@ -44,6 +44,112 @@ HARD = {
 }
 
 
+
+# --- engine identification --------------------------------------------------
+#
+# The highest-leverage question in the whole triage, and the cheapest to ask.
+#
+# A port's hardest problem is usually not the machine code -- it is knowing what
+# the host owes the engine: which entry points, in what units, on which thread,
+# with what set up before each call. Reverse-engineering that from traces is
+# slow and produces guesses. If the engine is one whose source is public, none
+# of it has to be guessed: the Java side of every JNI call can simply be read,
+# and several of these engines ship a desktop backend, which is a working
+# reference implementation of the behaviour the host has to reproduce.
+#
+# So: look for the engine before doing anything else. It costs a substring
+# search and can save the entire contract-discovery phase.
+#
+# Matching is on symbol prefixes first, because a JNI package name is close to
+# proof, then on strings in the binary, which are strong but not conclusive.
+ENGINES = [
+    ("cocos2d-x",
+     ["Java_org_cocos2dx_"],
+     [b"cocos2d-x", b"Cocos2dxActivity", b"Cocos2dxRenderer"],
+     "source public; ships a desktop backend -- the contract can be read "
+     "rather than inferred"),
+    ("Unity",
+     ["Java_com_unity3d_player_"],
+     [b"UnityEngine", b"libunity", b"il2cpp"],
+     "source is not public; IL2CPP output is a second lifting problem on top "
+     "of this one"),
+    ("Unreal Engine",
+     ["Java_com_epicgames_"],
+     [b"UnrealEngine", b"FEngineLoop", b"UE4"],
+     "source available under licence; a desktop target exists"),
+    ("Godot",
+     ["Java_org_godotengine_"],
+     [b"godotengine", b"GodotLib"],
+     "source public; desktop is a first-class target"),
+    ("libGDX",
+     ["Java_com_badlogic_gdx_"],
+     [b"libgdx", b"com/badlogic/gdx"],
+     "source public; desktop backend is the primary one"),
+    ("Defold",
+     [],
+     [b"dmEngine", b"defold"],
+     "source public; desktop targets are first class"),
+    ("Solar2D / Corona",
+     ["Java_com_ansca_corona_"],
+     [b"CoronaLua", b"Corona Labs"],
+     "source public since 2020"),
+    ("Marmalade",
+     [],
+     [b"s3eDevice", b"Marmalade"],
+     "discontinued; SDK source not public"),
+    ("GameMaker",
+     [],
+     [b"YoYoGames", b"GMRunner"],
+     "runner source not public"),
+    ("Flutter",
+     ["Java_io_flutter_"],
+     [b"FlutterEngine", b"flutter_assets"],
+     "source public; desktop embedders exist"),
+    ("Mono / Xamarin",
+     [],
+     [b"mono_jit_init", b"Xamarin"],
+     "a managed runtime -- the game logic is in assemblies, not this binary"),
+    ("SDL",
+     [],
+     [b"SDL_CreateWindow", b"SDL_GL_SwapWindow"],
+     "portable already; the host may need very little"),
+]
+
+
+def identify_engine(blob: bytes, exports: list[str]):
+    """(name, evidence, note) for each engine the binary looks like."""
+    found = []
+    for name, symbols, strings, note in ENGINES:
+        evidence = []
+        for prefix in symbols:
+            hit = next((e for e in exports if e.startswith(prefix)), None)
+            if hit:
+                evidence.append(f"exports {hit}")
+        for needle in strings:
+            if needle in blob:
+                evidence.append(f'contains "{needle.decode()}"')
+        if evidence:
+            found.append((name, evidence[:3], note))
+    return found
+
+
+def jni_packages(exports: list[str]) -> list[tuple[str, int]]:
+    """JNI entry points grouped by the Java package that declared them.
+
+    Useful even when no engine matches: the package names say who wrote the
+    Java side, which is where the host contract came from.
+    """
+    counts: dict[str, int] = {}
+    for name in exports:
+        if not name.startswith("Java_"):
+            continue
+        parts = name[5:].split("_")
+        if len(parts) < 2:
+            continue
+        counts[".".join(parts[:-1])] = counts.get(".".join(parts[:-1]), 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
+
+
 def read_lib(path: str, abi: str) -> tuple[str, bytes]:
     """Return (name, bytes) of the largest .so for `abi`, from an APK or a dir."""
     candidates: dict[str, int] = {}
@@ -123,6 +229,8 @@ def probe(name: str, blob: bytes) -> dict:
             if m.startswith(prefixes):
                 hard[kind] += 1
                 break
+    rep["engines"] = identify_engine(blob, rep["exports"])
+    rep["jni_packages"] = jni_packages(rep["exports"])
     rep["insn_total"] = sum(hist.values())
     rep["insn_distinct"] = len(hist)
     rep["insn_top"] = hist.most_common(25)
@@ -140,6 +248,25 @@ def render(rep: dict) -> str:
           f"- functions from `.eh_frame`: **{rep['func_count']:,}** "
           f"covering {rep['eh_coverage']:.1%} of `.text`",
           f"- undisassembled bytes: {rep['undisassembled']:,}", ""]
+
+    if rep["engines"]:
+        L += ["## Engine", ""]
+        for name, evidence, note in rep["engines"]:
+            L += [f"**{name}** -- {note}", "",
+                  "".join(f"- {e}\n" for e in evidence)]
+        L += ["The host contract for a known engine is read, not inferred: the "
+              "Java side of every entry point is source you can open, and a "
+              "desktop backend is a reference implementation of what the host "
+              "has to reproduce.", ""]
+    else:
+        L += ["## Engine", "",
+              "No engine recognised. The contract will have to be recovered "
+              "from the binary and the dex -- see `dex_contract.py`.", ""]
+
+    if rep["jni_packages"]:
+        L += ["JNI entry points by declaring package:", ""]
+        L += [f"- `{pkg}` -- {n}" for pkg, n in rep["jni_packages"][:8]]
+        L += [""]
 
     L += ["## Shim surface", "", "Linked libraries -- every one of these is a shim you write:", ""]
     L += [f"- `{n}`" for n in rep["needed"]]
