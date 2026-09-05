@@ -9,7 +9,7 @@ unrelated engines. *The Simpsons: Tapped Out*'s 28 MB Scorpio engine resolves
 1,521 of its 1,527 static constructors. *Family Guy: The Quest for Stuff*'s
 cocos2d-x engine lifted at **99.0% of functions with no title-specific work at
 all** — the first evidence that the kit generalises — and now runs **1,201 of
-its 1,202 constructors** at 99.7% of functions and 99.99% of instructions. See
+its 1,202 constructors** at 99.8% of functions and 100.00% of instructions. See
 [Milestones](#milestones).
 
 ---
@@ -421,8 +421,8 @@ ELF.
       Android's, and it is the one library worth replacing rather than loading.
 - [x] **Lifter.** ARM64 → C. Boundaries from `.eh_frame`, the PLT, call sites
       and the gaps between them; indirect branches via an address →
-      function-pointer table. On the second engine, **99.99% of instructions
-      and 99.7% of functions lift completely**, and 750 of 750 differential
+      function-pointer table. On the second engine, **100.00% of instructions
+      and 99.8% of functions lift completely**, and 750 of 750 differential
       cases across 68 operand forms agree with the oracle. What remains is a
       long tail of narrow forms — horizontal reductions, a few scalar FP
       spellings — plus the `svc` sites, which need the shim rather than the
