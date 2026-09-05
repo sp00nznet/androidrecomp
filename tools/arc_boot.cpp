@@ -658,6 +658,7 @@ int main(int argc, char** argv) {
       // fault raises, and was already answered there.
       printf("  %s\n", call.trap);
       ReportFrames();
+      ReportRegisters(&ctx);
     } else {
       const std::string what = ExplainAddress(g_fault_address);
       printf("  %s on %s of %#llx%s%s\n", FaultName(code), g_fault_kind,
