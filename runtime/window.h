@@ -28,6 +28,17 @@ class Window {
   void Present();
   void Close();
 
+  // Hand the context to the calling thread, and give it up again.
+  //
+  // A GL context belongs to one thread at a time, and the guest runs on a
+  // thread of its own -- it needs a stack far larger than a default one. So
+  // without this the engine's GL calls have no context to act on, and that
+  // does not fail loudly: `glGetString` answers null and the engine calls
+  // `strlen` on the result. Release on the thread that holds it before taking
+  // it on another.
+  bool MakeCurrent(std::string* err);
+  void ReleaseCurrent();
+
   int width() const { return width_; }
   int height() const { return height_; }
 

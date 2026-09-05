@@ -217,11 +217,21 @@ struct EntryCall {
   int rc;
   unsigned long code;
   char trap[256];
+  arc::Window* window;
 };
 
 #if defined(_WIN32)
 DWORD WINAPI RunEntry(void* p) {
   EntryCall* e = static_cast<EntryCall*>(p);
+  // The context has to be current on the thread that issues the GL calls, and
+  // that is this one. Without it the engine's calls have no context to act on,
+  // which fails quietly rather than loudly: glGetString(GL_EXTENSIONS) answers
+  // null and the engine takes strlen of it.
+  if (e->window) {
+    std::string err;
+    if (!e->window->MakeCurrent(&err))
+      printf("  could not make the GL context current: %s\n", err.c_str());
+  }
   e->rc = CallGuarded(e->ctx, e->target, &e->code);
   if (e->rc == 1) snprintf(e->trap, sizeof(e->trap), "%s", arc_last_trap());
   if (e->rc != 0) {
@@ -520,6 +530,11 @@ int main(int argc, char** argv) {
     EntryCall call{};
     call.ctx = &ctx;
     call.target = addr;
+    call.window = want_window ? &window : nullptr;
+    // Given up here so the guest's thread can take it: a context is current on
+    // one thread at a time, and claiming it elsewhere while this one still
+    // holds it fails.
+    if (want_window) window.ReleaseCurrent();
 #if defined(_WIN32)
     // 512 MB reserved. It is address space, not memory: only the pages the
     // guest actually touches are ever committed.

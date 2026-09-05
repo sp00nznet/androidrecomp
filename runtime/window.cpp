@@ -46,6 +46,24 @@ bool Window::Open(const char* title, int width, int height, std::string* err) {
   return true;
 }
 
+bool Window::MakeCurrent(std::string* err) {
+  if (!window_ || !context_) {
+    if (err) *err = "no window";
+    return false;
+  }
+  if (SDL_GL_MakeCurrent(static_cast<SDL_Window*>(window_),
+                         static_cast<SDL_GLContext>(context_)) != 0) {
+    if (err) *err = SDL_GetError();
+    return false;
+  }
+  return true;
+}
+
+void Window::ReleaseCurrent() {
+  if (window_)
+    SDL_GL_MakeCurrent(static_cast<SDL_Window*>(window_), nullptr);
+}
+
 bool Window::PumpEvents() {
   SDL_Event e;
   bool open = true;
@@ -118,6 +136,11 @@ bool Window::Open(const char*, int, int, std::string* err) {
   if (err) *err = "built without SDL2";
   return false;
 }
+bool Window::MakeCurrent(std::string* err) {
+  if (err) *err = "built without SDL2";
+  return false;
+}
+void Window::ReleaseCurrent() {}
 bool Window::PumpEvents() { return false; }
 void Window::Present() {}
 void Window::Close() {}
