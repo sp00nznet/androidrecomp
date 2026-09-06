@@ -1,8 +1,10 @@
 #include "jni_env.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 #if defined(_WIN32)
@@ -37,8 +39,10 @@ uint64_t g_table = reinterpret_cast<uint64_t>(g_slots);
 uint64_t g_vm_slots[kVmSlots];
 uint64_t g_vm_table = reinterpret_cast<uint64_t>(g_vm_slots);
 
-size_t g_hits[kSlots];
-size_t g_total;
+// Counters, not state the guest depends on -- but written from every thread
+// the engine starts, so they are atomic rather than merely approximate.
+std::atomic<size_t> g_hits[kSlots];
+std::atomic<size_t> g_total;
 
 // --- the arena -------------------------------------------------------------
 // Handles are blocks from a zeroed arena, reserved low in the address space. A
@@ -61,7 +65,15 @@ unsigned char* ReserveLowArena() {
   return static_cast<unsigned char*>(calloc(1, kArenaSize));
 }
 
+// Locked, because the engine reaches this from every thread it starts. Two
+// threads racing here do not merely miscount: both leave with the same block,
+// and a handle that two owners are writing over is a pointer that reads back
+// as something no one stored -- which surfaces far away as a branch to an
+// address that was never in any mapped image.
+std::mutex g_arena_lock;
+
 uint64_t Allocate() {
+  std::lock_guard<std::mutex> held(g_arena_lock);
   if (!g_arena) {
     g_arena = ReserveLowArena();
     if (!g_arena) return 0;
