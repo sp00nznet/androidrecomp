@@ -120,6 +120,8 @@ struct Field {
 
 const Field kFields[] = {
     {"appPath", 's', "/assets", 0, 0},
+    // Answered from the asset root, not from here -- see DirectoryForName.
+    {"writablePath", 's', ".", 0, 0},
     {"appBundle", 's', "androidrecomp.host", 0, 0},
     {"appVersion", 's', "1.0", 0, 0},
     {"clientVersion", 's', "1.0", 0, 0},
@@ -253,18 +255,20 @@ const MethodText kMethodText[] = {
 // this machine rather than anything invented. They come from the asset root
 // the host was given: the bundle is that directory, and what the engine writes
 // goes beside it rather than into it.
-const char* DirectoryForMethod(const char* name) {
+const char* DirectoryForName(const char* name) {
   static std::mutex lock;
   static std::string bundle, storage;
   const char* root = arc::ShimAssetRoot();
   if (!root || !*root) return nullptr;
   std::lock_guard<std::mutex> held(lock);
   if (strcmp(name, "getBundleDir") == 0 || strcmp(name, "getAssetsPath") == 0 ||
-      strcmp(name, "getCocos2dxWritablePath") == 0) {
+      strcmp(name, "getCocos2dxWritablePath") == 0 ||
+      strcmp(name, "appPath") == 0) {
     bundle = root;
     return bundle.c_str();
   }
-  if (strcmp(name, "getStorageDir") == 0) {
+  if (strcmp(name, "getStorageDir") == 0 ||
+      strcmp(name, "writablePath") == 0) {
     // Forward slashes, like the root it is derived from: the guest is Android
     // code and splits on '/'.
     storage = std::filesystem::path(root).parent_path().generic_string();
@@ -277,7 +281,7 @@ const char* TextForMethod(uint64_t id) {
   const char* name = MethodName(id);
   if (!name) return nullptr;
   NoteCalled(name);
-  if (const char* dir = DirectoryForMethod(name)) return dir;
+  if (const char* dir = DirectoryForName(name)) return dir;
   for (const MethodText& m : kMethodText)
     if (strcmp(m.name, name) == 0) return m.text;
   NoteUnanswered(name);
@@ -384,6 +388,14 @@ void Handle(size_t index, Arm64Ctx* c) {
     }
     case 95: {  // GetObjectField(env, object, fieldID)
       const Field* f = FieldFromId(c->x[2]);
+      if (f && f->kind == 's') {
+        // A path field has to name a directory that exists on this machine, so
+        // it comes from the asset root rather than from the table.
+        if (const char* dir = DirectoryForName(f->name)) {
+          c->x[0] = AllocateText(dir);
+          return;
+        }
+      }
       c->x[0] = AllocateText(f && f->kind == 's' ? f->text : "");
       return;
     }
