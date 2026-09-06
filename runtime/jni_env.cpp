@@ -149,10 +149,23 @@ const Field* FieldFromId(uint64_t id) {
   return index < kFieldCount ? &kFields[index] : nullptr;
 }
 
+// Fields the engine asked for that this table has no answer for. Each reads as
+// zero of its type -- an empty string, a zero count -- which is a plausible
+// value rather than a visible failure, so the engine carries it away and comes
+// apart somewhere else entirely. Naming them is the difference between that and
+// a line saying which one to add.
+std::mutex g_field_lock;
+std::deque<std::string> g_unknown_fields;
+
 uint64_t FieldIdFor(const char* name) {
   if (name) {
     for (size_t i = 0; i < kFieldCount; ++i)
       if (strcmp(kFields[i].name, name) == 0) return kFieldIdBase + i;
+    std::lock_guard<std::mutex> held(g_field_lock);
+    bool seen = false;
+    for (const std::string& s : g_unknown_fields)
+      if (s == name) { seen = true; break; }
+    if (!seen) g_unknown_fields.push_back(name);
   }
   // Unknown field: still a usable id, and it reads as zero of its type.
   return kFieldIdBase + kFieldCount;
@@ -604,6 +617,14 @@ void arc_jni_report(void) {
   // here had a value for. Each got a blank handle, which reads as an empty
   // string -- so any of these that was meant to be a path is a lookup failing
   // somewhere later for a reason that points nowhere near here.
+  {
+    std::lock_guard<std::mutex> held(g_field_lock);
+    if (!g_unknown_fields.empty()) {
+      printf("  object fields asked for that nothing here answers:\n   ");
+      for (const std::string& s : g_unknown_fields) printf(" %s", s.c_str());
+      printf("\n");
+    }
+  }
   std::lock_guard<std::mutex> held(g_method_lock);
   if (!g_method_called.empty()) {
     printf("  Java methods invoked:\n   ");
