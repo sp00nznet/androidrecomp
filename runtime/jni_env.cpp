@@ -389,10 +389,12 @@ void arc_jni_report(void) {
     printf("  no JNI slots were called\n");
     return;
   }
-  printf("  %zu JNI calls across these slots:\n", g_total);
+  // Loaded explicitly: an atomic has no business being passed to a variadic
+  // function, and MSVC is right to refuse it.
+  printf("  %zu JNI calls across these slots:\n", g_total.load());
   for (size_t i = 0; i < kSlots; ++i)
-    if (g_hits[i])
-      printf("    %6zu x  slot %3zu  %s\n", g_hits[i], i, NameOf(i));
+    if (const size_t n = g_hits[i].load())
+      printf("    %6zu x  slot %3zu  %s\n", n, i, NameOf(i));
 }
 
 }  // extern "C"
