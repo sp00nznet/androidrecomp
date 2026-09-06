@@ -9,7 +9,8 @@ unrelated engines. *The Simpsons: Tapped Out*'s 28 MB Scorpio engine resolves
 1,521 of its 1,527 static constructors. *Family Guy: The Quest for Stuff*'s
 cocos2d-x engine lifted at **99.0% of functions with no title-specific work at
 all** — the first evidence that the kit generalises — and now runs **all 1,202 of
-its constructors** at 99.8% of functions and 100.00% of instructions. See
+its constructors**, completes all three of its startup entry points, and reaches
+the game's own loading screen at 99.8% of functions and 100.00% of instructions. See
 [Milestones](#milestones).
 
 ---
