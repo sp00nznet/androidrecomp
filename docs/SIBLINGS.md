@@ -187,3 +187,54 @@ separate diagnoses in one session were confounded by this: a fix appeared to
 have no effect, and a rebuild reported nothing to do, because the port was
 building a pinned older commit. Change the kit, push it, then move the port's
 submodule — in that order, every time.
+
+## Bringing a title up: what the second port had to learn
+
+Everything here was found driving Family Guy from static initialisation to a
+running renderer. None of it is about Family Guy, and tstorecomp has had none
+of it -- its six remaining constructor failures are all null dereferences,
+which is the shape every one of these had before it was understood.
+
+**A library expects JNI_OnLoad.** The Java runtime calls it after loading a
+library and running its static constructors, handing over the JavaVM. A library
+caches that pointer and reaches every later thread's environment through it, so
+skipping the call leaves a null that surfaces much later, inside whatever first
+tries to call back into Java. Both engines export it. The host does this now,
+so a port does not have to remember to.
+
+**Startup is a sequence, not an entry point.** cocos2d-x builds its Application
+inside the first native method Android invokes, and the renderer entry point
+calls getInstance on it. Calling the second without the first finds a null
+singleton. Which methods, and in what order, is a property of the title and
+belongs in its contract.
+
+**The table of context-taking natives has to fit a whole JNI table.** It held
+64 entries; a JNI environment has 233. Everything past the sixty-fourth was
+dropped in silence, so the guest branched to a real stub address the dispatcher
+had no record of, and the report blamed the branch. Both registration tables
+now say when they are full, because the symptom of overflow points anywhere but
+at the cause.
+
+**The native thunk carries stack arguments now.** It passed the eight integer
+registers AArch64 uses and nothing else, which is enough for almost everything
+and not enough for glTexImage2D -- nine arguments, the ninth being the pixel
+data. Nothing reported a missing argument: the call was made and the driver
+read an address nobody had passed.
+
+**Paths handed to the guest must be absolute and use forward slashes.** The
+guest is Android code: it splits on the separator it knows and has no notion of
+a working directory of ours. A relative Windows path arrives as one long
+filename containing none, which is not a wrong directory but no directory.
+
+**And the guest may expect to be running in its own bundle.** Some files are
+opened by bare name, with no directory at all -- on Android the app is launched
+that way and never has to say so. A relative open cannot be corrected after the
+fact, because by the time the name arrives there is nothing left in it to say
+which directory was meant.
+
+**Read the engine's own log before reasoning about it.** Every one of the last
+several blockers announced itself in plain words -- a missing asset manager, a
+JSON document that would not parse, a file that was not found, a random device
+that could not be opened -- while the visible symptom was a null dereference
+somewhere unrelated. The log is on stderr from the first run; it costs nothing
+and it was repeatedly ahead of the analysis.
