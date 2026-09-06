@@ -471,11 +471,21 @@ void Handle(size_t index, Arm64Ctx* c) {
       c->x[0] = s ? strlen(s) : 0;
       return;
     }
-    case 184: {  // GetByteArrayElements
+    case 184:    // GetByteArrayElements
+    case 222: {  // GetPrimitiveArrayCritical -- the same question, asked in
+                 // the form that promises not to hold the collector up
+      // The elements *are* the handle: that is where the bytes were put. The
+      // default for a slot that returns something is a fresh block, and a
+      // fresh block is empty -- so a caller reading an array through this got
+      // nothing back and had no way to tell that from an empty array.
       c->x[0] = c->x[1];
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
+    case 191:    // ReleaseBooleanArrayElements
+    case 192:    // ReleaseByteArrayElements
+    case 223:    // ReleasePrimitiveArrayCritical
+      return;    // nothing was copied, so there is nothing to write back
 
     case 219: {  // GetJavaVM(env, JavaVM** out)
       // Writing the VM out is the whole point of the call. Left unwritten, the
