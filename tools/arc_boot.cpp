@@ -420,8 +420,14 @@ int main(int argc, char** argv) {
                    : dir.parent_path().parent_path() / "assets";
     std::error_code ec;
     if (std::filesystem::is_directory(assets, ec)) {
-      arc::ShimSetAssetRoot(assets.string().c_str());
-      printf("assets     %s\n", assets.string().c_str());
+      // Absolute, and with forward slashes. The guest is Android code: it
+      // splits paths on '/' and has no notion of a working directory of ours,
+      // so a relative Windows path arrives as one long filename containing no
+      // separators at all -- which is not a wrong directory but no directory.
+      const std::string root =
+          std::filesystem::absolute(assets, ec).generic_string();
+      arc::ShimSetAssetRoot(root.c_str());
+      printf("assets     %s\n", root.c_str());
     } else if (asset_root) {
       fprintf(stderr, "no such assets directory: %s\n",
               assets.string().c_str());

@@ -250,7 +250,9 @@ const char* DirectoryForMethod(const char* name) {
     return bundle.c_str();
   }
   if (strcmp(name, "getStorageDir") == 0) {
-    storage = std::filesystem::path(root).parent_path().string();
+    // Forward slashes, like the root it is derived from: the guest is Android
+    // code and splits on '/'.
+    storage = std::filesystem::path(root).parent_path().generic_string();
     return storage.c_str();
   }
   return nullptr;
