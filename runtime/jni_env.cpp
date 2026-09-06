@@ -222,7 +222,9 @@ struct MethodText {
 const MethodText kMethodText[] = {
     {"getCocos2dxPackageName", "androidrecomp.host"},
     {"getPackageName", "androidrecomp.host"},
-    {"getDeviceInfo", "androidrecomp"},
+    // A document, not a name: the engine parses this one as JSON and says so
+    // when it cannot ("Failed to construct JsonMap from string ...").
+    {"getDeviceInfo", "{}"},
     {"getDeviceModel", "androidrecomp"},
     {"getCurrentLanguage", "en"},
     {"getLanguage", "en"},
