@@ -58,16 +58,40 @@ std::filesystem::path Resolve(const char* name) {
   return std::filesystem::path(g_root) / p;
 }
 
-void* ManagerFromJava(void*, void*) { return &g_manager; }
+// What the engine actually asked for, and whether it got it. A title that
+// cannot find its own files is otherwise a silent no: the call succeeds in the
+// sense that it returns, and nothing says which name went unanswered.
+bool Tracing() {
+  static const bool on = getenv("ARC_TRACE_ASSETS") != nullptr;
+  return on;
+}
+
+void Trace(const char* what, const char* name, bool found) {
+  if (Tracing())
+    fprintf(stderr, "[asset] %-8s %-6s %s\n", what, found ? "ok" : "MISS",
+            name ? name : "(null)");
+}
+
+void* ManagerFromJava(void*, void*) {
+  Trace("manager", g_root.c_str(), !g_root.empty());
+  return &g_manager;
+}
 
 // The third argument is the access mode -- streaming, random, buffered. It is
 // advice about how the file will be read, not about what it contains, so the
 // same file answers all of them.
 void* ManagerOpen(void*, const char* name, int) {
   const std::filesystem::path path = Resolve(name);
-  if (path.empty()) return nullptr;
+  if (path.empty()) {
+    Trace("open", name, false);
+    return nullptr;
+  }
   std::error_code ec;
-  if (!std::filesystem::is_regular_file(path, ec)) return nullptr;
+  if (!std::filesystem::is_regular_file(path, ec)) {
+    Trace("open", name, false);
+    return nullptr;
+  }
+  Trace("open", name, true);
   FILE* file = nullptr;
 #if defined(_WIN32)
   if (fopen_s(&file, path.string().c_str(), "rb") != 0) file = nullptr;
@@ -129,6 +153,10 @@ void* ManagerOpenDir(void*, const char* name) {
   for (const auto& entry : std::filesystem::directory_iterator(path, ec))
     if (entry.is_regular_file(ec))
       dir->names.push_back(entry.path().filename().string());
+  if (Tracing())
+    fprintf(stderr, "[asset] opendir  %-6s %s (%zu entries)\n",
+            dir->names.empty() ? "EMPTY" : "ok", name ? name : "(root)",
+            dir->names.size());
   return dir;
 }
 
