@@ -195,6 +195,32 @@ running renderer. None of it is about Family Guy, and tstorecomp has had none
 of it -- its six remaining constructor failures are all null dereferences,
 which is the shape every one of these had before it was understood.
 
+**That last sentence was a guess, and it was wrong.** tstorecomp was rebuilt on
+all of the above -- JNI_OnLoad, the corrected slot indices, the enlarged
+registration table, the asset manager, stack arguments, setjmp -- and the six
+failures came back identical: same constructors, same addresses, same null
+offsets. Nothing above touched them. The reasoning was that two engines failing
+the same way probably fail for the same reason, which had been true of the
+thread pointer and was not true here.
+
+What they actually were is worth more than the guess. Three of them faulted
+writing to address 0x16, and 0x16 was simply what x2 held; the frame trail
+named `sincosf`. Its first argument is a float, so it arrives in v0 -- and the
+native thunk carries the integer registers only. Bound the ordinary way, the
+host function takes the guest's two output pointers as its first and second
+arguments and writes a result through whatever was in the third.
+
+The thunk had said so all along: *it does NOT carry floating-point arguments,
+which live in v0-v7 ... generate those from the import list when a title
+actually needs one.* A documented limitation is not a harmless one. It sat
+unexercised through one whole port and then presented as memory corruption in
+the next, three constructors deep, with nothing in the symptom pointing at the
+calling convention.
+
+**So: check the import list against the thunk's reach before blaming the code
+it fails in.** Any imported function taking a float, a double, or a struct by
+value needs the context, exactly as a variadic one does.
+
 **A library expects JNI_OnLoad.** The Java runtime calls it after loading a
 library and running its static constructors, handing over the JavaVM. A library
 caches that pointer and reaches every later thread's environment through it, so
