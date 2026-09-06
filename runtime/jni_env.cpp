@@ -443,7 +443,17 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (name && (strcmp(name, "getBytes") == 0 ||
                    strcmp(name, "toString") == 0)) {
         NoteCalled(name);
-        c->x[0] = AllocateText(reinterpret_cast<const char*>(c->x[1]));
+        const char* self = reinterpret_cast<const char*>(c->x[1]);
+        // Whether the object carries text at all is the question these turn
+        // on: a handle we made for a string does, and one we handed back for
+        // something we did not understand is a zeroed block that does not.
+        static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+        if (trace)
+          fprintf(stderr, "[jni] %s on %#llx %s text=\"%.48s\"\n", name,
+                  static_cast<unsigned long long>(c->x[1]),
+                  arc_jni_owns(c->x[1]) ? "ours" : "not ours",
+                  self ? self : "");
+        c->x[0] = AllocateText(self);
         return;
       }
       const char* text = TextForMethod(c->x[2]);
