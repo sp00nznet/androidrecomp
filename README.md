@@ -54,7 +54,9 @@ have. Licensed MIT; contributions must be your own work.
 | `runtime/shim_gl` | GL by name through the live driver — desktop GL exports most GLES2 entry points under identical names, so this costs no code per symbol either. |
 | `runtime/shim_file` | File I/O, directories and `mmap` at Bionic's struct layouts and flag values, which are *not* the host's. |
 | `runtime/shim_sys` | Sockets, `dlopen`/`dlsym`/`dl_iterate_phdr` over the loaded images, process and system. |
-| `runtime/window` | SDL2 window, GL context and event loop: the desktop stand-in for `GLSurfaceView`. |
+| `runtime/shim_asset` | The Android asset manager over an ordinary directory. An APK carries a title's own files under `assets/` and the engine reads them through this rather than through `open`, so without it a game loads nothing. There is nothing to emulate: the APK is a zip and the host has a filesystem. |
+| `runtime/jni_env` | The `JNIEnv` and the `JavaVM` the engine calls back through: field and method lookup, string and array access, the invocation interface. Answers by name, and reports what it was asked for and could not answer. |
+| `runtime/window` | SDL2 window, GL context and event loop: the desktop stand-in for `GLSurfaceView`. The context is made current on whichever thread runs the guest, because a GL context belongs to one thread at a time and the guest gets one of its own. |
 | `tools/apk_probe.py` | Feasibility triage for a new title: imports, function count from `.eh_frame`, instruction histogram, and the constructs a lifter must special-case. |
 | `tools/arc_host.cpp` | Loads a library and prints the outstanding-import work list. With no `--contract`, lists every `Java_*` export — how you discover a title's host contract. |
 | `runtime/arm64_context.h` | Guest CPU state and the operations lifted code emits. No address translation: guest pointers *are* host pointers. |
