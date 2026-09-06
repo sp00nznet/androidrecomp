@@ -433,8 +433,35 @@ void Handle(size_t index, Arm64Ctx* c) {
     case 114:    // CallStaticObjectMethod
     case 115:    // CallStaticObjectMethodV
     case 116: {  // CallStaticObjectMethodA
+      // `String.getBytes()` and `toString()` are how a Java string becomes
+      // something the engine can read, and both are called *on* the string --
+      // so the answer is that object's own text, not an entry in a table. This
+      // is why nothing ever called GetStringUTFChars: the conversion goes this
+      // way instead, and answering it with a blank handle made every path the
+      // engine asked for come back empty.
+      const char* name = MethodName(c->x[2]);
+      if (name && (strcmp(name, "getBytes") == 0 ||
+                   strcmp(name, "toString") == 0)) {
+        NoteCalled(name);
+        c->x[0] = AllocateText(reinterpret_cast<const char*>(c->x[1]));
+        return;
+      }
       const char* text = TextForMethod(c->x[2]);
       c->x[0] = text ? AllocateText(text) : Allocate();
+      return;
+    }
+
+    case 171: {  // GetArrayLength
+      // Our byte arrays are the same NUL-terminated text a string handle
+      // holds, so their length is simply that. An array we did not fill is a
+      // zeroed block, which measures zero -- which is the truth about it.
+      const char* s = reinterpret_cast<const char*>(c->x[1]);
+      c->x[0] = s ? strlen(s) : 0;
+      return;
+    }
+    case 184: {  // GetByteArrayElements
+      c->x[0] = c->x[1];
+      if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
 
