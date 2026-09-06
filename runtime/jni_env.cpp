@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <string>
 #include <mutex>
 #include <utility>
@@ -14,6 +15,7 @@
 #endif
 
 #include "arm64_context.h"
+#include "shim.h"
 
 namespace {
 
@@ -205,20 +207,45 @@ struct MethodText {
 
 const MethodText kMethodText[] = {
     {"getCocos2dxPackageName", "androidrecomp.host"},
-    {"getCocos2dxWritablePath", "."},
-    {"getAssetsPath", "."},
     {"getPackageName", "androidrecomp.host"},
-    {"getAbsolutePath", "."},
-    {"getPath", "."},
-    {"getCanonicalPath", "."},
-    {"getCurrentLanguage", "en"},
+    {"getDeviceInfo", "androidrecomp"},
     {"getDeviceModel", "androidrecomp"},
+    {"getCurrentLanguage", "en"},
+    {"getLanguage", "en"},
+    {"getCountry", "US"},
     {"getVersion", "1.0"},
+    // A locale variant and an absent preference are legitimately empty, and
+    // saying so is different from having no answer.
+    {"getVariant", ""},
+    {"getStringPreference", ""},
 };
+
+// The two the engine turns into directories, which have to be real paths on
+// this machine rather than anything invented. They come from the asset root
+// the host was given: the bundle is that directory, and what the engine writes
+// goes beside it rather than into it.
+const char* DirectoryForMethod(const char* name) {
+  static std::mutex lock;
+  static std::string bundle, storage;
+  const char* root = arc::ShimAssetRoot();
+  if (!root || !*root) return nullptr;
+  std::lock_guard<std::mutex> held(lock);
+  if (strcmp(name, "getBundleDir") == 0 || strcmp(name, "getAssetsPath") == 0 ||
+      strcmp(name, "getCocos2dxWritablePath") == 0) {
+    bundle = root;
+    return bundle.c_str();
+  }
+  if (strcmp(name, "getStorageDir") == 0) {
+    storage = std::filesystem::path(root).parent_path().string();
+    return storage.c_str();
+  }
+  return nullptr;
+}
 
 const char* TextForMethod(uint64_t id) {
   const char* name = MethodName(id);
   if (!name) return nullptr;
+  if (const char* dir = DirectoryForMethod(name)) return dir;
   for (const MethodText& m : kMethodText)
     if (strcmp(m.name, name) == 0) return m.text;
   NoteUnanswered(name);
