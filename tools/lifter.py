@@ -2054,6 +2054,14 @@ class Lifter:
             return reg_of(self.md, op.reg)[0]
 
         const: dict[int, int] = {}
+        # The same values, never invalidated. A big function sets a jump
+        # table's base in one block and branches through it in another, with
+        # the register written many times in between -- strict tracking loses
+        # it every time, and zlib's inflate is exactly that shape. Falling back
+        # to the last one seen is a guess, but a self-checking one: every
+        # target still has to land inside this function on a four-byte
+        # boundary, and a wrong base fails on the first entry.
+        seen: dict[int, int] = {}
         load: dict[int, tuple[int, int, bool]] = {}
         pend: dict[int, tuple[tuple[int, int, bool], int, int]] = {}
         pend_reg: dict[int, tuple[int, int, tuple[int, int]]] = {}
@@ -2067,7 +2075,7 @@ class Lifter:
                 if m in ("adrp", "adr") and len(ops) == 2 \
                         and ops[1].type == a64.ARM64_OP_IMM:
                     d = num(ops[0])
-                    const[d] = ops[1].imm
+                    const[d] = seen[d] = ops[1].imm
                     load.pop(d, None)
                     pend.pop(d, None)
                     pend_reg.pop(d, None)
@@ -2075,7 +2083,7 @@ class Lifter:
                         and ops[2].type == a64.ARM64_OP_IMM \
                         and num(ops[1]) in const:
                     d = num(ops[0])
-                    const[d] = const[num(ops[1])] + ops[2].imm
+                    const[d] = seen[d] = const[num(ops[1])] + ops[2].imm
                     load.pop(d, None)
                     pend.pop(d, None)
                     pend_reg.pop(d, None)
@@ -2089,7 +2097,8 @@ class Lifter:
                                 if o.type == a64.ARM64_OP_MEM), None)
                     table = None
                     if mem is not None and mem.mem.index:
-                        base = const.get(reg_of(self.md, mem.mem.base)[0])
+                        b = reg_of(self.md, mem.mem.base)[0]
+                        base = const.get(b, seen.get(b))
                         if base is not None:
                             table = base + mem.mem.disp
                     const.pop(d, None)
@@ -2107,7 +2116,8 @@ class Lifter:
                     # destination is normally one of the sources. Sample both
                     # before the destination is cleared.
                     load_a, load_b = load.get(a), load.get(b)
-                    const_a, const_b = const.get(a), const.get(b)
+                    const_a = const.get(a, seen.get(a))
+                    const_b = const.get(b, seen.get(b))
                     const.pop(d, None)
                     load.pop(d, None)
                     pend.pop(d, None)
