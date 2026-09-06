@@ -108,6 +108,14 @@ def harvest(path: str, per_form: int, only: set[str] | None):
             continue
         if insn.mnemonic in ("adr", "adrp"):
             continue
+        # The thread pointer is host state the emulator does not model: it
+        # answers zero, and we hand back a real per-thread block on purpose.
+        # Returning what the oracle returns is the bug that cost thirty-six
+        # static constructors, so this is a divergence to keep rather than a
+        # failure to report -- and a permanent red mark is one somebody
+        # eventually spends an afternoon on.
+        if insn.mnemonic in ("mrs", "msr") and "tpidr" in insn.op_str.lower():
+            continue
         # Literal loads read through image_base, and the harness has no image.
         if (insn.mnemonic.startswith(("ldr", "str")) and
                 not any(o.type == a64.ARM64_OP_MEM for o in insn.operands)):
