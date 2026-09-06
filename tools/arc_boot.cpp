@@ -604,6 +604,36 @@ int main(int argc, char** argv) {
     for (const std::string& f : first_failures) printf("%s\n", f.c_str());
   }
 
+  // What the Java runtime does once a library is loaded and its static
+  // constructors have run: hand it the VM. A library caches that pointer and
+  // reaches every later thread's environment through it, so skipping the call
+  // leaves a null behind that surfaces much later, inside whatever first tries
+  // to call back into Java. Both engines seen so far export this, and it is a
+  // convention of the platform rather than of any one of them, so the host
+  // does it rather than each port remembering to.
+  if (const uint64_t on_load = g_image.Lookup("JNI_OnLoad")) {
+    ctx.sp = stack_top;
+    memset(ctx.x, 0, sizeof(ctx.x));
+    ctx.x[0] = arc_jni_vm();
+    arc_frame_clear();
+    unsigned long code = 0;
+    const int rc = CallGuarded(&ctx, on_load, &code);
+    if (rc == 0) {
+      printf("\nJNI_OnLoad returned JNI version %#llx\n",
+             static_cast<unsigned long long>(ctx.x[0] & 0xFFFFFFFFu));
+    } else if (rc == 1) {
+      printf("\nJNI_OnLoad: %s\n", arc_last_trap());
+      ReportFrames();
+    } else {
+      const std::string what = ExplainAddress(g_fault_address);
+      printf("\nJNI_OnLoad: %s on %s of %#llx%s%s\n", FaultName(code),
+             g_fault_kind, static_cast<unsigned long long>(g_fault_address),
+             what.empty() ? "" : " -- ", what.c_str());
+      ReportFrames();
+      ReportRegisters(&ctx);
+    }
+  }
+
   for (const auto& step : entries) {
     const char* entry = step.first.c_str();
     const char* entry_args = step.second.empty() ? nullptr

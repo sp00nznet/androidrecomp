@@ -332,6 +332,8 @@ extern "C" {
 
 uint64_t arc_jni_env(void) { return reinterpret_cast<uint64_t>(&g_table); }
 
+uint64_t arc_jni_vm(void) { return reinterpret_cast<uint64_t>(&g_vm_table); }
+
 void arc_jni_register(void) {
   uint64_t low = g_slots[0], high = g_slots[0];
   for (size_t i = 0; i < kSlots; ++i) {

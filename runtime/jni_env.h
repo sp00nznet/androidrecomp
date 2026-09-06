@@ -23,6 +23,11 @@ extern "C" {
 // A JNIEnv* for the guest, in guest terms: an address it can put in x0.
 uint64_t arc_jni_env(void);
 
+// The JavaVM, which is what `JNI_OnLoad` is handed. A library caches it and
+// reaches every other thread's environment through it later, so this is the
+// one pointer a host must give the guest before anything else asks.
+uint64_t arc_jni_vm(void);
+
 // The object an entry point is invoked on. Its fields are answered by the
 // accessors rather than read out of it, so this only has to be a valid handle.
 uint64_t arc_jni_object(void);
