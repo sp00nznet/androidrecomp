@@ -129,6 +129,21 @@ void FillStat(const struct __stat64& in, GuestStat* out) {
 }
 #endif
 
+// Which paths the engine actually asks for, and whether they were there. A
+// title that cannot find its own files says so in its own words much later, if
+// at all -- and by then the name it looked for is the one thing missing from
+// the account.
+bool TracingFiles() {
+  static const bool on = getenv("ARC_TRACE_FILES") != nullptr;
+  return on;
+}
+
+void TraceFile(const char* what, const char* path, bool found) {
+  if (TracingFiles())
+    fprintf(stderr, "[file] %-8s %-5s %s\n", what, found ? "ok" : "MISS",
+            path ? path : "(null)");
+}
+
 int StatPath(const char* path, GuestStat* out) {
 #if defined(_WIN32)
   struct __stat64 st;
@@ -150,8 +165,12 @@ int StatPath(const char* path, GuestStat* out) {
 #endif
 }
 
-int Stat(const char* path, GuestStat* out) { return StatPath(path, out); }
-int Lstat(const char* path, GuestStat* out) { return StatPath(path, out); }
+int Stat(const char* path, GuestStat* out) {
+  const int rc = StatPath(path, out);
+  TraceFile("stat", path, rc == 0);
+  return rc;
+}
+int Lstat(const char* path, GuestStat* out) { return Stat(path, out); }
 
 int Fstat(int fd, GuestStat* out) {
 #if defined(_WIN32)
@@ -198,10 +217,12 @@ void FillRandom(void* buf, size_t n) {
 int Open(const char* path, int flags, ...) {
   if (IsRandomDevice(path)) return kRandomFd;
 #if defined(_WIN32)
-  return _open(path, TranslateOpenFlags(flags), _S_IREAD | _S_IWRITE);
+  const int fd = _open(path, TranslateOpenFlags(flags), _S_IREAD | _S_IWRITE);
 #else
-  return ::open(path, flags, 0644);
+  const int fd = ::open(path, flags, 0644);
 #endif
+  TraceFile("open", path, fd >= 0);
+  return fd;
 }
 int Open2(const char* path, int flags) { return Open(path, flags); }
 
@@ -360,10 +381,12 @@ void* Opendir(const char* path) {
   pattern += "\\*";
   d->find = FindFirstFileA(pattern.c_str(), &d->data);
   if (d->find == INVALID_HANDLE_VALUE) {
+    TraceFile("opendir", path, false);
     delete d;
     return nullptr;
   }
   d->pending = true;
+  TraceFile("opendir", path, true);
 #else
   d->dir = ::opendir(path);
   if (!d->dir) {
