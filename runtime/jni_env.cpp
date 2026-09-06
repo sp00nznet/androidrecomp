@@ -377,7 +377,26 @@ void Handle(size_t index, Arm64Ctx* c) {
       c->x[0] = s ? strlen(s) : 0;
       return;
     }
-    case 165:    // GetStringChars
+    case 165: {  // GetStringChars -- UTF-16, not the UTF-8 the handle holds
+      // Handing the handle straight back gives the caller our bytes read as
+      // sixteen-bit units, which is right only for a single ASCII character
+      // and garbage for anything longer. That is the sort of accident that
+      // reads as working: a one-character path survives it intact.
+      // ponytail: ASCII widened one byte per unit. Decode properly if a title
+      // ever hands us a string that is not.
+      const char* s = reinterpret_cast<const char*>(c->x[1]);
+      const uint64_t wide = Allocate();
+      if (wide && s) {
+        auto* out = reinterpret_cast<uint16_t*>(wide);
+        size_t i = 0;
+        for (; s[i] && (i + 1) * sizeof(uint16_t) < kBlock; ++i)
+          out[i] = static_cast<unsigned char>(s[i]);
+        out[i] = 0;
+      }
+      c->x[0] = wide;
+      if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 1;  // isCopy = true
+      return;
+    }
     case 169: {  // GetStringUTFChars -- a jstring already holds its own text
       c->x[0] = c->x[1];
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
