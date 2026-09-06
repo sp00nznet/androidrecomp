@@ -1277,6 +1277,56 @@ class Lifter:
             return self.vec_result(ops[0], [
                 f"  _t.{view}[{i}] = {high(i)};" for i in range(slanes)])
 
+        # Test bits: a lane is all-ones where the two share any set bit. Not a
+        # comparison, though it sits with them -- there is no ordering here.
+        if m == "cmtst" and len(ops) == 3:
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = ({self.vec_source(ops[1], i, view)} &"
+                f" {self.vec_source(ops[2], i, view)}) ? {ones} : 0;"
+                for i in range(lanes)])
+
+        # Absolute difference, floating point.
+        if m == "fabd" and fview and len(ops) == 3:
+            f = "f" if bits == 32 else ""
+            return self.vec_result(ops[0], [
+                f"  _t.{fview}[{i}] = fabs{f}(arc_fsub{bits}("
+                f"{self.vec_source(ops[1], i, fview)},"
+                f" {self.vec_source(ops[2], i, fview)}));"
+                for i in range(lanes)])
+
+        # Leading zeros per lane. The helper counts across 64 bits, so a
+        # narrower lane starts that many places in -- and a zero lane still
+        # answers its own width rather than 64.
+        if m == "clz" and len(ops) == 2:
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(arc_clz64("
+                f"{self.vec_source(ops[1], i, view)}) - {64 - bits});"
+                for i in range(lanes)])
+
+        # Pairwise widening add, accumulating into the destination.
+        if m in ("uadalp", "sadalp") and len(ops) == 2:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            _, s_view, sbits = sinfo
+            signed = m[0] == "s"
+            src_view = self.signed_view(sbits) if signed else s_view
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            return self.vec_result_keep(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(_t.{view}[{i}] + ({cast})"
+                f"({self.vec_elem(ops[1], 2 * i, src_view)}) + ({cast})"
+                f"({self.vec_elem(ops[1], 2 * i + 1, src_view)}));"
+                for i in range(lanes)], clear_top=lanes * bits == 64)
+
+        # ARM's min and max propagate a NaN; the helpers already spell that
+        # out, and it is the difference between these and the `nm` pair below.
+        if m in ("fmin", "fmax") and fview and len(ops) == 3:
+            return self.vec_result(ops[0], [
+                f"  _t.{fview}[{i}] = arc_{m}{bits}("
+                f"{self.vec_source(ops[1], i, fview)},"
+                f" {self.vec_source(ops[2], i, fview)});"
+                for i in range(lanes)])
+
         # The NaN-quiet min and max. These are the ones C's fmin and fmax
         # already are -- it is ARM's plain fmin/fmax that propagate instead.
         if m in ("fminnm", "fmaxnm") and fview and len(ops) == 3:
@@ -1638,6 +1688,15 @@ class Lifter:
             return [self.fp_write(
                 ops[0], f"(-arc_fmul{w}({self.fp_read(ops[1])},"
                         f" {self.fp_read(ops[2])}))")]
+        # Absolute difference: one instruction, and the subtraction goes
+        # through the helper so an invalid operation still produces this
+        # architecture's NaN rather than the host's.
+        if m == "fabd" and len(ops) == 3:
+            w = "32" if self.fp_kind(ops[0]) == "s" else "64"
+            f = "f" if w == "32" else ""
+            return [self.fp_write(
+                ops[0], f"fabs{f}(arc_fsub{w}({self.fp_read(ops[1])},"
+                        f" {self.fp_read(ops[2])}))")]
         if m == "fneg":
             return [self.fp_write(ops[0], f"(-({self.fp_read(ops[1])}))")]
         if m == "fabs":
@@ -1941,6 +2000,13 @@ class Lifter:
             # bytes is what every arm64 device this targets reports.
             if "ctr_el0" in insn.op_str.lower():
                 return [self.write(ops[0], "UINT64_C(0x8444c004)")]
+            # The virtual counter, which is how compiled code reads a clock
+            # without a system call. It has to advance, or anything timing
+            # itself sees no time pass and either divides by zero or spins.
+            if "cntvct_el0" in insn.op_str.lower():
+                return [self.write(ops[0], "arc_cntvct_read()")]
+            if "cntfrq_el0" in insn.op_str.lower():
+                return [self.write(ops[0], "UINT64_C(1000000000)")]
             raise Unsupported(f"mrs {insn.op_str.split(',')[-1].strip()}")
         if m == "msr":
             if "tpidr_el0" in insn.op_str.lower():

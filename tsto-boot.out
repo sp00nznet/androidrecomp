@@ -1,0 +1,153 @@
+window     1280x720, GL 2.1 compatibility
+assets     G:/recomp/tstorecomp/work/assets
+jni        264 slots at 00007FF7F1F27B80, stubs 0x7ff7f1d54ff0..0x7ff7f1d5b980
+image      libscorpio.so at 00000167EA660000
+imports    623 host functions, 147 satisfied by unlifted guest images, 6 unresolved
+           still needed: SL_IID_ANDROIDCONFIGURATION SL_IID_ANDROIDSIMPLEBUFFERQUEUE SL_IID_ENGINE SL_IID_PLAY SL_IID_RECORD slCreateEngine
+
+mapped images
+  libc++_shared.so       0x00000167df340000 .. 0x00000167df441000  lifted
+  libopenal.so           0x00000167df230000 .. 0x00000167df33f000  not lifted
+  libNimble.so           0x00000167dfed0000 .. 0x00000167dfee2000  lifted
+  libscorpio.so          0x00000167ea660000 .. 0x00000167ec167000  lifted
+
+running 1527 of 1527 static constructors
+  ctor 281 at 0x7edd84: access violation on write of 0x16 -- near null
+  guest functions entered, most recent first:
+    libscorpio.so          +0x19be3b0
+    libscorpio.so          +0x13df2fc
+    libscorpio.so          +0x13de444
+    libc++_shared.so       +0xec890
+    libc++_shared.so       +0xec880
+    libc++_shared.so       +0xe3a54  __cxa_guard_release+0
+    libscorpio.so          +0x19bde70
+    libc++_shared.so       +0xec890
+    libc++_shared.so       +0xecaf0
+    libc++_shared.so       +0xec880
+    libc++_shared.so       +0xe38f8  __cxa_guard_acquire+0
+    libscorpio.so          +0x19bde60
+    libscorpio.so          +0x13de444
+    libscorpio.so          +0x105a424
+    libc++_shared.so       +0xecd30
+    libc++_shared.so       +0xc33e8  _Znwm+0
+  guest registers:
+     x0 =00000167ef177f8c  x1 =00000167ef177f88  x2 =0000000000000016  x3 =00000167ef177fa8
+     x4 =0000000000000000  x5 =0000000000000000  x6 =0000000000000000  x7 =0000000000000000
+     x8 =00000000bf0bc6a8  x9 =00000167ec145de4  x10=000000008e670000  x11=000000000000646e
+     x12=0000000000006400  x13=0000000000000064  x14=00000000e6546b64  x15=000000001f69648a
+     x16=00000167ec123340  x17=00007ff7f1d67020  x18=0000000000000000  x19=00000167ef177fd0
+     x20=00000167ec13f000  x21=00000167ec143048  x22=0000000000000000  x23=0000000000000000
+     x24=0000000000000000  x25=0000000000000000  x26=0000000000000000  x27=0000000000000000
+     x28=0000000000000000  x29=00000167ef177f70  x30=00000167eba3f318
+     sp =00000167ef177f70
+  1521 ran, 0 trapped, 6 faulted
+
+distinct fault addresses (3)
+       3 x 000000000000000000  near null
+       2 x 0x0000000000000007  near null
+       1 x 0x0000000000000016  near null
+
+first failures
+  ctor 281 at 0x7edd84: access violation on write of 0x16 -- near null
+  ctor 288 at 0x818f84: access violation on write of 0x7 -- near null
+  ctor 313 at 0x873590: access violation on write of 0x7 -- near null
+  ctor 1520 at 0x1762db0: access violation on read of 0 -- near null
+  ctor 1521 at 0x17c8e34: access violation on read of 0 -- near null
+  ctor 1522 at 0x17e4668: access violation on read of 0 -- near null
+
+JNI_OnLoad returned JNI version 0x10002
+
+calling Java_com_bight_android_jni_BGCoreJNIBridge_init at 0x145ec50
+  with 1 argument(s) after the environment and object
+  last calls out of the guest, most recent first:
+    memcpy memcpy memcpy memcpy memcpy strlen DeleteLocalRef DeleteLocalRef ReleaseStringUTFChars vsnprintf calloc GetStringUTFChars
+  JNI:
+  130 JNI calls across these slots:
+        12 x  slot   6  FindClass
+        12 x  slot  21  NewGlobalRef
+        23 x  slot  23  DeleteLocalRef
+         1 x  slot  29  NewObjectV
+        16 x  slot  31  GetObjectClass
+         1 x  slot  33  GetMethodID
+        16 x  slot  94  GetFieldID
+         7 x  slot  95  GetObjectField
+         1 x  slot  96  GetBooleanField
+         7 x  slot 100  GetIntField
+         1 x  slot 102  GetFloatField
+         7 x  slot 164  GetStringLength
+         7 x  slot 169  GetStringUTFChars
+         7 x  slot 170  ReleaseStringUTFChars
+         1 x  slot 219  GetJavaVM
+        11 x  slot 262  GetEnv
+  access violation on read of 0x167f0179000 -- reserved, not committed, protection 0, region of 0x1000 bytes from 0x167ec170000
+  guest functions entered, most recent first:
+    libscorpio.so          +0x19bdd70
+    libscorpio.so          +0x19bdd70
+    libscorpio.so          +0x19bdd70
+    libscorpio.so          +0x19bdd70
+    libscorpio.so          +0x19bdd70
+    libscorpio.so          +0x19bdd90
+    libscorpio.so          +0x19bdec0
+    libscorpio.so          +0x1461844
+    libscorpio.so          +0x19be040
+    libscorpio.so          +0x19bdea0
+    libscorpio.so          +0x19be0c0
+    libscorpio.so          +0x13c8ef0
+    libscorpio.so          +0x13c8e84
+    libscorpio.so          +0x19bdec0
+    libscorpio.so          +0x1461844
+    libscorpio.so          +0x19be040
+  guest registers:
+     x0 =00000167ef177f09  x1 =00000167ef177f5b  x2 =ffffffffffffffff  x3 =00000167ef177ed0
+     x4 =000000000000000f  x5 =0000000000000040  x6 =00000167eaa2a41a  x7 =0000000000000000
+     x8 =0000000000000001  x9 =0000000000000001  x10=00000167ef177f5a  x11=fffffffffffffffe
+     x12=0000000000003001  x13=00000167ef177f41  x14=0000000000000000  x15=0000000000000000
+     x16=00000167ec123020  x17=00007ffd8e2ddb00  x18=0000000000000000  x19=00000167e52096d0
+     x20=00000167ec160d58  x21=ffffffffffffffff  x22=00000167ef177f5b  x23=00000167ef177f09
+     x24=0000000000000000  x25=00000167ef177f00  x26=00000167ef177f59  x27=00000167ef177f09
+     x28=00000167ef177f29  x29=00000167ef177fa0  x30=00000167ebabcf78
+     sp =00000167ef177f00
+
+calling Java_com_bight_android_jni_BGCoreJNIBridge_OGLESInit at 0x145f9d4
+  with 2 argument(s) after the environment and object
+  JNI:
+  130 JNI calls across these slots:
+        12 x  slot   6  FindClass
+        12 x  slot  21  NewGlobalRef
+        23 x  slot  23  DeleteLocalRef
+         1 x  slot  29  NewObjectV
+        16 x  slot  31  GetObjectClass
+         1 x  slot  33  GetMethodID
+        16 x  slot  94  GetFieldID
+         7 x  slot  95  GetObjectField
+         1 x  slot  96  GetBooleanField
+         7 x  slot 100  GetIntField
+         1 x  slot 102  GetFloatField
+         7 x  slot 164  GetStringLength
+         7 x  slot 169  GetStringUTFChars
+         7 x  slot 170  ReleaseStringUTFChars
+         1 x  slot 219  GetJavaVM
+        11 x  slot 262  GetEnv
+  returned, x0 = 0x1
+
+calling Java_com_bight_android_jni_BGCoreJNIBridge_OGLESResize at 0x145fa74
+  with 2 argument(s) after the environment and object
+  JNI:
+  130 JNI calls across these slots:
+        12 x  slot   6  FindClass
+        12 x  slot  21  NewGlobalRef
+        23 x  slot  23  DeleteLocalRef
+         1 x  slot  29  NewObjectV
+        16 x  slot  31  GetObjectClass
+         1 x  slot  33  GetMethodID
+        16 x  slot  94  GetFieldID
+         7 x  slot  95  GetObjectField
+         1 x  slot  96  GetBooleanField
+         7 x  slot 100  GetIntField
+         1 x  slot 102  GetFloatField
+         7 x  slot 164  GetStringLength
+         7 x  slot 169  GetStringUTFChars
+         7 x  slot 170  ReleaseStringUTFChars
+         1 x  slot 219  GetJavaVM
+        11 x  slot 262  GetEnv
+  returned, x0 = 0x1

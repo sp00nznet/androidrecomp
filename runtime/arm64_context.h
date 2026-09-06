@@ -535,6 +535,12 @@ void arc_tpidr_write(uint64_t v);
 // this says.
 // ponytail: stored, not obeyed. Give it teeth if a title ever depends on a
 // directed rounding mode rather than merely preserving one.
+// The virtual counter. Compiled code reads it to time itself without a system
+// call, so it has to advance -- a clock that never moves makes anything
+// measuring an interval either divide by zero or wait forever. Counted in
+// nanoseconds, which is what CNTFRQ_EL0 is answered with.
+uint64_t arc_cntvct_read(void);
+
 uint64_t arc_fpcr_read(void);
 void arc_fpcr_write(uint64_t v);
 

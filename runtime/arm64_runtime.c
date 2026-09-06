@@ -11,6 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #define ARC_THREAD_LOCAL __declspec(thread)
@@ -134,6 +140,19 @@ uint64_t arc_tpidr_read(void) {
 }
 
 void arc_tpidr_write(uint64_t v) { t_tpidr = v; }
+
+uint64_t arc_cntvct_read(void) {
+#if defined(_WIN32)
+  LARGE_INTEGER now, freq;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&freq);
+  return (uint64_t)((now.QuadPart * 1000000000LL) / freq.QuadPart);
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
 
 static ARC_THREAD_LOCAL uint64_t t_fpcr;
 uint64_t arc_fpcr_read(void) { return t_fpcr; }
