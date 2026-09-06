@@ -528,6 +528,15 @@ uint64_t arc_umulh(uint64_t a, uint64_t b);
 uint64_t arc_tpidr_read(void);
 void arc_tpidr_write(uint64_t v);
 
+// FPCR carries the rounding mode and the exception masks. Code that reads it is
+// almost always saving it to put back afterwards, so it has to round-trip --
+// but the arithmetic underneath is the host's, which rounds to nearest whatever
+// this says.
+// ponytail: stored, not obeyed. Give it teeth if a title ever depends on a
+// directed rounding mode rather than merely preserving one.
+uint64_t arc_fpcr_read(void);
+void arc_fpcr_write(uint64_t v);
+
 // --- indirect control flow -------------------------------------------------
 // Every `blr`/`br` target is looked up in a sorted address -> function table
 // built from the recovered function starts. A miss traps loudly: an unlifted

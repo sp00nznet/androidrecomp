@@ -569,6 +569,24 @@ class Lifter:
             return [f"{setter}(c, {idx}, ({self.vec_elem(ops[1], 0, s_view)}"
                     f" + {self.vec_elem(ops[1], 1, s_view)}));"]
 
+        # `fmov x7, v0.d[1]` and `fmov v0.d[1], x7` move the *upper* half of a
+        # vector register to and from a general register. They are the only
+        # fmov forms that name a lane, and they are how a 128-bit value is
+        # taken apart and put back together a half at a time.
+        if m == "fmov" and len(ops) == 2:
+            if self.is_vector(ops[1]) and self.lane_of(ops[1]) >= 0 \
+                    and not self.is_vector(ops[0]):
+                sinfo = self.vas_of(ops[1])
+                return [self.write(ops[0],
+                                   self.vec_elem(ops[1], self.lane_of(ops[1]),
+                                                 sinfo[1] if sinfo else "u64"))]
+            if self.is_vector(ops[0]) and self.lane_of(ops[0]) >= 0 \
+                    and not self.is_vector(ops[1]):
+                dinfo = self.vas_of(ops[0])
+                slot = self.vec_elem(ops[0], self.lane_of(ops[0]),
+                                     dinfo[1] if dinfo else "u64")
+                return [f"{slot} = {self.read(ops[1])};"]
+
         # `fmov d0, x8` moves the bits between a general register and a scalar
         # -- no conversion, and no arrangement to find. It reaches here only
         # because the other operand made it look like a vector instruction.
@@ -1803,10 +1821,18 @@ class Lifter:
         if m == "mrs":
             if "tpidr_el0" in insn.op_str.lower():
                 return [self.write(ops[0], "arc_tpidr_read()")]
+            # FPCR carries the rounding mode and the exception masks. Code that
+            # reads it is almost always saving it to restore afterwards, so it
+            # has to round-trip -- but the arithmetic here is the host's, which
+            # rounds to nearest whatever this says.
+            if "fpcr" in insn.op_str.lower():
+                return [self.write(ops[0], "arc_fpcr_read()")]
             raise Unsupported(f"mrs {insn.op_str.split(',')[-1].strip()}")
         if m == "msr":
             if "tpidr_el0" in insn.op_str.lower():
                 return [f"arc_tpidr_write({self.read(ops[1])});"]
+            if "fpcr" in insn.op_str.lower():
+                return [f"arc_fpcr_write({self.read(ops[1])});"]
             raise Unsupported("msr")
 
         raise Unsupported(m)

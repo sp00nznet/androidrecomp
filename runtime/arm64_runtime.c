@@ -135,6 +135,10 @@ uint64_t arc_tpidr_read(void) {
 
 void arc_tpidr_write(uint64_t v) { t_tpidr = v; }
 
+static ARC_THREAD_LOCAL uint64_t t_fpcr;
+uint64_t arc_fpcr_read(void) { return t_fpcr; }
+void arc_fpcr_write(uint64_t v) { t_fpcr = v; }
+
 static ARC_THREAD_LOCAL jmp_buf* t_recovery;
 static ARC_THREAD_LOCAL char t_last_trap[256];
 
