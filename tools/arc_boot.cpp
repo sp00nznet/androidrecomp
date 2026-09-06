@@ -683,6 +683,16 @@ int main(int argc, char** argv) {
     if (entry_args) {
       int slot = 2;
       for (const char* p = entry_args; *p && slot < 8;) {
+        // `obj` stands for a Java object the host has no real counterpart for
+        // -- a Context, an AssetManager. The engine passes these straight back
+        // through JNI rather than reading them, so a stand-in handle is enough,
+        // and a plain number here would be a pointer it eventually follows.
+        if (strncmp(p, "obj", 3) == 0) {
+          ctx.x[slot++] = arc_jni_object();
+          p += 3;
+          if (*p == ',') ++p;
+          continue;
+        }
         char* end = nullptr;
         const long long v = strtoll(p, &end, 0);
         if (end == p) break;
