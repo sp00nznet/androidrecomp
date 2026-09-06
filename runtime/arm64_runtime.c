@@ -224,14 +224,25 @@ void arc_register_native(uint64_t address, const char* name) {
   ++g_native_count;
 }
 
-// ponytail: eight integer arguments in, one integer result out. That is the
-// integer half of the AArch64 calling convention and covers allocation,
-// string, file and threading calls -- which is nearly everything a guest asks
-// the host for. It does NOT carry floating-point arguments, which live in
-// v0-v7 and would need per-signature thunks to place correctly. Generate those
-// from the import list when a title actually needs one.
-typedef uint64_t (*ArcNative8)(uint64_t, uint64_t, uint64_t, uint64_t,
-                               uint64_t, uint64_t, uint64_t, uint64_t);
+// Twelve integer arguments in, one integer result out: eight from the
+// registers AArch64 passes them in, and four more read from the guest stack,
+// where that convention puts the rest.
+//
+// Eight was not enough, and the way it failed is worth keeping. glTexImage2D
+// takes nine -- the ninth being the pixel data -- so the texture was uploaded
+// from whatever the driver found in that argument slot. Nothing reported a
+// missing argument; the call simply read an address nobody had passed.
+//
+// Handing a function more arguments than it declares is harmless here: the
+// caller sets them up and the callee ignores them. So one thunk serves every
+// arity up to twelve rather than needing one per signature.
+//
+// It still does NOT carry floating-point arguments, which live in v0-v7 and
+// would need per-signature thunks to place correctly. Generate those from the
+// import list when a title actually needs one.
+typedef uint64_t (*ArcNative12)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t, uint64_t);
 
 #define ARC_TRACE 64
 static ARC_THREAD_LOCAL const char* t_trace[ARC_TRACE];
@@ -395,9 +406,13 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
                 g_natives[i].name, (unsigned long long)c->x[0],
                 (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
     }
-    ArcNative8 fn = (ArcNative8)(uintptr_t)target;
+    ArcNative12 fn = (ArcNative12)(uintptr_t)target;
+    /* Arguments past the eighth sit at the stack pointer, in order. A callee
+       taking fewer simply never looks at them. */
+    const uint64_t* rest = (const uint64_t*)(uintptr_t)c->sp;
     uint64_t r = fn(c->x[0], c->x[1], c->x[2], c->x[3],
-                    c->x[4], c->x[5], c->x[6], c->x[7]);
+                    c->x[4], c->x[5], c->x[6], c->x[7],
+                    rest[0], rest[1], rest[2], rest[3]);
     c->x[0] = r;
     return;
   }
