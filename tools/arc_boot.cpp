@@ -405,7 +405,11 @@ int main(int argc, char** argv) {
            window.Describe().c_str());
   }
 
-  const std::filesystem::path path(lib);
+  // Resolved against the directory we were started in, and before anything
+  // changes that: the assets block below moves us, and a relative library path
+  // stops meaning what it meant the moment it does.
+  std::error_code lib_ec;
+  const std::filesystem::path path = std::filesystem::absolute(lib, lib_ec);
   const std::filesystem::path dir = path.parent_path();
   std::string err;
 
