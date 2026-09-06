@@ -197,6 +197,20 @@ void NoteUnanswered(const char* name) {
   g_method_unanswered.push_back(name);
 }
 
+// Every method actually invoked, as opposed to merely looked up. The
+// difference matters: a name can be resolved to an id during setup and then
+// never called, and reading a value into the answer for a call that never
+// happened is a way to spend a long time being wrong.
+std::deque<std::string> g_method_called;
+
+void NoteCalled(const char* name) {
+  if (!name) return;
+  std::lock_guard<std::mutex> held(g_method_lock);
+  for (const std::string& s : g_method_called)
+    if (s == name) return;
+  g_method_called.push_back(name);
+}
+
 // What a method returning a string should answer with. The engine builds paths
 // out of these, so an empty one is worse than a wrong one: it silently becomes
 // the filesystem root.
@@ -245,6 +259,7 @@ const char* DirectoryForMethod(const char* name) {
 const char* TextForMethod(uint64_t id) {
   const char* name = MethodName(id);
   if (!name) return nullptr;
+  NoteCalled(name);
   if (const char* dir = DirectoryForMethod(name)) return dir;
   for (const MethodText& m : kMethodText)
     if (strcmp(m.name, name) == 0) return m.text;
@@ -539,8 +554,13 @@ void arc_jni_report(void) {
   // string -- so any of these that was meant to be a path is a lookup failing
   // somewhere later for a reason that points nowhere near here.
   std::lock_guard<std::mutex> held(g_method_lock);
+  if (!g_method_called.empty()) {
+    printf("  Java methods invoked:\n   ");
+    for (const std::string& s : g_method_called) printf(" %s", s.c_str());
+    printf("\n");
+  }
   if (!g_method_unanswered.empty()) {
-    printf("  Java methods called with no value to return:\n   ");
+    printf("  ...of which these had no value to return:\n   ");
     for (const std::string& s : g_method_unanswered) printf(" %s", s.c_str());
     printf("\n");
   }
