@@ -55,6 +55,14 @@ void ShimRegisterVarargs();
 // is current, which is why the window is opened before the engine is loaded.
 uint64_t ShimResolveGL(const char* name);
 
+// The Android asset manager, over an ordinary directory. Claimed only once a
+// root is set, so that an unconfigured host leaves the names on the
+// outstanding-import list rather than opening nothing.
+uint64_t ShimResolveAsset(const char* name);
+size_t ShimAssetCount();
+void ShimSetAssetRoot(const char* path);
+const char* ShimAssetRoot();
+
 // File I/O, directories and memory mapping, at Bionic's struct layouts.
 uint64_t ShimResolveFile(const char* name);
 size_t ShimFileCount();

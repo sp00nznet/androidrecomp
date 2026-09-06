@@ -218,6 +218,7 @@ uint64_t ShimResolve(const char* name) {
   if (uint64_t a = ShimResolvePthread(name)) return a;
   if (uint64_t a = ShimResolvePosix(name)) return a;
   if (uint64_t a = ShimResolveGL(name)) return a;
+  if (uint64_t a = ShimResolveAsset(name)) return a;
   if (uint64_t a = ShimResolveFile(name)) return a;
   if (uint64_t a = ShimResolveSys(name)) return a;
 

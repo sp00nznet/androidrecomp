@@ -21,6 +21,7 @@ add_library(androidrecomp STATIC
   runtime/shim_pthread.cpp
   runtime/shim_posix.cpp
   runtime/shim_gl.cpp
+  runtime/shim_asset.cpp
   runtime/shim_file.cpp
   runtime/shim_sys.cpp
   runtime/shim_varargs.cpp

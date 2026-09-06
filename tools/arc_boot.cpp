@@ -355,6 +355,7 @@ int main(int argc, char** argv) {
   long ctor_limit = 0;
   bool want_window = false;
   const char* gl_version = nullptr;
+  const char* asset_root = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--entry=", 8) == 0)
       entries.emplace_back(argv[i] + 8, std::string());
@@ -369,6 +370,8 @@ int main(int argc, char** argv) {
       want_window = true;
     else if (strncmp(argv[i], "--gl=", 5) == 0)
       gl_version = argv[i] + 5;
+    else if (strncmp(argv[i], "--assets=", 9) == 0)
+      asset_root = argv[i] + 9;
     else if (strncmp(argv[i], "--constructors=", 15) == 0)
       ctor_limit = strtol(argv[i] + 15, nullptr, 10);
     else
@@ -376,8 +379,9 @@ int main(int argc, char** argv) {
   }
   if (!lib) {
     fprintf(stderr,
-            "usage: %s [--window] [--constructors=N] [--entry=SYMBOL]"
-            " [--args=N,N,...] <library.so>\n",
+            "usage: %s [--window] [--gl=MAJOR.MINOR] [--assets=DIR]"
+            " [--constructors=N] [--entry=SYMBOL] [--args=N,N,...]"
+            " <library.so>\n",
             argv[0]);
     return 2;
   }
@@ -404,6 +408,26 @@ int main(int argc, char** argv) {
   const std::filesystem::path path(lib);
   const std::filesystem::path dir = path.parent_path();
   std::string err;
+
+  // The engine reads its own files through the asset manager, so it needs a
+  // directory to read them from. An extracted APK puts the library under
+  // lib/<abi>/ and the assets beside that pair, so the default is derived from
+  // where the library was found and only has to be given when the layout is
+  // not the usual one.
+  {
+    std::filesystem::path assets =
+        asset_root ? std::filesystem::path(asset_root)
+                   : dir.parent_path().parent_path() / "assets";
+    std::error_code ec;
+    if (std::filesystem::is_directory(assets, ec)) {
+      arc::ShimSetAssetRoot(assets.string().c_str());
+      printf("assets     %s\n", assets.string().c_str());
+    } else if (asset_root) {
+      fprintf(stderr, "no such assets directory: %s\n",
+              assets.string().c_str());
+      return 1;
+    }
+  }
 
   auto resolve = [](const char* name) -> uint64_t {
     for (const auto& d : g_deps)
