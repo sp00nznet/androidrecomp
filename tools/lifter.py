@@ -1572,9 +1572,9 @@ class Lifter:
                 return [f"ARC_X_W(c, 30, {self.base_expr()} + "
                         f"UINT64_C({insn.address + 4}));",
                         "ARC_X_W(c, 0, (uint64_t)(uint32_t)setjmp("
-                        "*(jmp_buf*)arc_jmpbuf_for(ARC_X_R(c, 0))));"]
+                        "*(jmp_buf*)arc_jmpbuf_for(c, ARC_X_R(c, 0))));"]
             if name == "longjmp":
-                return ["arc_longjmp(ARC_X_R(c, 0), (int)ARC_X_R(c, 1));"]
+                return ["arc_longjmp(c, ARC_X_R(c, 0), (int)ARC_X_R(c, 1));"]
             return [f"ARC_X_W(c, 30, {self.base_expr()} + "
                     f"UINT64_C({insn.address + 4}));",
                     f"{self.fn_name(t)}(c);"]

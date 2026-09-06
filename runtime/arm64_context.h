@@ -552,8 +552,15 @@ void arc_fpcr_write(uint64_t v);
 //
 // One registry per thread, because a longjmp across threads is undefined
 // anywhere.
-void* arc_jmpbuf_for(uint64_t guest_buffer);
-void arc_longjmp(uint64_t guest_buffer, int value);
+// Both take the context because a jump has to restore the *guest's* frame as
+// well as the host's. A real longjmp puts back x19-x30 and the stack pointer;
+// restoring only the host side leaves the guest's callee-saved registers
+// holding whatever the callee left in them, and the first thing the returned-to
+// function does is check its stack canary against a frame that no longer
+// matches. That reads as memory corruption, which is the last place anyone
+// would look for a missing register restore.
+void* arc_jmpbuf_for(Arm64Ctx* c, uint64_t guest_buffer);
+void arc_longjmp(Arm64Ctx* c, uint64_t guest_buffer, int value);
 
 // --- indirect control flow -------------------------------------------------
 // Every `blr`/`br` target is looked up in a sorted address -> function table

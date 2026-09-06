@@ -148,33 +148,55 @@ void arc_fpcr_write(uint64_t v) { t_fpcr = v; }
 typedef struct {
   uint64_t guest;
   jmp_buf host;
+  /* x19-x30 and the stack pointer: what the architecture says a jump puts
+     back, and what the returned-to function's own frame check depends on. */
+  uint64_t saved[12];
+  uint64_t sp;
   int used;
 } ArcJmpSlot;
 static ARC_THREAD_LOCAL ArcJmpSlot t_jmps[ARC_JMP_SLOTS];
 static ARC_THREAD_LOCAL int t_jmp_next;
 
-void* arc_jmpbuf_for(uint64_t guest_buffer) {
+static void arc_jmp_save(ArcJmpSlot* slot, const Arm64Ctx* c) {
+  int r;
+  for (r = 19; r <= 30; ++r) slot->saved[r - 19] = c->x[r];
+  slot->sp = c->sp;
+}
+
+static void arc_jmp_restore(const ArcJmpSlot* slot, Arm64Ctx* c) {
+  int r;
+  for (r = 19; r <= 30; ++r) c->x[r] = slot->saved[r - 19];
+  c->sp = slot->sp;
+}
+
+void* arc_jmpbuf_for(Arm64Ctx* c, uint64_t guest_buffer) {
   int i;
   for (i = 0; i < ARC_JMP_SLOTS; ++i)
-    if (t_jmps[i].used && t_jmps[i].guest == guest_buffer)
+    if (t_jmps[i].used && t_jmps[i].guest == guest_buffer) {
+      arc_jmp_save(&t_jmps[i], c);
       return &t_jmps[i].host;
+    }
   for (i = 0; i < ARC_JMP_SLOTS; ++i)
     if (!t_jmps[i].used) {
       t_jmps[i].used = 1;
       t_jmps[i].guest = guest_buffer;
+      arc_jmp_save(&t_jmps[i], c);
       return &t_jmps[i].host;
     }
   i = t_jmp_next;
   t_jmp_next = (t_jmp_next + 1) % ARC_JMP_SLOTS;
   t_jmps[i].guest = guest_buffer;
+  arc_jmp_save(&t_jmps[i], c);
   return &t_jmps[i].host;
 }
 
-void arc_longjmp(uint64_t guest_buffer, int value) {
+void arc_longjmp(Arm64Ctx* c, uint64_t guest_buffer, int value) {
   int i;
   for (i = 0; i < ARC_JMP_SLOTS; ++i)
-    if (t_jmps[i].used && t_jmps[i].guest == guest_buffer)
+    if (t_jmps[i].used && t_jmps[i].guest == guest_buffer) {
+      arc_jmp_restore(&t_jmps[i], c);
       longjmp(t_jmps[i].host, value ? value : 1);
+    }
   // Nothing armed this on this thread. Saying so beats jumping somewhere
   // plausible: a longjmp to the wrong frame is a crash with no explanation
   // attached to it.
