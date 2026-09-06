@@ -61,6 +61,7 @@ class Ctx(ctypes.Structure):
         ("cf", ctypes.c_uint32), ("vf", ctypes.c_uint32),
         ("q", (ctypes.c_uint64 * 2) * 32),
         ("image_base", ctypes.c_uint64),
+        ("pc", ctypes.c_uint64),
     ]
 
 

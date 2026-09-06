@@ -1216,6 +1216,74 @@ class Lifter:
                         f" {self.vec_elem(src, j + 1, view)});")
             return self.vec_result(ops[0], body)
 
+        # Rounding shift right, and the accumulating form. The rounding is half
+        # a unit of the last bit discarded, added before the shift.
+        if m in ("srshr", "urshr", "srsra", "ursra") and len(ops) == 3 \
+                and ops[2].type == a64.ARM64_OP_IMM:
+            n = ops[2].imm
+            signed = m[0] == "s"
+            v = sview if signed else view
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            half = f" + (({cast})1 << {n - 1})" if n else ""
+
+            def shifted(i):
+                return (f"(uint{bits}_t)((({cast})"
+                        f"{self.vec_source(ops[1], i, v)}{half}) >> {n})")
+            if m.endswith("sra"):
+                return self.vec_result_keep(ops[0], [
+                    f"  _t.{view}[{i}] = (uint{bits}_t)(_t.{view}[{i}] +"
+                    f" {shifted(i)});" for i in range(lanes)],
+                    clear_top=lanes * bits == 64)
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {shifted(i)};" for i in range(lanes)])
+
+        # Pairwise widening add: each destination lane is the sum of two
+        # adjacent source lanes, which is why it cannot overflow.
+        if m in ("uaddlp", "saddlp") and len(ops) == 2:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            _, s_view, sbits = sinfo
+            signed = m[0] == "s"
+            src_view = self.signed_view(sbits) if signed else s_view
+            cast = f"int{bits}_t" if signed else f"uint{bits}_t"
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)(({cast})"
+                f"({self.vec_elem(ops[1], 2 * i, src_view)}) + ({cast})"
+                f"({self.vec_elem(ops[1], 2 * i + 1, src_view)}));"
+                for i in range(lanes)])
+
+        # Add or subtract at full width, then keep only the high half of each
+        # result. The `2` form fills the top of the destination.
+        if m in ("addhn", "addhn2", "subhn", "subhn2") and len(ops) == 3:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            c = "-" if m.startswith("sub") else "+"
+
+            def high(i):
+                return (f"(uint{bits}_t)((uint{sbits}_t)("
+                        f"{self.vec_elem(ops[1], i, s_view)} {c}"
+                        f" {self.vec_elem(ops[2], i, s_view)}) >> {bits})")
+            if m.endswith("2"):
+                return self.vec_result_keep(ops[0], [
+                    f"  _t.{view}[{lanes - slanes + i}] = {high(i)};"
+                    for i in range(slanes)])
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = {high(i)};" for i in range(slanes)])
+
+        # The NaN-quiet min and max. These are the ones C's fmin and fmax
+        # already are -- it is ARM's plain fmin/fmax that propagate instead.
+        if m in ("fminnm", "fmaxnm") and fview and len(ops) == 3:
+            f = "f" if bits == 32 else ""
+            fn = "fmin" if m == "fminnm" else "fmax"
+            return self.vec_result(ops[0], [
+                f"  _t.{fview}[{i}] = {fn}{f}("
+                f"{self.vec_source(ops[1], i, fview)},"
+                f" {self.vec_source(ops[2], i, fview)});"
+                for i in range(lanes)])
+
         raise Unsupported(f"vector {m}")
 
     # --- instruction emitters ----------------------------------------------
@@ -1353,6 +1421,7 @@ class Lifter:
         if m == "bics": return logical("&", True, invert_rhs=True)
         if m == "orr":  return logical("|", False)
         if m == "eor":  return logical("^", False)
+        if m == "eon":  return logical("^", False, True)
         if m == "bic":  return logical("&", False, invert_rhs=True)
         if m == "orn":  return logical("|", False, invert_rhs=True)
         if m == "mneg":
@@ -1780,6 +1849,17 @@ class Lifter:
                     f"else {{ (c)->nf = {(nzcv >> 3) & 1}; (c)->zf = {(nzcv >> 2) & 1};",
                     f"        (c)->cf = {(nzcv >> 1) & 1}; (c)->vf = {nzcv & 1}; }}"]
 
+        # The floating-point form of the same idea, and it reads the same way:
+        # compare if the condition holds, otherwise take the flags as given.
+        if m in ("fccmp", "fccmpe") and len(ops) >= 3:
+            cond = self.cond_of(insn)
+            nzcv = ops[2].imm
+            return [f"if (ARC_COND(c, {cond})) {{ arc_fcmp(c, (double)("
+                    f"{self.fp_read(ops[0])}), (double)({self.fp_read(ops[1])}));"
+                    " }",
+                    f"else {{ (c)->nf = {(nzcv >> 3) & 1}; (c)->zf = {(nzcv >> 2) & 1};",
+                    f"        (c)->cf = {(nzcv >> 1) & 1}; (c)->vf = {nzcv & 1}; }}"]
+
         # -- bit twiddling
         if m == "extr":
             d = ops[0]
@@ -1827,13 +1907,55 @@ class Lifter:
             # rounds to nearest whatever this says.
             if "fpcr" in insn.op_str.lower():
                 return [self.write(ops[0], "arc_fpcr_read()")]
+            # FPSR accumulates the exception flags -- invalid, inexact and so
+            # on. Nothing here raises them, so nothing has accumulated.
+            if "fpsr" in insn.op_str.lower():
+                return [self.write(ops[0], "UINT64_C(0)")]
+            # The cache type register. Read to find the line size before
+            # flushing something; the answer only has to be plausible, and 64
+            # bytes is what every arm64 device this targets reports.
+            if "ctr_el0" in insn.op_str.lower():
+                return [self.write(ops[0], "UINT64_C(0x8444c004)")]
             raise Unsupported(f"mrs {insn.op_str.split(',')[-1].strip()}")
         if m == "msr":
             if "tpidr_el0" in insn.op_str.lower():
                 return [f"arc_tpidr_write({self.read(ops[1])});"]
             if "fpcr" in insn.op_str.lower():
                 return [f"arc_fpcr_write({self.read(ops[1])});"]
+            # Clearing the accumulated exception flags, which were never set.
+            if "fpsr" in insn.op_str.lower():
+                return ["/* msr fpsr: nothing accumulates them here */"]
             raise Unsupported("msr")
+
+        # Cache maintenance. Host memory is coherent and nothing here writes
+        # code at run time, so there is nothing to flush or invalidate -- and
+        # unlike most no-ops this one is exactly right rather than merely
+        # harmless.
+        if m in ("dc", "ic"):
+            return [f"/* {m} {insn.op_str}: caches are coherent here */"]
+
+        # Shifts on a `d` register: the vector operations with a single 64-bit
+        # lane. They name no arrangement, so they never reach the vector
+        # emitters and have to be answered here.
+        if m in ("shl", "ushr", "sshr", "urshr", "srshr") and len(ops) == 3 \
+                and ops[2].type == a64.ARM64_OP_IMM \
+                and not self.is_vector(ops[0]) \
+                and self.fp_of(ops[0]) is not None \
+                and self.fp_of(ops[1]) is not None:
+            d = self.fp_of(ops[0])[0]
+            src = f"(c)->q[{self.fp_of(ops[1])[0]}]"
+            n = ops[2].imm
+            # The rounding forms add half a unit of the last bit discarded.
+            half = f" + (INT64_C(1) << {n - 1})" if n else ""
+            uhalf = f" + (UINT64_C(1) << {n - 1})" if n else ""
+            expr = {
+                "shl": f"{src}.u64[0] << {n}",
+                "ushr": f"{src}.u64[0] >> {n}",
+                "sshr": f"(uint64_t)({src}.i64[0] >> {n})",
+                "urshr": f"({src}.u64[0]{uhalf}) >> {n}",
+                "srshr": f"(uint64_t)(({src}.i64[0]{half}) >> {n})",
+            }[m]
+            return [f"arc_du_w(c, {d}, {expr});"]
 
         raise Unsupported(m)
 
