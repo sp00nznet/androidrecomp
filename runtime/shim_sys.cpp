@@ -392,10 +392,38 @@ int Sigdelset(void*, int) { return 0; }
 int Sigemptyset(void*) { return 0; }
 int Sigfillset(void*) { return 0; }
 int Sigprocmask(int, const void*, void*) { return 0; }
-[[noreturn]] void Siglongjmp(void*, int) {
-  fprintf(stderr, "siglongjmp -- not implemented\n");
-  abort();
+// setjmp and longjmp cannot be forwarded to the host's, for the same reason a
+// guest callback cannot be called as a host function: the state they capture
+// belongs to the wrong machine. The host's would save host registers and a
+// host frame, while the guest expects its own callee-saved registers and stack
+// pointer to come back -- and the Microsoft build takes a second, undeclared
+// frame argument that our thunk has no way to supply, so it was being handed
+// whatever the guest happened to leave in that register.
+//
+// Nor can a faithful one live here. A host setjmp called inside this function
+// would capture *this* frame, which is gone the moment it returns; jumping to
+// it later is undefined. Doing it properly means the lifter emitting the
+// setjmp inline in the calling function, so the frame it captures is the one
+// that will still be there.
+//
+// So: setjmp succeeds and says no jump has happened, which is the truth on
+// every path that does not fail. Image decoders take this route -- they arm an
+// error handler and then decode successfully -- and that path now works.
+// A longjmp is the case we cannot honour, so it says so rather than jumping
+// somewhere plausible and wrong.
+// ponytail: no unwinding. Give the lifter an inline setjmp if a title starts
+// depending on the failure path rather than merely arming it.
+int Setjmp(void*) { return 0; }
+
+[[noreturn]] void Longjmp(void*, int value) {
+  char msg[96];
+  snprintf(msg, sizeof(msg),
+           "the guest called longjmp(%d); no jump target was recorded", value);
+  arc_trap(nullptr, msg);
+  abort();  // only reached with no recovery point armed
 }
+
+[[noreturn]] void Siglongjmp(void* buf, int value) { Longjmp(buf, value); }
 void FdSetChk(int, void*, uint64_t) {}
 int FdIssetChk(int, const void*, uint64_t) { return 0; }
 
@@ -471,6 +499,7 @@ const Entry kTable[] = {
     E("sigaction", Sigaction),      E("sigaddset", Sigaddset),
     E("sigdelset", Sigdelset),      E("sigemptyset", Sigemptyset),
     E("sigfillset", Sigfillset),    E("sigprocmask", Sigprocmask),
+    E("setjmp", Setjmp),           E("longjmp", Longjmp),
     E("siglongjmp", Siglongjmp),
     E("__FD_SET_chk", FdSetChk),    E("__FD_ISSET_chk", FdIssetChk),
 
