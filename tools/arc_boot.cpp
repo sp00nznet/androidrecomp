@@ -427,6 +427,12 @@ int main(int argc, char** argv) {
       const std::string root =
           std::filesystem::absolute(assets, ec).generic_string();
       arc::ShimSetAssetRoot(root.c_str());
+      // And run from there. The engine opens some of its files by bare name,
+      // with no directory at all -- on Android it is launched with its own
+      // bundle underfoot and never has to say so. A relative open is not a
+      // path we can correct after the fact, because by the time it arrives
+      // there is nothing left to say which directory was meant.
+      std::filesystem::current_path(assets, ec);
       printf("assets     %s\n", root.c_str());
     } else if (asset_root) {
       fprintf(stderr, "no such assets directory: %s\n",
