@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 
 #include "arm64_context.h"
@@ -338,6 +339,28 @@ void SyslogCtx(Arm64Ctx* c) {
   c->x[0] = 0;
 }
 
+// Not variadic -- these take the context for the other reason it exists. Their
+// first argument is a float, which lives in v0, and the thunk carries only the
+// integer registers. Bound the ordinary way, the host function receives the two
+// output pointers shifted into the wrong parameter slots and writes through
+// whatever the guest happened to leave in x2.
+//
+// That is not hypothetical: it is what three of The Simpsons' static
+// constructors were faulting on, writing to address 0x16 because 0x16 is what
+// x2 held. The comment on the thunk has always said to generate one of these
+// when a title needs it. One did.
+void SincosfCtx(Arm64Ctx* c) {
+  const float x = c->q[0].f32[0];
+  if (c->x[0]) *reinterpret_cast<float*>(c->x[0]) = sinf(x);
+  if (c->x[1]) *reinterpret_cast<float*>(c->x[1]) = cosf(x);
+}
+
+void SincosCtx(Arm64Ctx* c) {
+  const double x = c->q[0].f64[0];
+  if (c->x[0]) *reinterpret_cast<double*>(c->x[0]) = sin(x);
+  if (c->x[1]) *reinterpret_cast<double*>(c->x[1]) = cos(x);
+}
+
 void AndroidLogPrintCtx(Arm64Ctx* c) {
   GuestVaList ap = VaFromContext(c, 3);
   int n = 0;
@@ -362,6 +385,8 @@ const CtxEntry kCtxTable[] = {
     {"asprintf", AsprintfCtx},
     {"syslog", SyslogCtx},
     {"__android_log_print", AndroidLogPrintCtx},
+    {"sincosf", SincosfCtx},
+    {"sincos", SincosCtx},
 };
 
 struct Entry {

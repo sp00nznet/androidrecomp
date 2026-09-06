@@ -306,6 +306,10 @@ const unsigned char* g_ctype = BuildCtype();
 
 // --- odds and ends ---------------------------------------------------------
 
+// Not bound here. sincosf takes its float in v0, which the fixed-arity thunk
+// cannot place, so shim_varargs registers a context-taking version instead --
+// same reason as the variadic entries, different cause. Left defined because
+// the context version calls the same thing.
 void Sincosf(float x, float* sin_out, float* cos_out) {
   *sin_out = sinf(x);
   *cos_out = cosf(x);
@@ -473,7 +477,6 @@ const Entry kTable[] = {
     E("fputc", Fputc),
     E("fflush", Fflush),
     E("fclose", Fclose),
-    E("sincosf", Sincosf),
     E("getentropy", Getentropy),
     E("__cxa_thread_atexit_impl", CxaThreadAtexit),
     E("qsort", Qsort),
