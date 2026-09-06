@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <string>
 #include <mutex>
 #include <utility>
 
@@ -154,6 +156,75 @@ uint64_t FieldIdFor(const char* name) {
   return kFieldIdBase + kFieldCount;
 }
 
+// --- methods ---------------------------------------------------------------
+//
+// A method id is opaque, so it may as well be an index into the names the
+// engine asked for. That is worth keeping, because a call through an id is
+// otherwise answerable only with a blank handle -- and a method that was
+// supposed to return a path, answered with an empty string, is how a bundle
+// path becomes "/".
+//
+// A deque and not a vector: names are handed out as pointers and another
+// thread may be adding one, which would move a vector's contents.
+constexpr uint64_t kMethodIdBase = 0x0E2D1000;
+std::mutex g_method_lock;
+std::deque<std::string> g_method_names;
+std::deque<std::string> g_method_unanswered;
+
+uint64_t MethodIdFor(const char* name) {
+  const std::string wanted = name ? name : "?";
+  std::lock_guard<std::mutex> held(g_method_lock);
+  for (size_t i = 0; i < g_method_names.size(); ++i)
+    if (g_method_names[i] == wanted) return kMethodIdBase + i;
+  g_method_names.push_back(wanted);
+  return kMethodIdBase + g_method_names.size() - 1;
+}
+
+const char* MethodName(uint64_t id) {
+  const uint64_t index = id - kMethodIdBase;
+  std::lock_guard<std::mutex> held(g_method_lock);
+  return index < g_method_names.size() ? g_method_names[index].c_str()
+                                       : nullptr;
+}
+
+void NoteUnanswered(const char* name) {
+  if (!name) return;
+  std::lock_guard<std::mutex> held(g_method_lock);
+  for (const std::string& s : g_method_unanswered)
+    if (s == name) return;
+  g_method_unanswered.push_back(name);
+}
+
+// What a method returning a string should answer with. The engine builds paths
+// out of these, so an empty one is worse than a wrong one: it silently becomes
+// the filesystem root.
+struct MethodText {
+  const char* name;
+  const char* text;
+};
+
+const MethodText kMethodText[] = {
+    {"getCocos2dxPackageName", "androidrecomp.host"},
+    {"getCocos2dxWritablePath", "."},
+    {"getAssetsPath", "."},
+    {"getPackageName", "androidrecomp.host"},
+    {"getAbsolutePath", "."},
+    {"getPath", "."},
+    {"getCanonicalPath", "."},
+    {"getCurrentLanguage", "en"},
+    {"getDeviceModel", "androidrecomp"},
+    {"getVersion", "1.0"},
+};
+
+const char* TextForMethod(uint64_t id) {
+  const char* name = MethodName(id);
+  if (!name) return nullptr;
+  for (const MethodText& m : kMethodText)
+    if (strcmp(m.name, name) == 0) return m.text;
+  NoteUnanswered(name);
+  return nullptr;
+}
+
 // --- slot behaviour --------------------------------------------------------
 
 struct SlotInfo {
@@ -285,6 +356,27 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
+    case 33:     // GetMethodID(env, class, name, signature)
+    case 113: {  // GetStaticMethodID
+      c->x[0] = MethodIdFor(reinterpret_cast<const char*>(c->x[2]));
+      return;
+    }
+
+    // A call returning an object. Where the method's name says that object is
+    // a string, answer with one: the engine joins these into paths, and an
+    // empty answer is not a harmless unknown -- it becomes the filesystem root
+    // and everything looked up beneath it fails.
+    case 34:     // CallObjectMethod(env, obj, methodID, ...)
+    case 35:     // CallObjectMethodV
+    case 36:     // CallObjectMethodA
+    case 114:    // CallStaticObjectMethod
+    case 115:    // CallStaticObjectMethodV
+    case 116: {  // CallStaticObjectMethodA
+      const char* text = TextForMethod(c->x[2]);
+      c->x[0] = text ? AllocateText(text) : Allocate();
+      return;
+    }
+
     case 219: {  // GetJavaVM(env, JavaVM** out)
       // Writing the VM out is the whole point of the call. Left unwritten, the
       // caller reads whatever that variable happened to hold and branches
@@ -395,6 +487,17 @@ void arc_jni_report(void) {
   for (size_t i = 0; i < kSlots; ++i)
     if (const size_t n = g_hits[i].load())
       printf("    %6zu x  slot %3zu  %s\n", n, i, NameOf(i));
+
+  // The Java methods the engine called expecting an object back, that nothing
+  // here had a value for. Each got a blank handle, which reads as an empty
+  // string -- so any of these that was meant to be a path is a lookup failing
+  // somewhere later for a reason that points nowhere near here.
+  std::lock_guard<std::mutex> held(g_method_lock);
+  if (!g_method_unanswered.empty()) {
+    printf("  Java methods called with no value to return:\n   ");
+    for (const std::string& s : g_method_unanswered) printf(" %s", s.c_str());
+    printf("\n");
+  }
 }
 
 }  // extern "C"
