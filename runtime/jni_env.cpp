@@ -123,10 +123,14 @@ const Field kFields[] = {
     // Answered from the asset root, not from here -- see DirectoryForName.
     {"writablePath", 's', ".", 0, 0},
     {"appBundle", 's', "androidrecomp.host", 0, 0},
-    {"appVersion", 's', "1.0", 0, 0},
-    {"clientVersion", 's', "1.0", 0, 0},
+    // Three components, not two. The engine parses these, and with "1.0" its
+    // search for the second separator finds nothing -- the span computed from
+    // that comes out negative and goes straight into memcpy as -1, which reads
+    // until it leaves the heap. The value is ours to choose; the shape is not.
+    {"appVersion", 's', "1.0.0", 0, 0},
+    {"clientVersion", 's', "1.0.0", 0, 0},
     {"deviceName", 's', "androidrecomp", 0, 0},
-    {"deviceVersion", 's', "1.0", 0, 0},
+    {"deviceVersion", 's', "1.0.0", 0, 0},
     {"manufacturerName", 's', "generic", 0, 0},
     {"language", 's', "en", 0, 0},
     {"locale", 's', "en_US", 0, 0},
@@ -442,6 +446,17 @@ void Handle(size_t index, Arm64Ctx* c) {
       return;
     }
     case 169: {  // GetStringUTFChars -- a jstring already holds its own text
+      // An empty answer here is the dangerous one: a caller that takes the
+      // length and subtracts one gets -1, hands that to memcpy, and runs off
+      // the end of the arena a long way from the call that caused it. Worth
+      // being able to see which string was empty and which was not.
+      static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+      if (trace) {
+        const char* s = reinterpret_cast<const char*>(c->x[1]);
+        fprintf(stderr, "[jni] GetStringUTFChars %#llx %s \"%.48s\"\n",
+                static_cast<unsigned long long>(c->x[1]),
+                arc_jni_owns(c->x[1]) ? "ours" : "not ours", s ? s : "");
+      }
       c->x[0] = c->x[1];
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
