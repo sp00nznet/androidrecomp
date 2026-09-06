@@ -15,6 +15,7 @@
 #pragma once
 
 #include <math.h>
+#include <setjmp.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -536,6 +537,23 @@ void arc_tpidr_write(uint64_t v);
 // directed rounding mode rather than merely preserving one.
 uint64_t arc_fpcr_read(void);
 void arc_fpcr_write(uint64_t v);
+
+// setjmp and longjmp, which cannot be the host's own and cannot live in a shim
+// either. The host's would save host registers; and a host setjmp called
+// inside a shim captures that shim's frame, which is gone the moment it
+// returns, so jumping to it later is undefined.
+//
+// So the lifter emits the setjmp *inline*, in the lifted function that makes
+// the call. Lifted functions are ordinary host C functions, so the frame it
+// captures is the caller's -- exactly the one that has to still be live when
+// the jump happens. This hands out the buffer to capture into, keyed by the
+// guest's own; the guest then branches on the result it gets back, which is
+// how it already distinguishes arming from returning.
+//
+// One registry per thread, because a longjmp across threads is undefined
+// anywhere.
+void* arc_jmpbuf_for(uint64_t guest_buffer);
+void arc_longjmp(uint64_t guest_buffer, int value);
 
 // --- indirect control flow -------------------------------------------------
 // Every `blr`/`br` target is looked up in a sorted address -> function table

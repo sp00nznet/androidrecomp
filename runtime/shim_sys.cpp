@@ -406,13 +406,16 @@ int Sigprocmask(int, const void*, void*) { return 0; }
 // setjmp inline in the calling function, so the frame it captures is the one
 // that will still be there.
 //
-// So: setjmp succeeds and says no jump has happened, which is the truth on
-// every path that does not fail. Image decoders take this route -- they arm an
-// error handler and then decode successfully -- and that path now works.
-// A longjmp is the case we cannot honour, so it says so rather than jumping
-// somewhere plausible and wrong.
-// ponytail: no unwinding. Give the lifter an inline setjmp if a title starts
-// depending on the failure path rather than merely arming it.
+// The lifter does it properly now: it emits the setjmp inline in the lifted
+// function that calls it, so the frame captured is the caller's -- the one
+// that has to still be live when the jump lands. These remain only for a call
+// made through a function pointer, which no engine seen so far does, and they
+// cannot arm anything for the reason above.
+//
+// This file's earlier answer -- succeed, and report that no jump has happened
+// -- was reasoned from the shape of the code rather than measured, on the
+// argument that a decoder arms an error handler and then succeeds. It does
+// not: Family Guy takes the failure path and calls longjmp for real.
 int Setjmp(void*) { return 0; }
 
 [[noreturn]] void Longjmp(void*, int value) {

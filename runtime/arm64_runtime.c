@@ -139,6 +139,53 @@ static ARC_THREAD_LOCAL uint64_t t_fpcr;
 uint64_t arc_fpcr_read(void) { return t_fpcr; }
 void arc_fpcr_write(uint64_t v) { t_fpcr = v; }
 
+// The guest's jmp_buf is its own memory and its own size; ours has to live
+// somewhere we control, so the two are paired here rather than laid on top of
+// one another. Sixteen is generous for nesting -- a decoder arms one and an
+// unwinder maybe another -- and reusing the oldest is better than refusing,
+// because a refused setjmp is a jump that lands nowhere later.
+#define ARC_JMP_SLOTS 16
+typedef struct {
+  uint64_t guest;
+  jmp_buf host;
+  int used;
+} ArcJmpSlot;
+static ARC_THREAD_LOCAL ArcJmpSlot t_jmps[ARC_JMP_SLOTS];
+static ARC_THREAD_LOCAL int t_jmp_next;
+
+void* arc_jmpbuf_for(uint64_t guest_buffer) {
+  int i;
+  for (i = 0; i < ARC_JMP_SLOTS; ++i)
+    if (t_jmps[i].used && t_jmps[i].guest == guest_buffer)
+      return &t_jmps[i].host;
+  for (i = 0; i < ARC_JMP_SLOTS; ++i)
+    if (!t_jmps[i].used) {
+      t_jmps[i].used = 1;
+      t_jmps[i].guest = guest_buffer;
+      return &t_jmps[i].host;
+    }
+  i = t_jmp_next;
+  t_jmp_next = (t_jmp_next + 1) % ARC_JMP_SLOTS;
+  t_jmps[i].guest = guest_buffer;
+  return &t_jmps[i].host;
+}
+
+void arc_longjmp(uint64_t guest_buffer, int value) {
+  int i;
+  for (i = 0; i < ARC_JMP_SLOTS; ++i)
+    if (t_jmps[i].used && t_jmps[i].guest == guest_buffer)
+      longjmp(t_jmps[i].host, value ? value : 1);
+  // Nothing armed this on this thread. Saying so beats jumping somewhere
+  // plausible: a longjmp to the wrong frame is a crash with no explanation
+  // attached to it.
+  {
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "longjmp(%d) to a buffer no setjmp on this thread armed", value);
+    arc_trap(NULL, msg);
+  }
+}
+
 static ARC_THREAD_LOCAL jmp_buf* t_recovery;
 static ARC_THREAD_LOCAL char t_last_trap[256];
 

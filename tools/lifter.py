@@ -27,6 +27,7 @@ import os
 import sys
 
 from elftools.elf.elffile import ELFFile
+from elftools.elf.relocation import RelocationSection
 
 try:
     import capstone
@@ -130,6 +131,9 @@ class Lifter:
         # Everything mapped from the current image, for reading jump tables,
         # and the tables found in the function being lifted.
         self.image_sections: list[tuple[int, bytes]] = []
+        # PLT entry -> imported name, for the two calls that
+        # cannot be left to the dispatcher.
+        self.plt_names: dict[int, str] = {}
         self.cur_tables: dict[int, list[int]] = {}
         # Record the guest address of every instruction as it runs. Off by
         # default: it is a store per instruction, paid for only when something
@@ -1550,6 +1554,27 @@ class Lifter:
             return [f"if ((({self.read(ops[0])}) >> {bit} & 1) {test} 0) {body}"]
         if m == "bl":
             t = branch_target(ops[0])
+            name = self.plt_names.get(t)
+            # Almost every call out can be left to the dispatcher, which
+            # resolves the bound address at run time. These two cannot.
+            #
+            # setjmp has to be captured in *this* function's frame. Lifted
+            # functions are ordinary host C functions, so a setjmp written here
+            # saves exactly the frame that must still be live when the jump
+            # lands. Reached through a shim instead, it would save the shim's
+            # own frame -- gone the moment the shim returns, and undefined to
+            # jump to afterwards.
+            #
+            # The guest already branches on what setjmp returns, so putting the
+            # result in x0 makes both passes take the paths it wrote for them:
+            # zero when arming, non-zero when arriving via longjmp.
+            if name == "setjmp":
+                return [f"ARC_X_W(c, 30, {self.base_expr()} + "
+                        f"UINT64_C({insn.address + 4}));",
+                        "ARC_X_W(c, 0, (uint64_t)(uint32_t)setjmp("
+                        "*(jmp_buf*)arc_jmpbuf_for(ARC_X_R(c, 0))));"]
+            if name == "longjmp":
+                return ["arc_longjmp(ARC_X_R(c, 0), (int)ARC_X_R(c, 1));"]
             return [f"ARC_X_W(c, 30, {self.base_expr()} + "
                     f"UINT64_C({insn.address + 4}));",
                     f"{self.fn_name(t)}(c);"]
@@ -2400,6 +2425,35 @@ def functions_from_plt(elf: ELFFile) -> list[tuple[int, int]]:
     return [(base + off, 16) for off in range(0, size - 15, 16)]
 
 
+def plt_symbols(elf: ELFFile) -> dict[int, str]:
+    """Which imported function each PLT entry stands for.
+
+    The entries are in the same order as `.rela.plt`, after a 32-byte header,
+    so the name of the nth relocation belongs to the nth entry. Almost every
+    call out of the guest can be left to the dispatcher, which resolves the
+    bound address at run time and needs no names -- but two cannot, and this is
+    how they are recognised. See the `setjmp` note in the branch emitter.
+    """
+    plt = elf.get_section_by_name(".plt")
+    dynsym = elf.get_section_by_name(".dynsym")
+    if plt is None or dynsym is None:
+        return {}
+    rela = None
+    for section in elf.iter_sections():
+        if isinstance(section, RelocationSection) and section.name == ".rela.plt":
+            rela = section
+    if rela is None:
+        return {}
+    base = plt["sh_addr"]
+    out = {}
+    for index, reloc in enumerate(rela.iter_relocations()):
+        symbol = reloc["r_info_sym"]
+        if not symbol:
+            continue
+        out[base + 32 + index * 16] = dynsym.get_symbol(symbol).name
+    return out
+
+
 def functions_from_eh_frame(elf: ELFFile) -> list[tuple[int, int]]:
     if not elf.has_dwarf_info():
         return []
@@ -2505,9 +2559,10 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
 
     per_image = []          # (name, defined[], stub_targets[])
     written = 0
-    for index, (name, funcs, sections, data) in enumerate(images):
+    for index, (name, funcs, sections, data, plt) in enumerate(images):
         lifter.image_index = index
         lifter.image_sections = data
+        lifter.plt_names = plt
         lifter.referenced = set()
         defined, unlifted = [], []
         done = 0
@@ -2662,7 +2717,8 @@ def main() -> None:
                            sorted(functions_from_eh_frame(elf) +
                                   functions_from_plt(elf)),
                            code_sections(elf),
-                           data_sections(elf)))
+                           data_sections(elf),
+                           plt_symbols(elf)))
 
     lifter = Lifter()
     lifter.pc_notes = args.pc_notes
@@ -2672,6 +2728,7 @@ def main() -> None:
     else:
         funcs, sections = images[0][1], images[0][2]
         lifter.image_sections = images[0][3]
+        lifter.plt_names = images[0][4]
         done = failed = 0
         for start, size in funcs:
             if args.limit and done + failed >= args.limit:
