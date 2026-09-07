@@ -95,6 +95,14 @@ On Windows add `-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
 so CMake finds zlib and SDL2. A toolchain file only takes effect on a fresh
 cache, so delete `build/` if you add it later.
 
+On Windows the Visual Studio generator is multi-config, so `CMAKE_BUILD_TYPE`
+at configure time does nothing and the binaries land in `build/Debug/`. Ask for
+the configuration when you build instead:
+
+```sh
+cmake --build build --config Release
+```
+
 Triage a new title before committing to it:
 
 ```sh

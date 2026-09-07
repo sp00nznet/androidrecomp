@@ -20,9 +20,14 @@ On Windows, get zlib and SDL2 from vcpkg and pass the toolchain file. It only
 takes effect on a fresh cache, so delete `build/` if you add it later:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
 ```
+
+The Visual Studio generator is multi-config, so `-DCMAKE_BUILD_TYPE` at
+configure time does nothing there and the binaries land in `build/Debug/` unless
+you pass `--config` when you build. Every `./build/arc_host` below is
+`build\Release\arc_host.exe` on Windows.
 
 ## 1. Build the kit and check it works
 
@@ -156,7 +161,7 @@ Both run against Unicorn on whatever machine you have. [VERIFICATION.md](VERIFIC
 
 ```sh
 cmake -S . -B build-lifted -DARC_LIFTED_DIR=generated
-cmake --build build-lifted --target arc_boot
+cmake --build build-lifted --target arc_boot     # --config Release on Windows
 ```
 
 This is a large amount of C — expect it to take a while and want memory.

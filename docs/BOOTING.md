@@ -39,7 +39,7 @@ load of a global or a pointer walk reads identical bytes on both sides.
 
 ```sh
 cmake -S . -B build-lifted -DARC_LIFTED_DIR=generated
-cmake --build build-lifted --target arc_boot
+cmake --build build-lifted --target arc_boot     # --config Release on Windows
 ./build-lifted/arc_boot libengine.so
 ```
 
