@@ -57,10 +57,12 @@ venv/
 *.vcxproj*
 .DS_Store
 
-# tool output
-probe.txt
-run.txt
-triage.md
+# tool output. Anchored to the root: unanchored, "triage.md" also matches
+# docs/TRIAGE.md on a case-insensitive filesystem, which is a documented file
+# silently missing from the repository.
+/probe.txt
+/run.txt
+/triage.md
 
 verify.txt
 
