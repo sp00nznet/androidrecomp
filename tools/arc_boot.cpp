@@ -966,6 +966,11 @@ int main(int argc, char** argv) {
                ExplainAddress(g_fault_address).c_str());
       ReportFrames();
       ReportRegisters(&ctx);
+      // The frame loop is where a title actually spends its time, and a --peek
+      // that only runs between entry points cannot see any of it. On a fault
+      // it is exactly the state you want: whatever the engine was holding when
+      // it came apart.
+      for (const std::string& spec : peeks) ReportPeek(ctx.image_base, spec);
       return false;
     };
     bool alive = true;

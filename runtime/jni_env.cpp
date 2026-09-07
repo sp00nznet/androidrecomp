@@ -309,11 +309,10 @@ struct MethodFlag {
 };
 
 const MethodFlag kMethodFlags[] = {
-    // The loading screen polls this three times a frame and will not advance
-    // until it is true. On Android a Java worker thread does the loading and
-    // reports when it is finished; there is no Java here and nothing is
-    // pending, so it is finished. Answering false is an infinite wait that
-    // looks exactly like a game sitting on its splash screen.
+    // Handled by ThreadComplete() below rather than here, because "how long
+    // did the thread take" is a real variable and answering it instantly is
+    // not obviously the honest answer. Listed so the name is not reported as
+    // unanswered.
     {"isThreadComplete", true},
     // Java being asked to create a directory. False means it failed, and the
     // caller treats that as a fatal setup error. The filesystem shim creates
@@ -324,11 +323,34 @@ const MethodFlag kMethodFlags[] = {
 // Tri-state on purpose: "not in the table" has to stay distinguishable from
 // "in the table, answering false", or every unanswered call would be recorded
 // as a deliberate no.
+// The loading screen polls a Java worker thread and will not advance until it
+// says it is finished. There is no Java here and no work outstanding, so the
+// truthful answer is "finished" -- but on a device that thread takes real
+// time, and the engine advances its own state machine while it waits. Saying
+// yes on the very first poll compresses that to nothing, which is a different
+// order of events than the engine was written against.
+//
+// So it is a knob, defaulting to answering immediately: ARC_THREAD_POLLS is
+// how many polls to answer "still running" first. This is the sort of thing a
+// real device varies and a host cannot infer.
+bool ThreadComplete() {
+  static const long wait = [] {
+    const char* s = getenv("ARC_THREAD_POLLS");
+    return s ? strtol(s, nullptr, 10) : 0;
+  }();
+  static std::atomic<long> polls{0};
+  return polls++ >= wait;
+}
+
 bool FlagForMethod(uint64_t id, bool* answered) {
   *answered = false;
   const char* name = MethodName(id);
   if (!name) return false;
   NoteCalled(name);
+  if (strcmp(name, "isThreadComplete") == 0) {
+    *answered = true;
+    return ThreadComplete();
+  }
   for (const MethodFlag& m : kMethodFlags)
     if (strcmp(m.name, name) == 0) {
       *answered = true;
@@ -342,6 +364,28 @@ bool FlagForMethod(uint64_t id, bool* answered) {
 // this machine rather than anything invented. They come from the asset root
 // the host was given: the bundle is that directory, and what the engine writes
 // goes beside it rather than into it.
+// The device's locale, which is a real property of a real device and not
+// something a host can infer. The engine matches the language string against a
+// table of twenty-two it knows and takes the index; a string it does not know
+// is index zero, which is also what "English" is, and the two are not
+// distinguishable downstream.
+//
+// So it is a knob. ARC_LANG and ARC_LOCALE override what the JNI bridge
+// answers, which is how you find out what a title does with a locale other
+// than the one you guessed.
+const char* LocaleOverride(const char* name) {
+  if (strcmp(name, "language") == 0 || strcmp(name, "getLanguage") == 0 ||
+      strcmp(name, "getCurrentLanguage") == 0) {
+    static const char* v = getenv("ARC_LANG");
+    return v;
+  }
+  if (strcmp(name, "locale") == 0) {
+    static const char* v = getenv("ARC_LOCALE");
+    return v;
+  }
+  return nullptr;
+}
+
 const char* DirectoryForName(const char* name) {
   static std::mutex lock;
   static std::string bundle, storage;
@@ -373,6 +417,7 @@ const char* TextForMethod(uint64_t id) {
   const char* name = MethodName(id);
   if (!name) return nullptr;
   NoteCalled(name);
+  if (const char* v = LocaleOverride(name)) return v;
   if (const char* dir = DirectoryForName(name)) return dir;
   for (const MethodText& m : kMethodText)
     if (strcmp(m.name, name) == 0) return m.text;
@@ -517,6 +562,10 @@ void Handle(size_t index, Arm64Ctx* c) {
         // it comes from the asset root rather than from the table.
         if (const char* dir = DirectoryForName(f->name)) {
           c->x[0] = AllocateText(dir);
+          return;
+        }
+        if (const char* v = LocaleOverride(f->name)) {
+          c->x[0] = AllocateText(v);
           return;
         }
       }
