@@ -90,14 +90,47 @@ bool Window::PumpEvents() {
       case SDL_KEYDOWN:
         if (e.key.keysym.sym == SDLK_ESCAPE) open = false;
         break;
+      case SDL_MOUSEBUTTONDOWN:
+        if (e.button.button == SDL_BUTTON_LEFT) {
+          last_x_ = e.button.x;
+          last_y_ = e.button.y;
+          down_ = true;
+          pointers_.push_back({Pointer::Down, last_x_, last_y_, last_x_,
+                               last_y_});
+        }
+        break;
+      case SDL_MOUSEBUTTONUP:
+        if (e.button.button == SDL_BUTTON_LEFT && down_) {
+          down_ = false;
+          pointers_.push_back({Pointer::Up, e.button.x, e.button.y, last_x_,
+                               last_y_});
+          last_x_ = e.button.x;
+          last_y_ = e.button.y;
+        }
+        break;
+      case SDL_MOUSEMOTION:
+        // Only while held. A drag is the gesture the engine has an entry
+        // point for; a hovering cursor is not an event Android can produce,
+        // and feeding one in makes a tap out of every pass over the window.
+        if (down_) {
+          pointers_.push_back({Pointer::Move, e.motion.x, e.motion.y, last_x_,
+                               last_y_});
+          last_x_ = e.motion.x;
+          last_y_ = e.motion.y;
+        }
+        break;
       default:
-        // Pointer and key events are translated where they are consumed --
-        // by the JNI bridge that calls pointerPressed/keyPressed. Adding a
-        // translation layer here before that exists would have no reader.
         break;
     }
   }
   return open;
+}
+
+bool Window::NextPointer(Pointer* out) {
+  if (pointers_.empty()) return false;
+  *out = pointers_.front();
+  pointers_.pop_front();
+  return true;
 }
 
 void Window::Present() {
@@ -148,6 +181,7 @@ bool Window::MakeCurrent(std::string* err) {
 }
 void Window::ReleaseCurrent() {}
 bool Window::PumpEvents() { return false; }
+bool Window::NextPointer(Pointer*) { return false; }
 void Window::Present() {}
 void Window::Close() {}
 bool Window::TakeResized() { return false; }

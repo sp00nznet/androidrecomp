@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#if defined(_WIN32)
+#include <crtdbg.h>
+#endif
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -132,6 +135,86 @@ const char* ExplainForRuntime(uint64_t addr) {
 
 // Decode a packed frame back into the image it came from and the offset
 // inside it, which is what a disassembler wants.
+// A pointer chain, hex-dumped. "d58/358:32" reads the image at +0xd58, follows
+// the 64-bit value there, adds 0x358, and prints 32 bytes -- which is how a
+// field of an engine singleton is reached from the outside, with no debugger.
+void ReportPeek(uint64_t image_base, const std::string& spec) {
+  const size_t colon = spec.find(':');
+  const size_t len = colon == std::string::npos
+                         ? 64
+                         : strtoull(spec.c_str() + colon + 1, nullptr, 16);
+  std::string chain = spec.substr(0, colon);
+  uint64_t at = image_base;
+  size_t pos = 0;
+  bool first = true;
+  while (pos <= chain.size()) {
+    const size_t slash = chain.find('/', pos);
+    const std::string step = chain.substr(pos, slash - pos);
+    if (!first) {
+      // Every hop reads a pointer the guest wrote, so a null or a wild value
+      // is the answer rather than a reason to crash the host.
+      uint64_t next = 0;
+      memcpy(&next, reinterpret_cast<const void*>(at), sizeof next);
+      if (!next) {
+        printf("  peek %s: null at step %zu\n", spec.c_str(), pos);
+        return;
+      }
+      at = next;
+    }
+    at += strtoull(step.c_str(), nullptr, 16);
+    first = false;
+    if (slash == std::string::npos) break;
+    pos = slash + 1;
+  }
+  printf("  peek %s = %#llx\n", spec.c_str(),
+         static_cast<unsigned long long>(at));
+  const auto* p = reinterpret_cast<const unsigned char*>(at);
+  for (size_t i = 0; i < len; i += 16) {
+    printf("    +%04zx ", i);
+    for (size_t j = 0; j < 16 && i + j < len; ++j) printf("%02x ", p[i + j]);
+    printf("\n");
+  }
+}
+
+// The frame as the driver actually rasterised it, which is the only evidence
+// that a port renders. Written as binary PPM: no encoder, no dependency, and
+// every image tool reads it.
+void SaveFrame(const char* path, int w, int h) {
+  auto read = reinterpret_cast<void (*)(int, int, int, int, unsigned, unsigned,
+                                        void*)>(arc::ShimResolveGL("glReadPixels"));
+  if (!read) {
+    fprintf(stderr, "no glReadPixels to capture with\n");
+    return;
+  }
+  // With ARC_GL_TINT the guest clears to magenta; clearing to green from here
+  // first separates "the guest's GL went nowhere" from "the readback did".
+  if (getenv("ARC_GL_TINT")) {
+    auto cc = reinterpret_cast<void (*)(float, float, float, float)>(
+        arc::ShimResolveGL("glClearColor"));
+    auto cl = reinterpret_cast<void (*)(unsigned)>(
+        arc::ShimResolveGL("glClear"));
+    if (cc && cl) {
+      cc(0.0f, 0.6f, 0.2f, 1.0f);
+      cl(0x4000 /* GL_COLOR_BUFFER_BIT */);
+    }
+  }
+  std::vector<unsigned char> rgb(static_cast<size_t>(w) * h * 3);
+  read(0, 0, w, h, 0x1907 /* GL_RGB */, 0x1401 /* GL_UNSIGNED_BYTE */,
+       rgb.data());
+  FILE* f = fopen(path, "wb");
+  if (!f) {
+    fprintf(stderr, "cannot write %s\n", path);
+    return;
+  }
+  fprintf(f, "P6\n%d %d\n255\n", w, h);
+  // GL's origin is bottom-left and an image file's is top-left.
+  for (int y = h - 1; y >= 0; --y)
+    fwrite(rgb.data() + static_cast<size_t>(y) * w * 3, 1,
+           static_cast<size_t>(w) * 3, f);
+  fclose(f);
+  printf("wrote %s (%dx%d)\n", path, w, h);
+}
+
 void ReportFrames() {
   const size_t n = arc_frame_count();
   if (!n) return;
@@ -338,12 +421,30 @@ const char* FaultName(unsigned long code) {
 
 }  // namespace
 
+#if defined(_WIN32)
+// Bionic returns an error from a bad argument; the UCRT calls __fastfail, and
+// __fastfail is not an exception -- no handler sees it, the process is gone,
+// and the log ends mid-line with nothing to say which call did it. A guest is
+// exactly the caller that passes arguments the UCRT rejects, so the report has
+// to come from here.
+void OnInvalidParameter(const wchar_t* expr, const wchar_t* fn,
+                        const wchar_t* file, unsigned, uintptr_t) {
+  printf("  C library rejected an argument: %ls in %ls\n",
+         expr && *expr ? expr : L"(no expression)",
+         fn && *fn ? fn : L"(unnamed function)");
+  (void)file;
+}
+#endif
+
 int main(int argc, char** argv) {
   // Unbuffered: this program runs code that can abort the process, and
   // block-buffered output redirected to a file dies with it -- which turns a
   // diagnosable crash into an empty log.
   setvbuf(stdout, nullptr, _IONBF, 0);
   setvbuf(stderr, nullptr, _IONBF, 0);
+#if defined(_WIN32)
+  _set_invalid_parameter_handler(&OnInvalidParameter);
+#endif
 
   const char* lib = nullptr;
   // An engine's startup is a sequence, not a call. cocos2d-x builds its
@@ -356,6 +457,13 @@ int main(int argc, char** argv) {
   bool want_window = false;
   const char* gl_version = nullptr;
   const char* asset_root = nullptr;
+  // Every question about why an engine short-circuited is a question about one
+  // field of one object, and the object is on the heap behind a global. A
+  // chain says how to get there: an image offset, then a deref per "/".
+  std::vector<std::string> peeks;
+  bool loop = false;
+  long frame_limit = 0;
+  const char* shot = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--entry=", 8) == 0)
       entries.emplace_back(argv[i] + 8, std::string());
@@ -372,6 +480,14 @@ int main(int argc, char** argv) {
       gl_version = argv[i] + 5;
     else if (strncmp(argv[i], "--assets=", 9) == 0)
       asset_root = argv[i] + 9;
+    else if (strcmp(argv[i], "--loop") == 0)
+      loop = true;
+    else if (strncmp(argv[i], "--frames=", 9) == 0)
+      frame_limit = strtol(argv[i] + 9, nullptr, 10);
+    else if (strncmp(argv[i], "--shot=", 7) == 0)
+      shot = argv[i] + 7;
+    else if (strncmp(argv[i], "--peek=", 7) == 0)
+      peeks.emplace_back(argv[i] + 7);
     else if (strncmp(argv[i], "--constructors=", 15) == 0)
       ctor_limit = strtol(argv[i] + 15, nullptr, 10);
     else
@@ -380,7 +496,9 @@ int main(int argc, char** argv) {
   if (!lib) {
     fprintf(stderr,
             "usage: %s [--window] [--gl=MAJOR.MINOR] [--assets=DIR]"
-            " [--constructors=N] [--entry=SYMBOL] [--args=N,N,...]"
+            " [--constructors=N] [--peek=OFF[/OFF...][:LEN]]"
+            " [--loop] [--frames=N] [--shot=FILE.ppm]"
+            " [--entry=SYMBOL] [--args=N,N,...]"
             " <library.so>\n",
             argv[0]);
     return 2;
@@ -508,6 +626,7 @@ int main(int argc, char** argv) {
   arc_set_explain(&ExplainForRuntime);
   arc_jni_register();
   arc::ShimRegisterVarargs();
+  arc::ShimRegisterGL();
 
   printf("image      %s at %p\n", path.filename().string().c_str(),
          static_cast<void*>(g_image.base()));
@@ -547,6 +666,75 @@ int main(int argc, char** argv) {
   memset(&ctx, 0, sizeof(ctx));
   ctx.image_base = reinterpret_cast<uint64_t>(g_image.base());
   ctx.sp = stack_top;
+
+  // What the Java runtime does once a library is loaded: hand it the VM. A
+  // library caches that pointer and reaches every later thread's environment
+  // through it, so skipping the call leaves a null behind that surfaces much
+  // later, inside whatever first tries to call back into Java.
+  //
+  // Every image that exports it, not just the engine: a dependency gets its
+  // own call when Java loads it by name, and libNimble's cached VM is read by
+  // an engine constructor -- so a host that only calls the engine's faults in
+  // a constructor, three images deep, on a null nobody can trace back here.
+  auto call_on_load = [&](const arc::ElfImage& img, const char* who) {
+    const uint64_t on_load = img.Lookup("JNI_OnLoad");
+    if (!on_load) return;
+    ctx.sp = stack_top;
+    memset(ctx.x, 0, sizeof(ctx.x));
+    ctx.x[0] = arc_jni_vm();
+    arc_frame_clear();
+    unsigned long code = 0;
+    const int rc = CallGuarded(&ctx, on_load, &code);
+    if (rc == 0) {
+      printf("\n%s JNI_OnLoad returned JNI version %#llx\n", who,
+             static_cast<unsigned long long>(ctx.x[0] & 0xFFFFFFFFu));
+    } else if (rc == 1) {
+      printf("\n%s JNI_OnLoad: %s\n", who, arc_last_trap());
+      ReportFrames();
+    } else {
+      const std::string what = ExplainAddress(g_fault_address);
+      printf("\n%s JNI_OnLoad: %s on %s of %#llx%s%s\n", who, FaultName(code),
+             g_fault_kind, static_cast<unsigned long long>(g_fault_address),
+             what.empty() ? "" : " -- ", what.c_str());
+      ReportFrames();
+      ReportRegisters(&ctx);
+    }
+  };
+
+  // One guest call on a thread of its own, which is where the big stack and
+  // the GL context live. Arguments go in ctx.x before the call; the result
+  // comes back the same way.
+  auto call_guest = [&](uint64_t addr, EntryCall* call) {
+    call->ctx = &ctx;
+    call->target = addr;
+    call->window = want_window ? &window : nullptr;
+    // Given up here so the guest's thread can take it: a context is current on
+    // one thread at a time, and claiming it elsewhere while this one still
+    // holds it fails.
+    if (want_window) window.ReleaseCurrent();
+    // Per call, not per run. An entry point that returns without faulting
+    // still answers a question worth asking -- how much guest code it ran --
+    // and a count near zero means it did nothing at all.
+    arc_frame_clear();
+#if defined(_WIN32)
+    // 512 MB reserved. It is address space, not memory: only the pages the
+    // guest actually touches are ever committed.
+    HANDLE th = CreateThread(nullptr, 512u << 20, RunEntry, call, 0, nullptr);
+    if (th) {
+      WaitForSingleObject(th, INFINITE);
+      CloseHandle(th);
+    } else {
+      call->rc = CallGuarded(&ctx, addr, &call->code);
+    }
+#else
+    call->rc = CallGuarded(&ctx, addr, &call->code);
+#endif
+  };
+
+  // Before the engine's constructors, in load order: on Android each library
+  // gets this when Java loads it by name, and a dependency is loaded first.
+  for (const Mapping& m : g_mappings)
+    if (m.image != &g_image) call_on_load(*m.image, m.name.c_str());
 
   const std::vector<uint64_t>& ctors = g_image.init_array();
   const size_t total = ctor_limit > 0 && static_cast<size_t>(ctor_limit) < ctors.size()
@@ -644,41 +832,19 @@ int main(int argc, char** argv) {
     for (const std::string& f : first_failures) printf("%s\n", f.c_str());
   }
 
-  // What the Java runtime does once a library is loaded and its static
-  // constructors have run: hand it the VM. A library caches that pointer and
-  // reaches every later thread's environment through it, so skipping the call
-  // leaves a null behind that surfaces much later, inside whatever first tries
-  // to call back into Java. Both engines seen so far export this, and it is a
-  // convention of the platform rather than of any one of them, so the host
-  // does it rather than each port remembering to.
-  if (const uint64_t on_load = g_image.Lookup("JNI_OnLoad")) {
-    ctx.sp = stack_top;
-    memset(ctx.x, 0, sizeof(ctx.x));
-    ctx.x[0] = arc_jni_vm();
-    arc_frame_clear();
-    unsigned long code = 0;
-    const int rc = CallGuarded(&ctx, on_load, &code);
-    if (rc == 0) {
-      printf("\nJNI_OnLoad returned JNI version %#llx\n",
-             static_cast<unsigned long long>(ctx.x[0] & 0xFFFFFFFFu));
-    } else if (rc == 1) {
-      printf("\nJNI_OnLoad: %s\n", arc_last_trap());
-      ReportFrames();
-    } else {
-      const std::string what = ExplainAddress(g_fault_address);
-      printf("\nJNI_OnLoad: %s on %s of %#llx%s%s\n", FaultName(code),
-             g_fault_kind, static_cast<unsigned long long>(g_fault_address),
-             what.empty() ? "" : " -- ", what.c_str());
-      ReportFrames();
-      ReportRegisters(&ctx);
-    }
-  }
+  call_on_load(g_image, path.filename().string().c_str());
 
   for (const auto& step : entries) {
     const char* entry = step.first.c_str();
     const char* entry_args = step.second.empty() ? nullptr
                                                  : step.second.c_str();
-    const uint64_t addr = g_image.Lookup(entry);
+    // A raw offset as well as a name. Plenty of the engine is internal
+    // and stripped, and an unexported function is often exactly the one
+    // worth calling to find out what it gates.
+    const uint64_t addr =
+        (entry[0] == '0' && (entry[1] == 'x' || entry[1] == 'X'))
+            ? ctx.image_base + strtoull(entry + 2, nullptr, 16)
+            : g_image.Lookup(entry);
     if (!addr) {
       fprintf(stderr, "\nno symbol named %s\n", entry);
       return 1;
@@ -709,6 +875,17 @@ int main(int argc, char** argv) {
           if (*p == ',') ++p;
           continue;
         }
+        // `str:TEXT` for a Java String argument. The engine reads these
+        // through GetStringUTFChars, so a number in the slot is a pointer it
+        // follows into nothing.
+        if (strncmp(p, "str:", 4) == 0) {
+          const char* comma = strchr(p + 4, ',');
+          const std::string text(p + 4, comma ? comma - (p + 4)
+                                              : strlen(p + 4));
+          ctx.x[slot++] = arc_jni_string(text.c_str());
+          p = comma ? comma + 1 : p + strlen(p);
+          continue;
+        }
         char* end = nullptr;
         const long long v = strtoll(p, &end, 0);
         if (end == p) break;
@@ -719,33 +896,18 @@ int main(int argc, char** argv) {
              slot - 2);
     }
     EntryCall call{};
-    call.ctx = &ctx;
-    call.target = addr;
-    call.window = want_window ? &window : nullptr;
-    // Given up here so the guest's thread can take it: a context is current on
-    // one thread at a time, and claiming it elsewhere while this one still
-    // holds it fails.
-    if (want_window) window.ReleaseCurrent();
-#if defined(_WIN32)
-    // 512 MB reserved. It is address space, not memory: only the pages the
-    // guest actually touches are ever committed.
-    HANDLE th = CreateThread(nullptr, 512u << 20, RunEntry, &call, 0, nullptr);
-    if (th) {
-      WaitForSingleObject(th, INFINITE);
-      CloseHandle(th);
-    } else {
-      call.rc = CallGuarded(&ctx, addr, &call.code);
-    }
-#else
-    call.rc = CallGuarded(&ctx, addr, &call.code);
-#endif
+    call_guest(addr, &call);
     const int rc = call.rc;
     const unsigned long code = call.code;
     printf("  JNI:\n");
     arc_jni_report();
-    if (rc == 0)
-      printf("  returned, x0 = %#llx\n",
-             static_cast<unsigned long long>(ctx.x[0]));
+    if (rc == 0) {
+      printf("  returned, x0 = %#llx after %zu guest calls\n",
+             static_cast<unsigned long long>(ctx.x[0]),
+             arc_frame_seen());
+      if (getenv("ARC_TRACE_FRAMES")) ReportFrames();
+      for (const std::string& spec : peeks) ReportPeek(ctx.image_base, spec);
+    }
     else if (rc == 1) {
       // A trap says what went wrong but not where. It is the same question a
       // fault raises, and was already answered there.
@@ -759,6 +921,93 @@ int main(int argc, char** argv) {
              what.empty() ? "" : " -- ", what.c_str());
       ReportFrames();
       ReportRegisters(&ctx);
+    }
+  }
+
+  // The part Java does on Android: a thread that renders, presents, and hands
+  // touches back in. Everything above this is setup that runs once; a title is
+  // only actually running once something calls it again every frame.
+  if (loop) {
+    const char* kBridge = "Java_com_bight_android_jni_BGCoreJNIBridge_";
+    const uint64_t render = g_image.Lookup(
+        (std::string(kBridge) + "OGLESRender").c_str());
+    const uint64_t resize = g_image.Lookup(
+        (std::string(kBridge) + "OGLESResize").c_str());
+    const uint64_t pressed = g_image.Lookup(
+        (std::string(kBridge) + "pointerPressed").c_str());
+    const uint64_t moved = g_image.Lookup(
+        (std::string(kBridge) + "pointerMoved").c_str());
+    const uint64_t released = g_image.Lookup(
+        (std::string(kBridge) + "pointerReleased").c_str());
+    if (!render) {
+      fprintf(stderr, "no OGLESRender to loop on\n");
+      return 1;
+    }
+    printf("\nrunning. close the window or press escape to stop.\n");
+    // Arguments after the environment and the object, in the order the Java
+    // declarations give them.
+    auto call = [&](uint64_t fn, std::initializer_list<uint64_t> args) {
+      if (!fn) return true;
+      ctx.sp = stack_top;
+      memset(ctx.x, 0, sizeof(ctx.x));
+      ctx.x[0] = arc_jni_env();
+      ctx.x[1] = arc_jni_object();
+      int slot = 2;
+      for (uint64_t a : args) ctx.x[slot++] = a;
+      EntryCall c{};
+      call_guest(fn, &c);
+      if (c.rc == 0) return true;
+      // A frame that faults will fault again next frame on the same state, so
+      // stopping is the only outcome that reports rather than repeats.
+      if (c.rc == 1) printf("\n%s\n", c.trap);
+      else
+        printf("\n%s on %s of %#llx -- %s\n", FaultName(c.code), g_fault_kind,
+               static_cast<unsigned long long>(g_fault_address),
+               ExplainAddress(g_fault_address).c_str());
+      ReportFrames();
+      ReportRegisters(&ctx);
+      return false;
+    };
+    bool alive = true;
+    long frames = 0;
+    while (alive && window.PumpEvents()) {
+      if (window.TakeResized())
+        alive = call(resize, {static_cast<uint64_t>(window.width()),
+                              static_cast<uint64_t>(window.height())});
+      arc::Window::Pointer p;
+      while (alive && window.NextPointer(&p)) {
+        const uint64_t x = static_cast<uint32_t>(p.x);
+        const uint64_t y = static_cast<uint32_t>(p.y);
+        const uint64_t fx = static_cast<uint32_t>(p.from_x);
+        const uint64_t fy = static_cast<uint32_t>(p.from_y);
+        if (p.kind == arc::Window::Pointer::Down)
+          alive = call(pressed, {x, y, 0});
+        else if (p.kind == arc::Window::Pointer::Move)
+          alive = call(moved, {x, y, fx, fy, 0});
+        else
+          alive = call(released, {x, y, 0});
+      }
+      if (!alive) break;
+      alive = call(render, {});
+      // The guest thread gives the context up when it returns, so the present
+      // -- and a capture, which is a GL call like any other -- has to take it.
+      std::string err;
+      if (!window.MakeCurrent(&err)) {
+        // Silently skipping the present here is how a frame that rendered
+        // perfectly still reaches nobody.
+        static bool said = false;
+        if (!said) {
+          said = true;
+          printf("  cannot take the GL context to present: %s\n", err.c_str());
+        }
+      } else {
+        ++frames;
+        if (shot && frames == (frame_limit ? frame_limit : 1))
+          SaveFrame(shot, window.width(), window.height());
+        window.Present();
+        window.ReleaseCurrent();
+      }
+      if (frame_limit && frames >= frame_limit) break;
     }
   }
   return 0;

@@ -11,6 +11,7 @@
 // it does on Android.
 #pragma once
 
+#include <deque>
 #include <string>
 
 namespace arc {
@@ -27,9 +28,21 @@ class Window {
   bool Open(const char* title, int width, int height, std::string* err,
             int major = 0, int minor = 0);
 
+  // A touch, in the terms the engine's JNI bridge already speaks. A mouse is
+  // a single finger that is only ever down or up, so `id` is always 0 and a
+  // move with no button held is not reported at all -- Android has no hover.
+  struct Pointer {
+    enum Kind { Down, Move, Up } kind;
+    int x, y;        // where it is now
+    int from_x, from_y;  // where it was, which `pointerMoved` also wants
+  };
+
   // Drains the event queue. Returns false once the user has asked to close,
   // which is the host's cue to call the engine's destroy path.
   bool PumpEvents();
+
+  // One queued touch, oldest first. False when there are none left.
+  bool NextPointer(Pointer* out);
 
   void Present();
   void Close();
@@ -61,6 +74,9 @@ class Window {
   int width_ = 0;
   int height_ = 0;
   bool resized_ = false;
+  std::deque<Pointer> pointers_;
+  int last_x_ = 0, last_y_ = 0;
+  bool down_ = false;
 };
 
 }  // namespace arc

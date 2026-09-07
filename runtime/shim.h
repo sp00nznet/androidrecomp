@@ -55,6 +55,16 @@ void ShimRegisterVarargs();
 // is current, which is why the window is opened before the engine is loaded.
 uint64_t ShimResolveGL(const char* name);
 
+// The GL calls that take a float by value need the guest context to find it,
+// so the dispatcher has to know them as context natives before the first one
+// is reached. Called once, beside ShimRegisterVarargs.
+void ShimRegisterGL();
+
+// zlib, whose z_stream is a different size on this host than in the guest --
+// see shim_zlib.cpp. Bound before the by-name table, which would forward
+// straight through.
+uint64_t ShimResolveZlib(const char* name);
+
 // The Android asset manager, over an ordinary directory. Claimed only once a
 // root is set, so that an unconfigured host leaves the names on the
 // outstanding-import list rather than opening nothing.

@@ -32,6 +32,10 @@ uint64_t arc_jni_vm(void);
 // accessors rather than read out of it, so this only has to be a valid handle.
 uint64_t arc_jni_object(void);
 
+// A jstring holding this text, for an entry point whose Java declaration takes
+// a String -- a path, a locale, a launch argument.
+uint64_t arc_jni_string(const char* text);
+
 // Registers every slot with the native bridge, so an indirect branch into the
 // table is recognised as a call out to the host rather than a missing function.
 void arc_jni_register(void);

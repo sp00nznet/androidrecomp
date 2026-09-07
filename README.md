@@ -3,16 +3,22 @@
 > A toolkit for turning Android games' native engines into native desktop
 > applications. Bring your own APK.
 
-**Status: the shim layer and the lifter are both essentially closed**, on two
-unrelated engines. *The Simpsons: Tapped Out*'s 28 MB Scorpio engine resolves
-**770 of 776 imports**, brings up a window with a live GL context, and runs
-1,521 of its 1,527 static constructors. *Family Guy: The Quest for Stuff*'s
-cocos2d-x engine lifted at **99.0% of functions with no title-specific work at
-all** — the first evidence that the kit generalises — and is now lifted whole:
-**100% of its functions and 100% of its instructions**. It runs all 1,202 of its
-static constructors, completes all three of the JNI entry points Android calls
-on startup, and reaches **the game's own loading screen**. See
-[Milestones](#milestones).
+![The Simpsons: Tapped Out, lifted to C and rendering on Windows](docs/images/tsto-splash.png)
+
+*The Simpsons: Tapped Out*, its ARM64 engine recompiled to C, drawing its own
+splash screen through the desktop GL driver — no emulator, no Android runtime.
+The donut in the corner spins.
+
+**Status: a title renders.** *The Simpsons: Tapped Out*'s 28 MB Scorpio engine
+resolves **770 of 776 imports**, runs **all 1,527** of its static constructors
+with no faults, boots its game state machine, reads its own asset packs, and
+renders and presents frames through a desktop GL context while forwarding mouse
+input as touch. *Family Guy: The Quest for Stuff*'s cocos2d-x engine lifted at
+**99.0% of functions with no title-specific work at all** — the first evidence
+that the kit generalises — and is now lifted whole: **100% of its functions and
+100% of its instructions**. It runs all 1,202 of its static constructors,
+completes all three of the JNI entry points Android calls on startup, and
+reaches **the game's own loading screen**. See [Milestones](#milestones).
 
 ---
 
@@ -53,7 +59,8 @@ have. Licensed MIT; contributions must be your own work.
 | `runtime/shim` | Resolves imports in layers: explicit implementations, ABI-identical name aliases, then the host C runtime looked up by name. Most of libc costs no code per symbol. |
 | `runtime/shim_pthread` | Threads, semaphores and TLS keys on `std::thread` and the C++ primitives. |
 | `runtime/shim_posix` | The locale `*_l` family, time, the stdio entry points MSVC hides inline, wide-character and BSD string helpers. |
-| `runtime/shim_gl` | GL by name through the live driver — desktop GL exports most GLES2 entry points under identical names, so this costs no code per symbol either. |
+| `runtime/shim_gl` | GL by name through the live driver — desktop GL exports most GLES2 entry points under identical names, so most of it costs no code per symbol either. The exceptions are where the *language* or the *calling convention* differs: GLSL ES is translated to GLSL 1.20 on the way through, a compile or link that still fails is reported, and the four entry points taking a float by value read it out of the guest's v0. |
+| `runtime/shim_zlib` | zlib across a struct that is 112 bytes in the guest and 88 here, because `uLong` is 8 bytes on Android arm64 and 4 on Windows. Bound straight through, `inflateInit2_` rejects the size and every packed asset decompresses to nothing. |
 | `runtime/shim_file` | File I/O, directories and `mmap` at Bionic's struct layouts and flag values, which are *not* the host's. |
 | `runtime/shim_sys` | Sockets, `dlopen`/`dlsym`/`dl_iterate_phdr` over the loaded images, process and system. |
 | `runtime/shim_asset` | The Android asset manager over an ordinary directory. An APK carries a title's own files under `assets/` and the engine reads them through this rather than through `open`, so without it a game loads nothing. There is nothing to emulate: the APK is a zip and the host has a filesystem. |
@@ -317,10 +324,28 @@ without needing a window, a JNI environment or a server. Failures are recovered
 rather than fatal — a boot that dies on the first bad constructor tells you one
 thing per run, one that keeps going tells you the shape of what is left.
 
-On this engine, **1,521 of 1,527 constructors run**, and `init` then executes
-far enough to print the engine's own startup banner through the logging shim
-and make 96 JNI calls before it stops. On the second engine — a different
-vendor, a different renderer, no title-specific work — **all 1,202 run**.
+On this engine **all 1,527 constructors run** with no faults, and `init` prints
+the engine's own startup banner through the logging shim. On the second engine —
+a different vendor, a different renderer, no title-specific work — **all 1,202
+run**.
+
+Then drive it the way the Java shell does. `--loop` renders, presents, and
+forwards mouse events to the engine's pointer entry points; `--frames` and
+`--shot` make a run reproducible and leave a picture behind:
+
+```sh
+B=Java_com_bight_android_jni_BGCoreJNIBridge
+./build-lifted/arc_boot --window --loop --assets=work/assets \
+  --entry=${B}_init      --args=obj \
+  --entry=${B}_OGLESInit --args=1280,720 \
+  --entry=${B}_OGLESResize --args=1280,720 \
+  --entry=Java_com_ea_simpsons_ScorpioJNI_init --args=str:/path/to/data \
+  --entry=${B}_resume \
+  libengine.so
+```
+
+The order is Android's, and it is not optional: the GL surface exists before the
+game boots, because the game's boot allocates out of the renderer's heap.
 
 Constructors are also a good measure precisely because a whole boot is not one:
 the failures come back as a histogram, and a histogram is diagnosable. Thirty-six
@@ -397,6 +422,62 @@ branching through `x30`. Treating the pair as no-ops preserves exactly what it
 guarantees on hardware — that `x30` is unchanged from entry to exit — and took
 the library to 99.7%.
 
+## Getting a frame on screen
+
+Every step between "the engine's constructors run" and the picture at the top
+of this file failed *silently*. None raised an error, none crashed, and each one
+produced exactly the frame a game that had not been written yet would produce:
+a black window with a full set of correct-looking draw calls behind it. They are
+worth writing down because the next title will hit the same ones.
+
+**A dependency's `JNI_OnLoad` was never called.** Java calls it once per library
+it loads by name, and libNimble caches the `JavaVM` there. Three of the engine's
+own constructors reach into libNimble, found a null, and faulted. Calling it for
+every mapped image, before the main image's constructors, took the fault count
+from three to zero.
+
+**The game's boot entry point was not in the contract.** The fourteen
+`BGCoreJNIBridge` methods look like the whole host contract, and they are not:
+`ScorpioJNI_init` is what builds the game and installs its first state. Without
+it `OGLESRender` returned after six guest calls, having found no state to
+update. With it, a frame runs eight hundred.
+
+**`writablePath` was answered with the wrong directory.** Android hands a title
+one data directory; it reads its shipped content out of that *and* writes beside
+it. Answering with the parent of the asset root put every pack one directory out
+of reach — which showed up not as a missing file but as a shader whose body was
+empty, a program that linked to nothing, and every uniform location at -1.
+
+**GLSL ES is not desktop GLSL.** `precision mediump float;` is a statement
+desktop GLSL has no grammar for. `runtime/shim_gl` rewrites the version line,
+drops the precision statements, defines the qualifiers away, and — the part that
+matters — *reports* a compile or link that still fails, because nothing else
+will.
+
+**zlib's `z_stream` is a different size on each side.** `uLong` is
+`unsigned long`: 8 bytes on Android arm64, 4 on Windows, so the struct is 112
+bytes in the guest and 88 here with every field after `next_out` at a different
+offset. `inflateInit2_` compares the caller's `stream_size` against its own,
+answers `Z_VERSION_ERROR`, and the engine does not check — so every packed asset
+decompressed to nothing, every image was zero pixels wide, and the window stayed
+black. `runtime/shim_zlib` reads and writes the guest's struct by offset and
+keeps a host `z_stream` in the guest's own opaque `state` field.
+
+**The dispatcher's thunk carries no floating-point arguments.** They live in
+v0-v7 and the twelve-integer thunk cannot place them, so `glTexParameterf` set
+every texture parameter to 0 — not a valid enum, so every set was rejected and
+every texture kept the default `GL_NEAREST_MIPMAP_LINEAR`. With no mip levels
+that leaves a texture *incomplete*, and an incomplete texture samples as black.
+A whole frame of correct draws, in black, with no GL error anywhere. The four GL
+entry points that take a float by value are registered as context natives and
+read v0 themselves.
+
+The tools that found these are in the box and stay there: `--peek` walks a
+pointer chain and hex-dumps what it lands on, `--shot` writes the frame the
+driver actually rasterised, `ARC_TRACE_GUEST` prints every guest function
+entered, and `ARC_GL_FLAT` replaces the fragment shader with a solid colour so
+that "the geometry never arrives" and "the texture is black" stop looking alike.
+
 ## Two execution paths, one host
 
 The host program is needed either way, so it comes first.
@@ -418,8 +499,16 @@ ELF.
       at Bionic's struct layouts rather than forwarded to the host's.
 - [x] **Sockets and dynamic linking.** Including `dl_iterate_phdr` over the
       loaded images, which is how guest C++ exceptions find their `.eh_frame`.
-- [ ] **JNI bridge.** A `JNIEnv` the engine can call back through, and input
+- [x] **JNI bridge.** A `JNIEnv` the engine can call back through, and input
       translation. Per-title glue lives in the port; the reusable parts land here.
+      Each mapped image gets its own `JNI_OnLoad` *before* the engine's
+      constructors run, which is what Android does when Java loads a dependency
+      by name — without it three of Tapped Out's constructors faulted on
+      libNimble's uncached `JavaVM`.
+- [x] **A frame on the screen.** `--loop` renders, presents, and forwards mouse
+      events to `pointerPressed`/`Moved`/`Released` — the part the Java shell
+      does on Android. See [Getting a frame on
+      screen](#getting-a-frame-on-screen).
 - [ ] **Audio.** openal-soft in place of a shipped `libopenal.so`. A shipped
       OpenAL resolves plenty but pulls in `libOpenSLES` — its backend is
       Android's, and it is the one library worth replacing rather than loading.

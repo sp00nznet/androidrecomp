@@ -75,3 +75,13 @@ generated_test/
 boot.out
 boot.err
 *.log
+
+# Local launchers. They hardcode one machine's paths and one title's, and this
+# repository is deliberately game-agnostic.
+build-lifted.bat
+run-*.bat
+
+# Every run redirects a pair of these, and a frame capture writes one of those.
+*.out
+*.err
+*.ppm

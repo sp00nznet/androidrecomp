@@ -123,6 +123,7 @@ struct Entry {
   void* fn;
 };
 
+
 const Entry kExplicit[] = {
     {"__android_log_print", reinterpret_cast<void*>(&AndroidLogPrint)},
     {"__android_log_vprint", reinterpret_cast<void*>(&AndroidLogVPrint)},
@@ -152,16 +153,6 @@ const Entry kExplicit[] = {
     // the pattern OpenAL and the GL loader follow too. Bionic's zlib is stock
     // zlib, so every signature matches.
     {"zlibVersion", reinterpret_cast<void*>(&zlibVersion)},
-    {"deflate", reinterpret_cast<void*>(&deflate)},
-    {"deflateEnd", reinterpret_cast<void*>(&deflateEnd)},
-    {"deflateReset", reinterpret_cast<void*>(&deflateReset)},
-    {"deflateInit_", reinterpret_cast<void*>(&deflateInit_)},
-    {"deflateInit2_", reinterpret_cast<void*>(&deflateInit2_)},
-    {"inflate", reinterpret_cast<void*>(&inflate)},
-    {"inflateEnd", reinterpret_cast<void*>(&inflateEnd)},
-    {"inflateReset", reinterpret_cast<void*>(&inflateReset)},
-    {"inflateInit_", reinterpret_cast<void*>(&inflateInit_)},
-    {"inflateInit2_", reinterpret_cast<void*>(&inflateInit2_)},
     {"crc32", reinterpret_cast<void*>(&crc32)},
 #endif
 };
@@ -218,6 +209,7 @@ uint64_t ShimResolve(const char* name) {
   if (uint64_t a = ShimResolvePthread(name)) return a;
   if (uint64_t a = ShimResolvePosix(name)) return a;
   if (uint64_t a = ShimResolveGL(name)) return a;
+  if (uint64_t a = ShimResolveZlib(name)) return a;
   if (uint64_t a = ShimResolveAsset(name)) return a;
   if (uint64_t a = ShimResolveFile(name)) return a;
   if (uint64_t a = ShimResolveSys(name)) return a;

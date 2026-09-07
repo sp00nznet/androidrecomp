@@ -214,6 +214,40 @@ void FillRandom(void* buf, size_t n) {
   }
 }
 
+// fopen is the other door onto the same problem the flags above solve, and it
+// was left standing open. Bionic has no text mode, so a title writes "r" and
+// means "rb"; the UCRT takes "r" literally, drops every 0x0D that precedes a
+// 0x0A and stops at the first 0x1A. A pack file read that way comes back
+// shorter than it is with holes in the middle -- which does not fail, it
+// decodes to an image 0 pixels wide, uploads cleanly, and draws nothing.
+FILE* Fopen(const char* path, const char* mode) {
+  char binary[8] = {0};
+  size_t n = 0;
+  bool has_b = false;
+  for (const char* m = mode ? mode : "r"; *m && n < sizeof binary - 2; ++m) {
+    if (*m == 'b') has_b = true;
+    binary[n++] = *m;
+  }
+  if (!has_b) binary[n++] = 'b';
+  FILE* f = fopen(path, binary);
+  TraceFile("fopen", path, f != nullptr);
+  return f;
+}
+
+FILE* Freopen(const char* path, const char* mode, FILE* stream) {
+  char binary[8] = {0};
+  size_t n = 0;
+  bool has_b = false;
+  for (const char* m = mode ? mode : "r"; *m && n < sizeof binary - 2; ++m) {
+    if (*m == 'b') has_b = true;
+    binary[n++] = *m;
+  }
+  if (!has_b) binary[n++] = 'b';
+  FILE* f = freopen(path, binary, stream);
+  TraceFile("freopen", path, f != nullptr);
+  return f;
+}
+
 int Open(const char* path, int flags, ...) {
   if (IsRandomDevice(path)) return kRandomFd;
 #if defined(_WIN32)
@@ -497,6 +531,8 @@ struct Entry {
 
 #define E(sym, fn) {sym, reinterpret_cast<void*>(&fn)}
 const Entry kTable[] = {
+    E("fopen", Fopen),        E("fopen64", Fopen),
+    E("freopen", Freopen),    E("freopen64", Freopen),
     E("open", Open),          E("__open_2", Open2),
     E("close", Close),        E("read", Read),
     E("__read_chk", ReadChk), E("write", Write),

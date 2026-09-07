@@ -143,6 +143,15 @@ const Field kFields[] = {
     {"density", 'f', nullptr, 0, 2.0},
     {"densityDPI", 'f', nullptr, 0, 320.0},
     {"mbExternalStorageUnusable", 'z', nullptr, 0, 0},
+    // The API level, which read as zero -- not a version any Android
+    // ever had, so every check against it took a branch meant for no
+    // real device. 21 is the oldest level that can load an arm64
+    // library, which keeps the engine on its most self-contained paths
+    // rather than ones gated behind newer Java APIs nothing here has.
+    {"sdk_int", 'i', nullptr, 21, 0},
+    // Zero already meant "no override"; naming it stops it being
+    // reported as missing and records that the value is deliberate.
+    {"screenOverride", 'i', nullptr, 0, 0},
 };
 constexpr size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
 
@@ -163,15 +172,20 @@ const Field* FieldFromId(uint64_t id) {
 std::mutex g_field_lock;
 std::deque<std::string> g_unknown_fields;
 
-uint64_t FieldIdFor(const char* name) {
+uint64_t FieldIdFor(const char* name, const char* sig) {
   if (name) {
     for (size_t i = 0; i < kFieldCount; ++i)
       if (strcmp(kFields[i].name, name) == 0) return kFieldIdBase + i;
+    // Record the signature with the name. A missing field has to be added back
+    // as some particular type, and the caller already said which -- guessing
+    // between an int, a boolean and a string is a wrong answer two times in
+    // three, and each wrong answer reads as a plausible zero somewhere later.
+    const std::string entry = std::string(name) + "  " + (sig ? sig : "?");
     std::lock_guard<std::mutex> held(g_field_lock);
     bool seen = false;
     for (const std::string& s : g_unknown_fields)
-      if (s == name) { seen = true; break; }
-    if (!seen) g_unknown_fields.push_back(name);
+      if (s == entry) { seen = true; break; }
+    if (!seen) g_unknown_fields.push_back(entry);
   }
   // Unknown field: still a usable id, and it reads as zero of its type.
   return kFieldIdBase + kFieldCount;
@@ -273,9 +287,14 @@ const char* DirectoryForName(const char* name) {
   }
   if (strcmp(name, "getStorageDir") == 0 ||
       strcmp(name, "writablePath") == 0) {
-    // Forward slashes, like the root it is derived from: the guest is Android
-    // code and splits on '/'.
-    storage = std::filesystem::path(root).parent_path().generic_string();
+    // The same directory, not the one above it. Android hands a title one data
+    // directory and it both reads its content out of that and writes beside
+    // it: Tapped Out builds "<writablePath>/core/res-core/UberShader.vsh" and
+    // "<writablePath>/prefbackup" from the same string. Answering with the
+    // parent put every shipped file one directory out of reach, which shows up
+    // not as a missing file but as an empty shader that links to nothing and
+    // draws a black screen behind a full set of draw calls.
+    storage = root;
     return storage.c_str();
   }
   return nullptr;
@@ -385,9 +404,36 @@ void Handle(size_t index, Arm64Ctx* c) {
   if (index < kSlots) ++g_hits[index];
   ++g_total;
 
+  // The three slots that carry a name. A frame that repeats the same
+  // lookups is asking for something it never gets, and the only way to
+  // know which thing is to read the names it asks by.
+  {
+    static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+    if (trace) {
+      const char* what = index == 6 ? "FindClass"
+                       : index == 33 ? "GetMethodID"
+                       : index == 113 ? "GetStaticMethodID"
+                       : index == 167 ? "NewStringUTF"
+                       : index == 94 ? "GetFieldID" : nullptr;
+      if (what) {
+        const uint64_t reg = (index == 6 || index == 167) ? c->x[1] : c->x[2];
+        fprintf(stderr, "[jni] %s %.72s\n", what,
+                reg ? reinterpret_cast<const char*>(reg) : "(null)");
+      }
+      // A call through an id says nothing on its own. The name behind the
+      // id is the whole content of the event: which Java method the engine
+      // reached for, and therefore what it believes it is doing.
+      if (index >= 34 && index <= 143) {
+        if (const char* called = MethodName(c->x[2]))
+          fprintf(stderr, "[jni] %s -> %.72s\n", NameOf(index), called);
+      }
+    }
+  }
+
   switch (index) {
     case 94: {  // GetFieldID(env, class, name, signature)
-      c->x[0] = FieldIdFor(reinterpret_cast<const char*>(c->x[2]));
+      c->x[0] = FieldIdFor(reinterpret_cast<const char*>(c->x[2]),
+                           reinterpret_cast<const char*>(c->x[3]));
       return;
     }
     case 95: {  // GetObjectField(env, object, fieldID)
@@ -620,6 +666,10 @@ void arc_jni_register(void) {
 // directly -- every access goes through a field accessor -- so a block of
 // arena is enough.
 uint64_t arc_jni_object(void) { return Allocate(); }
+
+// A jstring, which here is just its own text: every path that reads one --
+// GetStringUTFChars, getBytes, toString -- hands the handle straight back.
+uint64_t arc_jni_string(const char* text) { return AllocateText(text); }
 
 size_t arc_jni_call_count(void) { return g_total; }
 

@@ -24,6 +24,7 @@ add_library(androidrecomp STATIC
   runtime/shim_asset.cpp
   runtime/shim_file.cpp
   runtime/shim_sys.cpp
+  runtime/shim_zlib.cpp
   runtime/shim_varargs.cpp
   runtime/window.cpp
   runtime/jni_env.cpp

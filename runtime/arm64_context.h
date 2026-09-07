@@ -660,6 +660,7 @@ void arc_frame_note(uint64_t packed);
 #define arc_frame_note(packed) ((void)0)
 #endif
 size_t arc_frame_count(void);
+size_t arc_frame_seen(void);
 uint64_t arc_frame_at(size_t back);  // 0 is the most recent
 void arc_frame_clear(void);
 size_t arc_trace_count(void);

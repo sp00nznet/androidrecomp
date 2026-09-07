@@ -374,6 +374,12 @@ static size_t t_frame_seen;
 
 #if defined(ARC_FRAMES)
 void arc_frame_note(uint64_t packed) {
+  /* The ring holds sixteen frames, which says where a fault happened and
+     nothing about how a call that returned cleanly spent its time. A whole
+     trace answers the other question: which branch a state machine took. */
+  static int trace = -1;
+  if (trace < 0) trace = getenv("ARC_TRACE_GUEST") != NULL;
+  if (trace) fprintf(stderr, "[fn] %llx\n", (unsigned long long)packed);
   t_frames[t_frame_next] = packed;
   t_frame_next = (t_frame_next + 1) % ARC_FRAME_RING;
   ++t_frame_seen;
@@ -383,6 +389,10 @@ void arc_frame_note(uint64_t packed) {
 size_t arc_frame_count(void) {
   return t_frame_seen < ARC_FRAME_RING ? t_frame_seen : ARC_FRAME_RING;
 }
+
+/* The ring saturates, so its count stops telling a busy frame from an idle
+   one once it fills. This is how many calls actually happened. */
+size_t arc_frame_seen(void) { return t_frame_seen; }
 
 uint64_t arc_frame_at(size_t back) {
   if (back >= arc_frame_count()) return 0;
@@ -494,9 +504,25 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
       /* "*" matches everything: a shell cannot easily pass an empty value. */
       if (filter && (!*filter || filter[0] == '*' ||
                      strstr(g_natives[i].name, filter)))
-        fprintf(stderr, "[call] %-12s x0=%#llx x1=%#llx x2=%#llx\n",
-                g_natives[i].name, (unsigned long long)c->x[0],
-                (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
+        {
+          /* A pointer says nothing about which file was wanted. For the
+             calls whose first argument is a path by contract, the name
+             is the whole point of the trace. */
+          static const char* const kPathFirst[] = {
+              "fopen", "fopen64", "open", "open64", "stat", "stat64",
+              "lstat", "access", "opendir", "unlink", "mkdir", 0};
+          int path_first = 0;
+          for (const char* const* q = kPathFirst; *q; ++q)
+            if (strcmp(g_natives[i].name, *q) == 0) { path_first = 1; break; }
+          if (path_first && c->x[0])
+            fprintf(stderr, "[call] %-12s \"%.160s\"\n",
+                    g_natives[i].name, (const char*)(uintptr_t)c->x[0]);
+          else
+            fprintf(stderr, "[call] %-12s x0=%#llx x1=%#llx x2=%#llx\n",
+                    g_natives[i].name, (unsigned long long)c->x[0],
+                    (unsigned long long)c->x[1],
+                    (unsigned long long)c->x[2]);
+        }
     }
     ArcNative12 fn = (ArcNative12)(uintptr_t)target;
     /* Arguments past the eighth sit at the stack pointer, in order. A callee
