@@ -176,9 +176,71 @@ int Bind(int fd, const void* addr, uint32_t len) {
   if (!ToHostSockaddr(addr, len, &host)) return -1;
   return ::bind(fd, host.get(), static_cast<int>(len));
 }
+// Where the game's server actually is.
+//
+// A title built for Android has its server address compiled in and rewritten
+// before installation -- for Tapped Out, by patching the library at an exact
+// byte offset for an exact sha256. That is a workable answer when you are
+// shipping an APK and a hopeless one when you are not: the offset is specific
+// to one build, and a library that has already been patched once no longer
+// contains the string anybody knows how to find.
+//
+// A native host does not have to play that game. ARC_SERVER_REDIRECT names an
+// address, and every outbound connection that is not already loopback goes
+// there instead. The engine keeps believing whatever URL it was built with;
+// the connection lands on the sidecar.
+//
+// Deliberately not a hostname map: the point is to catch connections whose
+// destination we could not name in advance, which is the whole problem.
+//
+// ponytail: it redirects everything, which is too much. A title that checks for
+// internet by fetching a well-known https:// URL has that check sent to the
+// sidecar too, and a plain-HTTP sidecar cannot answer a TLS handshake -- so the
+// check fails and the title never gets as far as asking for its server. Narrow
+// this to the destination port, or to everything except the check, once it is
+// known which is which.
+bool RedirectTarget(sockaddr_in* out) {
+  static bool looked = false;
+  static bool have = false;
+  static sockaddr_in target{};
+  if (!looked) {
+    looked = true;
+    const char* spec = getenv("ARC_SERVER_REDIRECT");
+    if (spec && *spec) {
+      char host[128] = {0};
+      int port = 0;
+      const char* colon = strrchr(spec, ':');
+      const size_t n = colon ? static_cast<size_t>(colon - spec) : strlen(spec);
+      if (n < sizeof host) {
+        memcpy(host, spec, n);
+        port = colon ? atoi(colon + 1) : 80;
+        target.sin_family = AF_INET;
+        target.sin_port = htons(static_cast<unsigned short>(port));
+        if (::inet_pton(AF_INET, host, &target.sin_addr) == 1) have = true;
+      }
+      fprintf(stderr, "[net] redirecting outbound connections to %s\n",
+              have ? spec : "(unparseable, ignored)");
+    }
+  }
+  if (have) *out = target;
+  return have;
+}
+
+// Loopback is left alone: a redirect that also catches the sidecar would send
+// it to itself.
+bool IsLoopback(const sockaddr* sa) {
+  if (!sa || sa->sa_family != AF_INET) return false;
+  const auto* in = reinterpret_cast<const sockaddr_in*>(sa);
+  return (ntohl(in->sin_addr.s_addr) >> 24) == 127;
+}
+
 int Connect(int fd, const void* addr, uint32_t len) {
   HostSockaddr host;
   if (!ToHostSockaddr(addr, len, &host)) return -1;
+  sockaddr_in target{};
+  if (RedirectTarget(&target) && !IsLoopback(host.get()))
+    return ::connect(fd, reinterpret_cast<const sockaddr*>(&target),
+                     static_cast<int>(sizeof target));
   return ::connect(fd, host.get(), static_cast<int>(len));
 }
 int Listen(int fd, int backlog) { return ::listen(fd, backlog); }
