@@ -966,6 +966,12 @@ int main(int argc, char** argv) {
                ExplainAddress(g_fault_address).c_str());
       ReportFrames();
       ReportRegisters(&ctx);
+      // Everything the engine asked the JNI bridge for and could not be
+      // answered, including during the frames -- the report otherwise only
+      // prints per entry point, which is the part of a run where nothing
+      // interesting happens.
+      printf("  JNI:\n");
+      arc_jni_report();
       // The frame loop is where a title actually spends its time, and a --peek
       // that only runs between entry points cannot see any of it. On a fault
       // it is exactly the state you want: whatever the engine was holding when
