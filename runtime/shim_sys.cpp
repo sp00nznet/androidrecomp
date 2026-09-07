@@ -4,11 +4,12 @@
 // same layout on Linux and Windows, so addresses cross unchanged. Two things do
 // not, and both would corrupt silently rather than fail:
 //
-//   * `struct addrinfo`. Linux orders it ai_addrlen, ai_addr, ai_canonname;
-//     Winsock orders it ai_addrlen, ai_canonname, ai_addr -- the two pointers
-//     are swapped, and ai_addrlen is size_t rather than socklen_t. Passing one
-//     through as the other hands the engine a canonical name where it expects
-//     a sockaddr. So results are translated into guest-shaped nodes.
+//   * `struct addrinfo`. Bionic descends from NetBSD and orders it
+//     ai_addrlen, ai_canonname, ai_addr; glibc swaps the two pointers, and
+//     Winsock agrees with Bionic but makes ai_addrlen a size_t. Get the order
+//     wrong and the engine is handed a canonical name where it expects a
+//     sockaddr -- with no error, because the call still returns 0. So results
+//     are translated into guest-shaped nodes.
 //
 //   * `SOL_SOCKET` option numbers. SO_REUSEADDR is 2 on Linux and 4 on
 //     Windows; SO_RCVTIMEO is 20 against 0x1006. Unmapped, a timeout request
@@ -82,15 +83,103 @@ void EnsureWinsock() {}
 int TranslateSockopt(int, int name) { return name; }
 #endif
 
+// Address families and getaddrinfo flags, which Bionic spells with the Linux
+// kernel's numbers and Winsock spells with its own.
+//
+// Only two of these actually differ, and both fail silently rather than
+// loudly. AF_INET6 is 10 on Linux and 23 here, so a socket() for it is an
+// unknown family and a getaddrinfo() hint of it matches nothing. AI_ADDRCONFIG
+// is 0x20 on Linux and 0x400 here, and 0x20 here is not a flag at all --
+// Winsock rejects the whole call with WSAEINVAL, so the name never resolves,
+// the engine never opens a socket, and a title that checks for internet by
+// resolving a well-known host decides it has none.
+//
+// The sockaddr the call returns carries the family too, in its first two
+// bytes, so that is translated on the way back and on the way in.
+constexpr int kGuestAfInet6 = 10;
+
+int FamilyToHost(int family) {
+#if defined(_WIN32)
+  return family == kGuestAfInet6 ? AF_INET6 : family;
+#else
+  return family;
+#endif
+}
+
+int FamilyToGuest(int family) {
+#if defined(_WIN32)
+  return family == AF_INET6 ? kGuestAfInet6 : family;
+#else
+  return family;
+#endif
+}
+
+#if defined(_WIN32)
+// Bionic's AI_* bits, from the Linux headers.
+constexpr int kGuestAiPassive = 0x0001;
+constexpr int kGuestAiCanonname = 0x0002;
+constexpr int kGuestAiNumerichost = 0x0004;
+constexpr int kGuestAiV4mapped = 0x0008;
+constexpr int kGuestAiAll = 0x0010;
+constexpr int kGuestAiAddrconfig = 0x0020;
+constexpr int kGuestAiNumericserv = 0x0400;
+#endif
+
+int AiFlagsToHost(int flags) {
+#if defined(_WIN32)
+  int out = 0;
+  if (flags & kGuestAiPassive) out |= AI_PASSIVE;
+  if (flags & kGuestAiCanonname) out |= AI_CANONNAME;
+  if (flags & kGuestAiNumerichost) out |= AI_NUMERICHOST;
+  if (flags & kGuestAiV4mapped) out |= AI_V4MAPPED;
+  if (flags & kGuestAiAll) out |= AI_ALL;
+  if (flags & kGuestAiAddrconfig) out |= AI_ADDRCONFIG;
+  if (flags & kGuestAiNumericserv) out |= AI_NUMERICSERV;
+  return out;
+#else
+  return flags;
+#endif
+}
+
+// A sockaddr the guest handed us, with its family in the host's terms. The
+// copy is small and bounded; the alternative is writing into the guest's own
+// structure, which it may well reuse.
+struct HostSockaddr {
+  alignas(8) unsigned char bytes[128];
+  const sockaddr* get() const { return reinterpret_cast<const sockaddr*>(bytes); }
+};
+
+bool ToHostSockaddr(const void* addr, uint32_t len, HostSockaddr* out) {
+  if (!addr || len < sizeof(uint16_t) || len > sizeof out->bytes) return false;
+  memcpy(out->bytes, addr, len);
+  uint16_t family = 0;
+  memcpy(&family, out->bytes, sizeof family);
+  family = static_cast<uint16_t>(FamilyToHost(family));
+  memcpy(out->bytes, &family, sizeof family);
+  return true;
+}
+
+void SockaddrToGuest(void* addr, uint32_t len) {
+  if (!addr || len < sizeof(uint16_t)) return;
+  uint16_t family = 0;
+  memcpy(&family, addr, sizeof family);
+  family = static_cast<uint16_t>(FamilyToGuest(family));
+  memcpy(addr, &family, sizeof family);
+}
+
 int Socket(int domain, int type, int protocol) {
   EnsureWinsock();
-  return static_cast<int>(::socket(domain, type, protocol));
+  return static_cast<int>(::socket(FamilyToHost(domain), type, protocol));
 }
 int Bind(int fd, const void* addr, uint32_t len) {
-  return ::bind(fd, static_cast<const sockaddr*>(addr), len);
+  HostSockaddr host;
+  if (!ToHostSockaddr(addr, len, &host)) return -1;
+  return ::bind(fd, host.get(), static_cast<int>(len));
 }
 int Connect(int fd, const void* addr, uint32_t len) {
-  return ::connect(fd, static_cast<const sockaddr*>(addr), len);
+  HostSockaddr host;
+  if (!ToHostSockaddr(addr, len, &host)) return -1;
+  return ::connect(fd, host.get(), static_cast<int>(len));
 }
 int Listen(int fd, int backlog) { return ::listen(fd, backlog); }
 int Accept(int fd, void* addr, uint32_t* len) {
@@ -148,15 +237,23 @@ int InetPton(int af, const char* src, void* dst) {
   return ::inet_pton(af, src, dst);
 }
 
-// Bionic's addrinfo, in Bionic's order.
+// Bionic's addrinfo, in Bionic's order -- which is BSD's, not glibc's.
+//
+// This is the field order the file's own header comment got backwards. glibc
+// puts ai_addr before ai_canonname; Bionic descends from NetBSD and puts
+// ai_canonname first, which happens to be Winsock's order too. Built the glibc
+// way, every resolution "succeeded" and handed the engine a canonical name
+// where it expected a sockaddr -- so it never opened a socket, never
+// connected, and decided it had no internet. There is no error anywhere in
+// that sequence: the call returns 0 and the answer is furniture.
 struct GuestAddrinfo {
   int32_t ai_flags;
   int32_t ai_family;
   int32_t ai_socktype;
   int32_t ai_protocol;
   uint32_t ai_addrlen;
-  sockaddr* ai_addr;
   char* ai_canonname;
+  sockaddr* ai_addr;
   GuestAddrinfo* ai_next;
 };
 
@@ -179,8 +276,8 @@ int Getaddrinfo(const char* node, const char* service, const void* hints_in,
   const addrinfo* hints_ptr = nullptr;
   if (hints_in) {
     const auto* g = static_cast<const GuestAddrinfo*>(hints_in);
-    hints.ai_flags = g->ai_flags;
-    hints.ai_family = g->ai_family;
+    hints.ai_flags = AiFlagsToHost(g->ai_flags);
+    hints.ai_family = FamilyToHost(g->ai_family);
     hints.ai_socktype = g->ai_socktype;
     hints.ai_protocol = g->ai_protocol;
     hints_ptr = &hints;
@@ -188,20 +285,32 @@ int Getaddrinfo(const char* node, const char* service, const void* hints_in,
 
   addrinfo* host = nullptr;
   int rc = ::getaddrinfo(node, service, hints_ptr, &host);
-  if (rc != 0) return rc;
+  if (rc != 0) {
+    // A name that will not resolve is the end of the road for whatever asked,
+    // and the caller usually reports it as its own failure -- "no internet",
+    // "cannot reach the server" -- with nothing saying which name or why.
+    fprintf(stderr, "[net] getaddrinfo(%s, %s) failed: %d (flags=%#x fam=%d)\n",
+            node ? node : "(null)", service ? service : "(null)", rc,
+            hints_ptr ? hints_ptr->ai_flags : 0,
+            hints_ptr ? hints_ptr->ai_family : -1);
+    return rc;
+  }
 
   GuestAddrinfo* head = nullptr;
   GuestAddrinfo** tail = &head;
   for (addrinfo* h = host; h; h = h->ai_next) {
     auto* g = static_cast<GuestAddrinfo*>(calloc(1, sizeof(GuestAddrinfo)));
     g->ai_flags = h->ai_flags;
-    g->ai_family = h->ai_family;
+    g->ai_family = FamilyToGuest(h->ai_family);
     g->ai_socktype = h->ai_socktype;
     g->ai_protocol = h->ai_protocol;
     g->ai_addrlen = static_cast<uint32_t>(h->ai_addrlen);
     if (h->ai_addr && h->ai_addrlen) {
       g->ai_addr = static_cast<sockaddr*>(malloc(h->ai_addrlen));
       memcpy(g->ai_addr, h->ai_addr, h->ai_addrlen);
+      // The family lives in the sockaddr as well as in the addrinfo, and the
+      // guest reads both.
+      SockaddrToGuest(g->ai_addr, static_cast<uint32_t>(h->ai_addrlen));
     }
     if (h->ai_canonname) {
 #if defined(_WIN32)

@@ -350,6 +350,12 @@ const MethodFlag kMethodFlags[] = {
     // caller treats that as a fatal setup error. The filesystem shim creates
     // what the engine actually opens.
     {"mkdir", true},
+    // Reachability is a question the engine asks Java, not the network: it
+    // never opens a socket to find out. Answered false, it never tries at all
+    // -- it goes straight to its error state and offers to retry, which is a
+    // correct-looking screen produced without a single connect(). The host has
+    // a network; say so, and let the connection succeed or fail on its own.
+    {"hasConnectivity", true},
 };
 
 // Tri-state on purpose: "not in the table" has to stay distinguishable from

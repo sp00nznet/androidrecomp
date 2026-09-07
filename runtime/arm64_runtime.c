@@ -510,7 +510,11 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
              is the whole point of the trace. */
           static const char* const kPathFirst[] = {
               "fopen", "fopen64", "open", "open64", "stat", "stat64",
-              "lstat", "access", "opendir", "unlink", "mkdir", 0};
+              "lstat", "access", "opendir", "unlink", "mkdir",
+              /* Not a path, but the same argument: a name, and the whole
+                 content of the event. Which host a title resolves is what
+                 says where it thinks its server is. */
+              "getaddrinfo", "gethostbyname", 0};
           int path_first = 0;
           for (const char* const* q = kPathFirst; *q; ++q)
             if (strcmp(g_natives[i].name, *q) == 0) { path_first = 1; break; }
