@@ -319,6 +319,27 @@ int64_t NumberForMethod(uint64_t id, bool* answered) {
   return 0;
 }
 
+// Preferences, which are read by key rather than by method: getSharedPreference
+// is one Java method with forty-odd different questions behind it, so the
+// answer has to come from the argument.
+//
+// The one that matters is where the game's own server lives. On Android that
+// is patched into the library by hash and offset before installation; here it
+// is a host setting, which is the point of doing this natively at all. Set
+// ARC_SERVER to the base URL -- "http://127.0.0.1:9000" for a loopback sidecar
+// -- and the engine asks that server for its directory instead of nothing.
+const char* PreferenceValue(const char* key) {
+  if (!key || !*key) return nullptr;
+  static const char* const kServerKeys[] = {"MayhemServerURL", "MayhemURL",
+                                            "ServerURL", "DirectorURL"};
+  for (const char* k : kServerKeys)
+    if (strcmp(k, key) == 0) {
+      static const char* v = getenv("ARC_SERVER");
+      return v;
+    }
+  return nullptr;
+}
+
 // The engine's own log, which on Android goes to Java rather than to
 // __android_log. These are the names it writes through; anything else that
 // returns void stays quiet.
@@ -706,6 +727,18 @@ void Handle(size_t index, Arm64Ctx* c) {
                   self ? self : "");
         c->x[0] = AllocateText(self);
         return;
+      }
+      // Read by key: the method name says only that a preference was wanted.
+      if (name && (strcmp(name, "getSharedPreference") == 0 ||
+                   strcmp(name, "getStringPreference") == 0)) {
+        NoteCalled(name);
+        if (const uint64_t key = FirstOwnedArg(c)) {
+          if (const char* v =
+                  PreferenceValue(reinterpret_cast<const char*>(key))) {
+            c->x[0] = AllocateText(v);
+            return;
+          }
+        }
       }
       // A *static* helper that turns something into a String -- the engine
       // fills a byte array and hands it to one of these. The text is in an

@@ -226,9 +226,47 @@ int Gethostname(char* name, uint64_t len) {
   EnsureWinsock();
   return ::gethostname(name, static_cast<int>(len));
 }
+#if defined(_WIN32)
+// A Linux fd_set is a bitmask indexed by descriptor; Winsock's is a count and
+// an array. Translated both ways, because a caller reads back which of its
+// descriptors are ready.
+void GuestFdsToHost(const void* guest, int nfds, fd_set* host) {
+  FD_ZERO(host);
+  if (!guest) return;
+  const auto* bits = static_cast<const uint64_t*>(guest);
+  for (int fd = 0; fd < nfds && fd < 1024; ++fd)
+    if (bits[fd / 64] & (uint64_t{1} << (fd % 64)))
+      FD_SET(static_cast<SOCKET>(fd), host);
+}
+
+void HostFdsToGuest(const fd_set* host, void* guest, int nfds) {
+  if (!guest) return;
+  auto* bits = static_cast<uint64_t*>(guest);
+  for (int i = 0; i < (nfds + 63) / 64 && i < 16; ++i) bits[i] = 0;
+  for (u_int i = 0; i < host->fd_count; ++i) {
+    const uint64_t fd = static_cast<uint64_t>(host->fd_array[i]);
+    if (fd < 1024) bits[fd / 64] |= uint64_t{1} << (fd % 64);
+  }
+}
+#endif
+
 int Select(int n, void* r, void* w, void* e, void* timeout) {
+#if defined(_WIN32)
+  EnsureWinsock();
+  fd_set hr, hw, he;
+  GuestFdsToHost(r, n, &hr);
+  GuestFdsToHost(w, n, &hw);
+  GuestFdsToHost(e, n, &he);
+  const int rc = ::select(n, r ? &hr : nullptr, w ? &hw : nullptr,
+                          e ? &he : nullptr, static_cast<timeval*>(timeout));
+  if (r) HostFdsToGuest(&hr, r, n);
+  if (w) HostFdsToGuest(&hw, w, n);
+  if (e) HostFdsToGuest(&he, e, n);
+  return rc;
+#else
   return ::select(n, static_cast<fd_set*>(r), static_cast<fd_set*>(w),
                   static_cast<fd_set*>(e), static_cast<timeval*>(timeout));
+#endif
 }
 const char* InetNtop(int af, const void* src, char* dst, uint32_t size) {
   return ::inet_ntop(af, src, dst, size);
@@ -340,7 +378,63 @@ void* Gethostbyname(const char*) { return nullptr; }
 unsigned IfNametoindex(const char*) { return 0; }
 int Socketpair(int, int, int, int*) { return -1; }
 int64_t Sendfile(int, int, void*, uint64_t) { return -1; }
-int Poll(void*, unsigned long, int) { return 0; }
+// poll() and select(), which decide when a socket is ready and therefore
+// whether anything on the network ever finishes.
+//
+// Neither could be forwarded. A `struct pollfd` is 8 bytes on Linux -- int fd,
+// short events, short revents -- and 16 on Winsock, where the descriptor is a
+// SOCKET; and the event bits share no values at all (Linux POLLIN is 0x001,
+// Winsock's is 0x300). A Linux `fd_set` is a 1024-bit mask indexed by
+// descriptor; Winsock's is a count followed by an array of descriptors.
+//
+// Poll was a stub returning 0, which says "nothing is ready" forever. That is
+// not an error anyone reports: the engine's HTTP client connects, waits to be
+// told the socket is readable, is never told, times out, and retries -- so a
+// title sits on its loading screen looking like it has no network, having in
+// fact opened the connection perfectly well.
+constexpr short kGuestPollIn = 0x001;
+constexpr short kGuestPollPri = 0x002;
+constexpr short kGuestPollOut = 0x004;
+constexpr short kGuestPollErr = 0x008;
+constexpr short kGuestPollHup = 0x010;
+constexpr short kGuestPollNval = 0x020;
+
+struct GuestPollfd {
+  int32_t fd;
+  int16_t events;
+  int16_t revents;
+};
+
+int Poll(void* fds_in, unsigned long nfds, int timeout) {
+  auto* fds = static_cast<GuestPollfd*>(fds_in);
+  if (!fds || nfds == 0) return 0;
+#if defined(_WIN32)
+  EnsureWinsock();
+  std::vector<WSAPOLLFD> host(nfds);
+  for (unsigned long i = 0; i < nfds; ++i) {
+    host[i].fd = static_cast<SOCKET>(fds[i].fd);
+    short e = 0;
+    if (fds[i].events & kGuestPollIn) e |= POLLRDNORM;
+    if (fds[i].events & kGuestPollPri) e |= POLLRDBAND;
+    if (fds[i].events & kGuestPollOut) e |= POLLWRNORM;
+    host[i].events = e;
+    host[i].revents = 0;
+  }
+  const int rc = ::WSAPoll(host.data(), static_cast<ULONG>(nfds), timeout);
+  for (unsigned long i = 0; i < nfds; ++i) {
+    short r = 0;
+    if (host[i].revents & (POLLRDNORM | POLLRDBAND)) r |= kGuestPollIn;
+    if (host[i].revents & POLLWRNORM) r |= kGuestPollOut;
+    if (host[i].revents & POLLERR) r |= kGuestPollErr;
+    if (host[i].revents & POLLHUP) r |= kGuestPollHup;
+    if (host[i].revents & POLLNVAL) r |= kGuestPollNval;
+    fds[i].revents = r;
+  }
+  return rc;
+#else
+  return ::poll(reinterpret_cast<struct pollfd*>(fds), nfds, timeout);
+#endif
+}
 int Ioctl(int, unsigned long, ...) { return 0; }
 
 // --- dynamic linking -------------------------------------------------------

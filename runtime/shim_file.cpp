@@ -26,6 +26,7 @@
 #include "shim.h"
 
 #if defined(_WIN32)
+#include <winsock2.h>
 #include <windows.h>
 #include <direct.h>
 #include <fcntl.h>
@@ -260,9 +261,32 @@ int Open(const char* path, int flags, ...) {
 }
 int Open2(const char* path, int flags) { return Open(path, flags); }
 
+#if defined(_WIN32)
+// On Linux a socket is a file descriptor and read()/write()/close() work on it.
+// On Windows a SOCKET is a different namespace entirely, and the CRT's _read
+// on one fails with EBADF -- so an HTTP client that opens a connection, sends
+// its request and reads the reply gets a connection it can never read from.
+// Nothing reports that as a network error; the caller just times out.
+//
+// Asking Winsock for the socket type is the cheap way to tell the two apart:
+// it answers for a socket and fails for anything else.
+//
+// ponytail: this assumes a CRT descriptor is never also a valid SOCKET value.
+// They are separate namespaces and small descriptors are not socket handles in
+// practice, but the two could collide. Keep a set of the descriptors the socket
+// shim handed out if that ever bites.
+bool IsSocket(int fd) {
+  int type = 0;
+  int len = sizeof type;
+  return ::getsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_TYPE,
+                      reinterpret_cast<char*>(&type), &len) == 0;
+}
+#endif
+
 int Close(int fd) {
   if (fd == kRandomFd) return 0;
 #if defined(_WIN32)
+  if (IsSocket(fd)) return ::closesocket(static_cast<SOCKET>(fd));
   return _close(fd);
 #else
   return ::close(fd);
@@ -274,6 +298,9 @@ int64_t Read(int fd, void* buf, uint64_t n) {
     return static_cast<int64_t>(n);
   }
 #if defined(_WIN32)
+  if (IsSocket(fd))
+    return ::recv(static_cast<SOCKET>(fd), static_cast<char*>(buf),
+                  static_cast<int>(n), 0);
   return _read(fd, buf, static_cast<unsigned>(n));
 #else
   return ::read(fd, buf, n);
@@ -284,6 +311,9 @@ int64_t ReadChk(int fd, void* buf, uint64_t n, uint64_t) {
 }
 int64_t Write(int fd, const void* buf, uint64_t n) {
 #if defined(_WIN32)
+  if (IsSocket(fd))
+    return ::send(static_cast<SOCKET>(fd), static_cast<const char*>(buf),
+                  static_cast<int>(n), 0);
   return _write(fd, buf, static_cast<unsigned>(n));
 #else
   return ::write(fd, buf, n);
