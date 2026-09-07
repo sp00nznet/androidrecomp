@@ -287,6 +287,38 @@ uint64_t FirstOwnedArg(Arm64Ctx* c) {
   return 0;
 }
 
+// What a method returning an integer should answer with. Zero is the default
+// and is usually harmless; these are the ones where it is a specific, wrong
+// claim about the device.
+struct MethodNumber {
+  const char* name;
+  int64_t value;
+};
+
+const MethodNumber kMethodNumbers[] = {
+    // Free disk space, in bytes. The engine is about to download content, so
+    // it checks for room before it starts loading and quietly refuses below
+    // about 40 MB. Zero means "the disk is full": the loading manager goes to
+    // a phase that never initialises the font system, every font cache lookup
+    // afterwards answers null, and the first one whose caller does not check
+    // takes the process down. Four gigabytes free is an ordinary answer.
+    {"getFreeDiskSpace", 4LL << 30},
+};
+
+int64_t NumberForMethod(uint64_t id, bool* answered) {
+  *answered = false;
+  const char* name = MethodName(id);
+  if (!name) return 0;
+  NoteCalled(name);
+  for (const MethodNumber& m : kMethodNumbers)
+    if (strcmp(m.name, name) == 0) {
+      *answered = true;
+      return m.value;
+    }
+  NoteUnanswered(name);
+  return 0;
+}
+
 // The engine's own log, which on Android goes to Java rather than to
 // __android_log. These are the names it writes through; anything else that
 // returns void stays quiet.
@@ -687,6 +719,24 @@ void Handle(size_t index, Arm64Ctx* c) {
       return;
     }
 
+    // A method returning an integer, in every spelling JNI has for it: byte,
+    // char, short, int and long, called on an object or on a class, through
+    // varargs, a va_list or an array. The width does not change the answer.
+    case 40: case 41: case 42:     // CallByteMethod{,V,A}
+    case 43: case 44: case 45:     // CallCharMethod
+    case 46: case 47: case 48:     // CallShortMethod
+    case 49: case 50: case 51:     // CallIntMethod
+    case 52: case 53: case 54:     // CallLongMethod
+    case 120: case 121: case 122:  // CallStaticByteMethod
+    case 123: case 124: case 125:  // CallStaticCharMethod
+    case 126: case 127: case 128:  // CallStaticShortMethod
+    case 129: case 130: case 131:  // CallStaticIntMethod
+    case 132: case 133: case 134: {  // CallStaticLongMethod
+      bool answered = false;
+      c->x[0] = static_cast<uint64_t>(NumberForMethod(c->x[2], &answered));
+      return;
+    }
+
     // A method returning nothing. Almost all of these are genuinely ignorable
     // -- telemetry, analytics, a crash-reporter key -- but one is not: the
     // engine writes its *own* diagnostic log through Java rather than through
@@ -718,9 +768,6 @@ void Handle(size_t index, Arm64Ctx* c) {
     case 37:     // CallBooleanMethod
     case 38:     // CallBooleanMethodV
     case 39:     // CallBooleanMethodA
-    case 40:     // CallNonvirtualBooleanMethod
-    case 41:     // CallNonvirtualBooleanMethodV
-    case 42:     // CallNonvirtualBooleanMethodA
     case 117:    // CallStaticBooleanMethod
     case 118:    // CallStaticBooleanMethodV
     case 119: {  // CallStaticBooleanMethodA
