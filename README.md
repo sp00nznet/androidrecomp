@@ -3,22 +3,21 @@
 > A toolkit for turning Android games' native engines into native desktop
 > applications. Bring your own APK.
 
-![The Simpsons: Tapped Out, lifted to C and rendering on Windows](docs/images/tsto-splash.png)
-
-*The Simpsons: Tapped Out*, its ARM64 engine recompiled to C, drawing its own
-splash screen through the desktop GL driver — no emulator, no Android runtime.
-The donut in the corner spins.
-
 **Status: a title renders.** *The Simpsons: Tapped Out*'s 28 MB Scorpio engine
 resolves **770 of 776 imports**, runs **all 1,527** of its static constructors
 with no faults, boots its game state machine, reads its own asset packs, and
 renders and presents frames through a desktop GL context while forwarding mouse
-input as touch. *Family Guy: The Quest for Stuff*'s cocos2d-x engine lifted at
-**99.0% of functions with no title-specific work at all** — the first evidence
-that the kit generalises — and is now lifted whole: **100% of its functions and
-100% of its instructions**. It runs all 1,202 of its static constructors,
-completes all three of the JNI entry points Android calls on startup, and
-reaches **the game's own loading screen**. See [Milestones](#milestones).
+input as touch — its own splash screen, drawn by lifted ARM64 code with no
+emulator and no Android runtime. There is a screenshot in
+[tstorecomp](https://github.com/sp00nznet/tstorecomp), which is where anything
+title-specific belongs.
+
+*Family Guy: The Quest for Stuff*'s cocos2d-x engine lifted at **99.0% of
+functions with no title-specific work at all** — the first evidence that the kit
+generalises — and is now lifted whole: **100% of its functions and 100% of its
+instructions**. It runs all 1,202 of its static constructors, completes all
+three of the JNI entry points Android calls on startup, and reaches **the game's
+own loading screen**. See [Milestones](#milestones).
 
 ---
 
@@ -424,10 +423,10 @@ the library to 99.7%.
 
 ## Getting a frame on screen
 
-Every step between "the engine's constructors run" and the picture at the top
-of this file failed *silently*. None raised an error, none crashed, and each one
-produced exactly the frame a game that had not been written yet would produce:
-a black window with a full set of correct-looking draw calls behind it. They are
+Every step between "the engine's constructors run" and a title drawing its own
+splash screen failed *silently*. None raised an error, none crashed, and each
+produced exactly the frame a game that had not been written yet would produce: a
+black window with a full set of correct-looking draw calls behind it. They are
 worth writing down because the next title will hit the same ones.
 
 **A dependency's `JNI_OnLoad` was never called.** Java calls it once per library
