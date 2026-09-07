@@ -6,9 +6,10 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
-#include <string>
 #include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -269,6 +270,74 @@ const MethodText kMethodText[] = {
     {"getStringPreference", ""},
 };
 
+// The first argument in a guest va_list that is one of our own handles.
+//
+// Which position a jstring or a byte[] occupies depends on the Java signature,
+// which we do not have -- but a handle we made is recognisable, and no other
+// argument will be. So "the first one that is ours" is both the answer and the
+// only question we can actually ask.
+uint64_t FirstOwnedArg(Arm64Ctx* c) {
+  if (!c->x[3]) return 0;
+  std::vector<unsigned char> cursor(arc::ShimVaListSize());
+  memcpy(cursor.data(), reinterpret_cast<const void*>(c->x[3]), cursor.size());
+  for (int i = 0; i < 6; ++i) {
+    const uint64_t v = arc::ShimVaNextInt(cursor.data());
+    if (v && arc_jni_owns(v)) return v;
+  }
+  return 0;
+}
+
+// The engine's own log, which on Android goes to Java rather than to
+// __android_log. These are the names it writes through; anything else that
+// returns void stays quiet.
+bool IsLogMethod(const char* name) {
+  static const char* const kNames[] = {"Log",      "log",     "LogError",
+                                       "logError", "LogInfo", "printLog",
+                                       "writeWithTitle", "LogToFile"};
+  for (const char* n : kNames)
+    if (strcmp(n, name) == 0) return true;
+  return false;
+}
+
+// What a method returning a boolean should answer with. False is the safe
+// default -- "no notification launched us", "no other music is playing" -- and
+// it is what an unlisted name gets. These are the ones where false is not
+// merely conservative but wrong.
+struct MethodFlag {
+  const char* name;
+  bool value;
+};
+
+const MethodFlag kMethodFlags[] = {
+    // The loading screen polls this three times a frame and will not advance
+    // until it is true. On Android a Java worker thread does the loading and
+    // reports when it is finished; there is no Java here and nothing is
+    // pending, so it is finished. Answering false is an infinite wait that
+    // looks exactly like a game sitting on its splash screen.
+    {"isThreadComplete", true},
+    // Java being asked to create a directory. False means it failed, and the
+    // caller treats that as a fatal setup error. The filesystem shim creates
+    // what the engine actually opens.
+    {"mkdir", true},
+};
+
+// Tri-state on purpose: "not in the table" has to stay distinguishable from
+// "in the table, answering false", or every unanswered call would be recorded
+// as a deliberate no.
+bool FlagForMethod(uint64_t id, bool* answered) {
+  *answered = false;
+  const char* name = MethodName(id);
+  if (!name) return false;
+  NoteCalled(name);
+  for (const MethodFlag& m : kMethodFlags)
+    if (strcmp(m.name, name) == 0) {
+      *answered = true;
+      return m.value;
+    }
+  NoteUnanswered(name);
+  return false;
+}
+
 // The two the engine turns into directories, which have to be real paths on
 // this machine rather than anything invented. They come from the asset root
 // the host was given: the bundle is that directory, and what the engine writes
@@ -345,7 +414,12 @@ constexpr SlotInfo kKnown[] = {
     {110, "SetLongField", false},       {111, "SetFloatField", false},
     {112, "SetDoubleField", false},     {113, "GetStaticMethodID", true},
     {115, "CallStaticObjectMethodV", true},
+    {37, "CallBooleanMethod", false},
+    {38, "CallBooleanMethodV", false},
+    {39, "CallBooleanMethodA", false},
+    {117, "CallStaticBooleanMethod", false},
     {118, "CallStaticBooleanMethodV", false},
+    {119, "CallStaticBooleanMethodA", false},
     {130, "CallStaticIntMethodV", false},
     {142, "CallStaticVoidMethodV", false},
     {144, "GetStaticFieldID", true},    {145, "GetStaticObjectField", true},
@@ -546,8 +620,63 @@ void Handle(size_t index, Arm64Ctx* c) {
         c->x[0] = AllocateText(self);
         return;
       }
+      // A *static* helper that turns something into a String -- the engine
+      // fills a byte array and hands it to one of these. The text is in an
+      // argument rather than in the object, and passing the handle straight
+      // back is what a jstring means here anyway.
+      if (name && (strcmp(name, "CreateNewStringUTFSafe") == 0 ||
+                   strcmp(name, "createNewStringUTFSafe") == 0 ||
+                   strcmp(name, "newStringUTF") == 0)) {
+        NoteCalled(name);
+        if (const uint64_t arg = FirstOwnedArg(c)) {
+          c->x[0] = arg;
+          return;
+        }
+      }
       const char* text = TextForMethod(c->x[2]);
       c->x[0] = text ? AllocateText(text) : Allocate();
+      return;
+    }
+
+    // A method returning nothing. Almost all of these are genuinely ignorable
+    // -- telemetry, analytics, a crash-reporter key -- but one is not: the
+    // engine writes its *own* diagnostic log through Java rather than through
+    // __android_log, so dropping these silently throws away the running
+    // commentary a port most needs. Anything log-shaped is printed.
+    case 61:     // CallVoidMethod
+    case 62:     // CallVoidMethodV
+    case 63:     // CallVoidMethodA
+    case 141:    // CallStaticVoidMethod
+    case 142:    // CallStaticVoidMethodV
+    case 143: {  // CallStaticVoidMethodA
+      const char* name = MethodName(c->x[2]);
+      if (name) NoteCalled(name);
+      // Only the va_list forms carry arguments we can walk; the varargs forms
+      // spread theirs across registers we were not handed.
+      const bool va = index == 62 || index == 142;
+      if (name && va && IsLogMethod(name)) {
+        if (const uint64_t msg = FirstOwnedArg(c))
+          fprintf(stderr, "[game] %.400s\n",
+                  reinterpret_cast<const char*>(msg));
+      }
+      c->x[0] = 0;
+      return;
+    }
+
+    // A method returning a boolean, called on an object or on a class. Six
+    // slots each because JNI spells every call three ways -- varargs, va_list
+    // and array -- and the answer does not depend on which.
+    case 37:     // CallBooleanMethod
+    case 38:     // CallBooleanMethodV
+    case 39:     // CallBooleanMethodA
+    case 40:     // CallNonvirtualBooleanMethod
+    case 41:     // CallNonvirtualBooleanMethodV
+    case 42:     // CallNonvirtualBooleanMethodA
+    case 117:    // CallStaticBooleanMethod
+    case 118:    // CallStaticBooleanMethodV
+    case 119: {  // CallStaticBooleanMethodA
+      bool answered = false;
+      c->x[0] = FlagForMethod(c->x[2], &answered) ? 1 : 0;
       return;
     }
 
@@ -570,6 +699,21 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
+    case 208: {  // SetByteArrayRegion(env, array, start, len, buf)
+      // The engine builds a Java string by filling a byte array and handing it
+      // to a helper. Dropping this leaves the array empty, the string empty,
+      // and the engine's own log a column of blank lines.
+      auto* dst = reinterpret_cast<char*>(c->x[1]);
+      const auto* src = reinterpret_cast<const char*>(c->x[4]);
+      const uint64_t start = c->x[2], len = c->x[3];
+      if (dst && src && arc_jni_owns(c->x[1]) && start + len < kBlock) {
+        memcpy(dst + start, src, static_cast<size_t>(len));
+        // NUL-terminated, because everything downstream reads it as text.
+        dst[start + len] = '\0';
+      }
+      return;
+    }
+
     case 191:    // ReleaseBooleanArrayElements
     case 192:    // ReleaseByteArrayElements
     case 223:    // ReleasePrimitiveArrayCritical

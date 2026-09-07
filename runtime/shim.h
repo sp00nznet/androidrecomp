@@ -51,6 +51,13 @@ uint64_t ShimResolveVarargs(const char* name);
 // Announces the variadic handlers to the dispatcher. Call once at startup.
 void ShimRegisterVarargs();
 
+// One integer-class argument out of a guest va_list, advancing the caller's
+// own cursor. Copy the guest's va_list into a buffer of ShimVaListSize() bytes
+// and walk that: a Java method called through Call*MethodV receives its
+// arguments this way.
+uint64_t ShimVaNextInt(void* cursor);
+size_t ShimVaListSize();
+
 // GL entry points, asked of the GL driver by name. Answers only once a context
 // is current, which is why the window is opened before the engine is loaded.
 uint64_t ShimResolveGL(const char* name);

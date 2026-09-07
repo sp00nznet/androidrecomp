@@ -407,6 +407,20 @@ const Entry kTable[] = {
 
 }  // namespace
 
+// One integer-class argument out of a guest va_list, for callers outside this
+// file. The JNI bridge needs it: a Java method invoked through Call*MethodV is
+// handed its arguments this way, and the engine's own log goes through one of
+// them -- so without this, the log the engine writes about itself is dropped
+// on the floor.
+//
+// `cursor` is the caller's own copy of the va_list, advanced in place, so a
+// caller can walk several arguments without disturbing the guest's.
+uint64_t ShimVaNextInt(void* cursor) {
+  return NextInt(static_cast<GuestVaList*>(cursor));
+}
+
+size_t ShimVaListSize() { return sizeof(GuestVaList); }
+
 uint64_t ShimResolveVarargs(const char* name) {
   for (const Entry& e : kTable)
     if (strcmp(e.name, name) == 0) return reinterpret_cast<uint64_t>(e.fn);
