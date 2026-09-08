@@ -300,6 +300,76 @@ struct GuestThreadStart {
   Thread* slot;
 };
 
+#if defined(_WIN32)
+// A guest thread had no fault handling at all. An access violation on one took
+// the whole process down with no report attached to it, which is the least
+// useful way a port can fail -- and it is where a title does its real work: the
+// HTTP client, the asset decoder and the audio mixer all run here, not on the
+// thread the entry points were called from. A fault reported badly on the main
+// thread was still reported; a fault here was only ever an exit code.
+//
+// The thread does not survive it -- there is nothing sensible to resume -- but
+// the process does, so the title reports the failure in its own terms and the
+// run can still be read to the end.
+int GuestThreadFault(EXCEPTION_POINTERS* ep, const Arm64Ctx* c, unsigned id) {
+  const unsigned long code = ep->ExceptionRecord->ExceptionCode;
+  unsigned long long at = 0;
+  const char* kind = "";
+  if (ep->ExceptionRecord->NumberParameters >= 2) {
+    at = ep->ExceptionRecord->ExceptionInformation[1];
+    switch (ep->ExceptionRecord->ExceptionInformation[0]) {
+      case 0: kind = "read"; break;
+      case 1: kind = "write"; break;
+      case 8: kind = "execute"; break;
+      default: break;
+    }
+  }
+  fprintf(stderr, "\nguest thread %u faulted: %#lx on %s of %#llx\n",
+          id, code, kind, at);
+  const size_t frames = arc_frame_count();
+  if (frames) {
+    fprintf(stderr, "  guest functions entered, most recent first:\n");
+    for (size_t i = 0; i < frames && i < 24; ++i) {
+      const unsigned long long packed = arc_frame_at(i);
+      fprintf(stderr, "    image %u +%#llx\n",
+              (unsigned)(packed >> 56), packed & 0x00FFFFFFFFFFFFFFull);
+    }
+  }
+  const size_t calls = arc_trace_count();
+  if (calls) {
+    fprintf(stderr, "  last calls out of the guest, most recent first:\n   ");
+    for (size_t i = 0; i < calls && i < 12; ++i) {
+      const char* what = arc_trace_at(i);
+      fprintf(stderr, " %s", what ? what : "?");
+    }
+    fprintf(stderr, "\n");
+  }
+  fprintf(stderr, "  guest registers:\n");
+  for (int i = 0; i < 31; i += 4) {
+    fprintf(stderr, "   ");
+    for (int j = i; j < i + 4 && j < 31; ++j)
+      fprintf(stderr, "  x%-2d=%016llx", j, (unsigned long long)c->x[j]);
+    fprintf(stderr, "\n");
+  }
+  fprintf(stderr, "     sp =%016llx\n", (unsigned long long)c->sp);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
+// Kept free of C++ objects: MSVC will not put structured exception handling in
+// a frame that also needs unwinding.
+void GuestThreadBody(uint64_t entry, Arm64Ctx* ctx, unsigned id) {
+#if defined(_WIN32)
+  __try {
+    arc_dispatch(ctx, entry);
+  } __except (GuestThreadFault(GetExceptionInformation(), ctx, id)) {
+  }
+#else
+  (void)id;
+  arc_dispatch(ctx, entry);
+#endif
+}
+
 void RunGuestThread(GuestThreadStart* s) {
   t_self_id = s->id;
   std::vector<uint8_t> stack(kGuestThreadStack);
@@ -308,7 +378,7 @@ void RunGuestThread(GuestThreadStart* s) {
   ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestThreadStack -
             kGuestThreadHeadroom) & ~15ULL;
   ctx.x[0] = s->arg;
-  arc_dispatch(&ctx, s->entry);
+  GuestThreadBody(s->entry, &ctx, s->id);
   s->slot->result = reinterpret_cast<void*>(ctx.x[0]);
   delete s;
 }
