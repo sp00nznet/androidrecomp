@@ -219,7 +219,12 @@ void ReportFrames() {
   const size_t n = arc_frame_count();
   if (!n) return;
   printf("  guest functions entered, most recent first:\n");
-  for (size_t i = 0; i < n && i < 16; ++i) {
+  // Sixteen is enough to see which call faulted and cheap enough to print
+  // on every trap. The ring holds more, and a fault whose cause is a few
+  // frames further back wants them: ARC_FRAME_TRAIL raises the cap.
+  size_t cap = 16;
+  if (const char* e = getenv("ARC_FRAME_TRAIL")) cap = strtoul(e, nullptr, 0);
+  for (size_t i = 0; i < n && i < cap; ++i) {
     const uint64_t packed = arc_frame_at(i);
     const size_t image = static_cast<size_t>(packed >> 56);
     const uint64_t off = packed & 0x00FFFFFFFFFFFFFFull;
@@ -243,6 +248,68 @@ void ReportFrames() {
              static_cast<unsigned long long>(off), sym.c_str(),
              static_cast<unsigned long long>(within));
     }
+  }
+}
+
+// Whether eight bytes at this address can be read without faulting. The walk
+// below follows a frame pointer the guest wrote, and faulting while reporting
+// a fault loses the report that was the whole point.
+bool GuestReadable(uint64_t at) {
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION mbi;
+  if (!VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof mbi)) return false;
+  if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+  const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY;
+  if (!(mbi.Protect & readable)) return false;
+  return at + 8 <= reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+#else
+  return at != 0;
+#endif
+}
+
+// One guest code address, named the way the trail above names them.
+void PrintGuestAddress(const char* lead, uint64_t addr) {
+  for (const Mapping& m : g_mappings) {
+    if (!m.image || addr < m.base || addr >= m.base + m.span) continue;
+    uint64_t within = 0;
+    const std::string sym = m.image->SymbolAt(addr, &within);
+    printf("    %-4s %-22s +%#llx", lead, m.name.c_str(),
+           static_cast<unsigned long long>(addr - m.base));
+    if (!sym.empty())
+      printf("  %s+%#llx", sym.c_str(),
+             static_cast<unsigned long long>(within));
+    printf("\n");
+    return;
+  }
+  printf("    %-4s %#018llx\n", lead, static_cast<unsigned long long>(addr));
+}
+
+// The guest call stack, walked through the frame pointer.
+//
+// Lifted code keeps ARM64's frame chain: a non-leaf function opens with
+// `stp x29, x30, [sp, #-N]!` and sets x29 to that pair, so x29 points at the
+// caller's x29 followed by the return address. Following it gives who called
+// whom, which the entry trail above cannot: that records entries in the order
+// they happened and says nothing about which had already returned. A fault
+// deep in a shared helper is a different bug depending on who reached it.
+void ReportGuestStack(const Arm64Ctx* c) {
+  printf("  guest call stack, innermost first:\n");
+  if (c->x[30]) PrintGuestAddress("in", c->x[30]);
+  uint64_t fp = c->x[29];
+  for (int depth = 0; depth < 64; ++depth) {
+    if (!fp || (fp & 15) || !GuestReadable(fp) || !GuestReadable(fp + 8)) break;
+    uint64_t next = 0, ret = 0;
+    memcpy(&next, reinterpret_cast<const void*>(fp), sizeof next);
+    memcpy(&ret, reinterpret_cast<const void*>(fp + 8), sizeof ret);
+    if (!ret) break;
+    PrintGuestAddress("from", ret);
+    // Stacks grow down, so a caller's frame is always at a higher address.
+    // Anything else is a chain that has been overwritten, and following it
+    // prints fiction.
+    if (next <= fp) break;
+    fp = next;
   }
 }
 
@@ -281,6 +348,7 @@ void ReportRegisters(const Arm64Ctx* c) {
     printf("\n");
   }
   printf("     sp =%016llx\n", static_cast<unsigned long long>(c->sp));
+  ReportGuestStack(c);
 }
 
 void ReportTrail() {
@@ -452,7 +520,18 @@ int main(int argc, char** argv) {
   // the one that initialises the renderer, so a host that calls the second
   // without the first finds a null singleton. Each --entry adds a step; an
   // --args after one belongs to it.
-  std::vector<std::pair<std::string, std::string>> entries;
+  // A step, and when to take it. Android does not make every lifecycle call
+  // before the first frame: an engine can queue what it is told and act on it
+  // at the top of a frame, so a call issued before the loop and the same call
+  // issued between frames are not the same call. at_frame says which -- 0 for
+  // the setup that runs before anything is drawn, N to issue it at the top of
+  // frame N instead.
+  struct EntryStep {
+    std::string name;
+    std::string args;
+    long at_frame = 0;
+  };
+  std::vector<EntryStep> entries;
   long ctor_limit = 0;
   bool want_window = false;
   const char* gl_version = nullptr;
@@ -466,13 +545,29 @@ int main(int argc, char** argv) {
   const char* shot = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (strncmp(argv[i], "--entry=", 8) == 0)
-      entries.emplace_back(argv[i] + 8, std::string());
+      entries.push_back({argv[i] + 8, std::string(), 0});
     else if (strncmp(argv[i], "--args=", 7) == 0) {
       if (entries.empty()) {
         fprintf(stderr, "--args must follow an --entry\n");
         return 2;
       }
-      entries.back().second = argv[i] + 7;
+      entries.back().args = argv[i] + 7;
+    }
+    else if (strncmp(argv[i], "--entry-at=", 11) == 0) {
+      if (entries.empty()) {
+        fprintf(stderr, "--entry-at must follow an --entry\n");
+        return 2;
+      }
+      const char* when = argv[i] + 11;
+      if (strncmp(when, "frame:", 6) != 0) {
+        fprintf(stderr, "--entry-at takes frame:N\n");
+        return 2;
+      }
+      entries.back().at_frame = strtol(when + 6, nullptr, 10);
+      if (entries.back().at_frame < 1) {
+        fprintf(stderr, "--entry-at=frame:N wants N >= 1\n");
+        return 2;
+      }
     }
     else if (strcmp(argv[i], "--window") == 0)
       want_window = true;
@@ -498,7 +593,7 @@ int main(int argc, char** argv) {
             "usage: %s [--window] [--gl=MAJOR.MINOR] [--assets=DIR]"
             " [--constructors=N] [--peek=OFF[/OFF...][:LEN]]"
             " [--loop] [--frames=N] [--shot=FILE.ppm]"
-            " [--entry=SYMBOL] [--args=N,N,...]"
+            " [--entry=SYMBOL] [--args=N,N,...] [--entry-at=frame:N]"
             " <library.so>\n",
             argv[0]);
     return 2;
@@ -834,10 +929,14 @@ int main(int argc, char** argv) {
 
   call_on_load(g_image, path.filename().string().c_str());
 
-  for (const auto& step : entries) {
-    const char* entry = step.first.c_str();
-    const char* entry_args = step.second.empty() ? nullptr
-                                                 : step.second.c_str();
+  // One step, taken. A lambda rather than a loop body because the same call
+  // has to be issuable from two places now: before anything is drawn, and at
+  // the top of a frame. False means the symbol is not there, which is a
+  // mistake in the command line rather than something the guest did.
+  auto run_entry = [&](const EntryStep& step) -> bool {
+    const char* entry = step.name.c_str();
+    const char* entry_args = step.args.empty() ? nullptr
+                                               : step.args.c_str();
     // A raw offset as well as a name. Plenty of the engine is internal
     // and stripped, and an unexported function is often exactly the one
     // worth calling to find out what it gates.
@@ -847,7 +946,7 @@ int main(int argc, char** argv) {
             : g_image.Lookup(entry);
     if (!addr) {
       fprintf(stderr, "\nno symbol named %s\n", entry);
-      return 1;
+      return false;
     }
     printf("\ncalling %s at %#llx\n", entry,
            static_cast<unsigned long long>(addr - ctx.image_base));
@@ -922,7 +1021,11 @@ int main(int argc, char** argv) {
       ReportFrames();
       ReportRegisters(&ctx);
     }
-  }
+    return true;
+  };
+
+  for (const EntryStep& step : entries)
+    if (step.at_frame == 0 && !run_entry(step)) return 1;
 
   // The part Java does on Android: a thread that renders, presents, and hands
   // touches back in. Everything above this is setup that runs once; a title is
@@ -981,6 +1084,10 @@ int main(int argc, char** argv) {
     };
     bool alive = true;
     long frames = 0;
+    // A step is taken once. The frame counter only advances when the present
+    // succeeds, so keying purely off it would repeat a step every time the GL
+    // context could not be taken.
+    std::vector<char> issued(entries.size(), 0);
     while (alive && window.PumpEvents()) {
       if (window.TakeResized())
         alive = call(resize, {static_cast<uint64_t>(window.width()),
@@ -999,6 +1106,21 @@ int main(int argc, char** argv) {
           alive = call(released, {x, y, 0});
       }
       if (!alive) break;
+      // Where a --entry-at=frame:N step belongs: after this frame's events,
+      // before anything is drawn for it. Android hands an engine its lifecycle
+      // messages and the engine acts on them at the top of a frame, so a call
+      // made here is not the same call made before the loop -- which is the
+      // whole reason for being able to say which.
+      //
+      // The observation is PvZ2Native's (OptiJuegos, MIT): its lifecycle
+      // driver queues an AndroidAppEvent and drains the queue at the top of
+      // every onDrawFrame rather than acting when the call arrives. No code
+      // from it is used here; the scheduling idea is theirs.
+      for (size_t i = 0; i < entries.size(); ++i)
+        if (!issued[i] && entries[i].at_frame == frames + 1) {
+          issued[i] = 1;
+          if (!run_entry(entries[i])) return 1;
+        }
       alive = call(render, {});
       // The guest thread gives the context up when it returns, so the present
       // -- and a capture, which is a GL call like any other -- has to take it.

@@ -165,3 +165,18 @@ is in [`docs/`](docs/README.md):
 - **tstorecomp** — *The Simpsons: Tapped Out*.
 - **fgrecomp** — *Family Guy: The Quest for Stuff*. The kit's second target, and the one that showed how much of it was general: 99.0% of
   functions lifted on the first run with no changes to the toolkit at all.
+
+## Acknowledgements
+
+No third-party code is vendored here. One design idea is borrowed and worth
+naming:
+
+- **[PvZ2Native](https://github.com/OptiJuegos/PvZ2Native)** (OptiJuegos,
+  staFF6773, Eliandro4 — MIT) runs a native ARM32 Android title on the desktop
+  by emulating the CPU and reimplementing Android around it, which is the same
+  bet this kit makes. Its lifecycle driver queues each lifecycle message and
+  drains the queue at the top of every `onDrawFrame` rather than acting the
+  moment the call arrives. `--entry-at=frame:N` exists because of that: a call
+  made between frames is not the same call made before the loop, and a title
+  that defers its own setup can only be driven correctly if the host can say
+  which one it meant. The idea is theirs; the code is not.
