@@ -256,6 +256,15 @@ void TraceBody(const char* what, const void* buf, int64_t rc) {
   static const bool on = getenv("ARC_TRACE_HTTP") != nullptr;
   if (!on || rc <= 0 || !buf) return;
   KeepErrno keep;
+  // A body is headers plus content, and only the headers are ever the
+  // question. Printing megabytes of asset payload costs more time than the
+  // transfer does and buries the exchange it was meant to show, so anything
+  // large is summarised instead.
+  if (rc > 2048) {
+    fprintf(stderr, "[http] %s %lld bytes (body not shown)\n", what,
+            (long long)rc);
+    return;
+  }
   const auto* p = static_cast<const unsigned char*>(buf);
   const int64_t cap = rc < 1400 ? rc : 1400;
   fprintf(stderr, "[http] %s %lld bytes\n", what, (long long)rc);

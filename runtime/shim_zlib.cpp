@@ -138,7 +138,11 @@ int Inflate(void* guest, int flush) {
   PushIn(guest, host);
   const int rc = inflate(host, flush);
   PullOut(guest, host);
-  return rc < 0 ? Report("inflate", rc) : rc;
+  // Reported on success too, not only on failure. Init traced under the knob
+  // and this did not, so a trace full of inflateInit2 with no inflate beside it
+  // read as "it never decompressed anything" when it had decompressed fine --
+  // a whole theory built on the shape of the instrument.
+  return Report("inflate", rc);
 }
 
 int InflateEnd(void* guest) {
@@ -179,7 +183,7 @@ int Deflate(void* guest, int flush) {
   PushIn(guest, host);
   const int rc = deflate(host, flush);
   PullOut(guest, host);
-  return rc < 0 ? Report("deflate", rc) : rc;
+  return Report("deflate", rc);
 }
 
 int DeflateEnd(void* guest) {
