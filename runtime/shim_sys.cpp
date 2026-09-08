@@ -23,8 +23,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "arm64_context.h"
@@ -660,7 +662,17 @@ struct GuestPollfd {
 
 int Poll(void* fds_in, unsigned long nfds, int timeout) {
   auto* fds = static_cast<GuestPollfd*>(fds_in);
-  if (!fds || nfds == 0) return 0;
+  // No descriptors is not a malformed call, it is how a caller sleeps: curl
+  // waits between connection attempts with poll(NULL, 0, ms) and nothing else.
+  // Returning 0 immediately turns that wait into a spin -- the retry loop runs
+  // as fast as the CPU allows, which is why a title with no network pins a
+  // core -- and it gives an in-flight connect no time to finish before the
+  // next attempt is made.
+  if (!fds || nfds == 0) {
+    if (timeout > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+    return 0;
+  }
 #if defined(_WIN32)
   EnsureWinsock();
   std::vector<WSAPOLLFD> host(nfds);
