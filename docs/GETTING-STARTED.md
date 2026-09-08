@@ -212,18 +212,37 @@ these are the tools that found them:
 |---|---|
 | `--constructors=N` | Stop after N. Bisects a bad one fast. |
 | `--peek=OFF[/OFF…][:LEN]` | Walk a pointer chain from the image base and hex-dump what it lands on. How you read one field of an engine singleton with no debugger. |
+| `--entry-at=frame:N` | Follows an `--entry` and issues it at the top of frame N instead of before the loop. Android hands an engine its lifecycle messages and the engine acts on them at the top of a frame, so a call made between frames is not the same call made before the loop -- and a one-shot that runs too early is spent. (Idea from [PvZ2Native](https://github.com/OptiJuegos/PvZ2Native); no code taken.) |
 | `--frames=N`, `--shot=FILE.ppm` | Run a fixed number of frames and write the one the driver actually rasterised. Reproducible, and it is the only real evidence a port renders. |
-| `ARC_TRACE_CALLS=<substring>` | Every call out to the host whose name matches, with arguments. Paths are printed as paths. |
+| `ARC_TRACE_CALLS=<list>` | Every call out to the host whose name matches any comma-separated substring; `*` matches all. Paths are printed as paths. A sequence is what answers most questions -- which calls a socket got between `connect` and `close` is not visible one name at a time. |
 | `ARC_TRACE_GUEST=1` | Every guest function entered. Enormous, and the way to see which branch a state machine took. |
 | `ARC_TRACE_JNI=1` | Every class, method and field the engine asks for by name. |
 | `ARC_TRACE_FRAMES=1` | The ring of guest functions entered, after each entry point. |
 | `ARC_TRACE_ASSETS=1` | Every asset the engine asks the asset manager for, and whether it was found. |
 | `ARC_TRACE_ZLIB=1` | Every `inflate`/`deflate`, with its return code. Failures print without asking. |
+| `ARC_TRACE_NET=1` | Every connect, send, recv and `getsockopt`, with the address and the error. Separates "never dialled" from "dialled and never spoke". |
+| `ARC_TRACE_FILES=1` | Every path opened, stat'd or created, and whether it was there. |
+| `ARC_TRACE_PREFS=1` | Every preference key the title reads, and what it was answered with. |
 | `ARC_TRACE_GL=1`, `ARC_GL_FLAT=1\|tex` | See [GRAPHICS.md](GRAPHICS.md). These separate "the geometry never arrives" from "the texture is black". |
 
 Read the report at the end of a run, not just the crash. It names every JNI
 field and method the engine asked for and could not be answered — each of which
 otherwise reads as a plausible zero somewhere much later.
+
+## Telling the host what the device is
+
+Some of what a title asks Java for is a real property of a real device, and a
+host cannot infer it. Those are environment knobs rather than invented
+constants, because getting one wrong is not visible and the right value is
+yours to know:
+
+| | |
+|---|---|
+| `ARC_SERVER` | Base URL the title should use for its own server. On Android this is patched into the library by hash and offset before installation; here it is a setting. |
+| `ARC_SERVER_REDIRECT=host:port` | Send every outbound connection there instead. For the hosts you could not name in advance — a content CDN the client has compiled in. TLS is left alone: a plain-HTTP sidecar cannot answer a handshake, and capturing a title's internet check guarantees it fails. |
+| `ARC_APP_VERSION` | The version the title believes it is, in three components. Not cosmetic: a title asks its content server for an index of entries tagged by version and picks the one its own version selects. Claiming `1.0.0` against a catalogue starting at 4.x selects nothing, and the loading screen waits forever for a download it never asked for — with the server showing a clean 200 for the index and nothing after it. |
+| `ARC_LANG`, `ARC_LOCALE` | The device locale. A string the title does not know is index zero, which is also what English is, so the two are not distinguishable downstream. |
+| `ARC_THREAD_POLLS` | How many times to answer "still working" before a Java worker thread reports done. Zero compresses to nothing a wait the engine advances its own state machine during. |
 
 ## Where to put your own code
 

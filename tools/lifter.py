@@ -2470,6 +2470,65 @@ def bytes_at(sections, addr: int, size: int):
     return None
 
 
+def dedupe_starts(*sources) -> list[tuple[int, int]]:
+    """One extent per function start, earlier sources winning.
+
+    The sources overlap heavily -- the symbol table names most of what
+    `.eh_frame` already describes -- and the emitter writes one C function per
+    entry it is given. Two entries for one address is two definitions of the
+    same C function and the link fails, so the union has to be taken on the
+    start rather than on the pair. Earlier sources win because `.eh_frame` is
+    the compiler's own account of the extent and a symbol size is the linker's;
+    where they disagree, prefer the one that came from the code generator.
+    """
+    out = {}
+    for source in sources:
+        for start, size in source:
+            out.setdefault(start, size)
+    return sorted(out.items())
+
+
+def functions_from_symbols(elf: ELFFile) -> list[tuple[int, int]]:
+    """Functions the symbol table names, which `.eh_frame` need not describe.
+
+    An unwind entry is emitted by a compiler for code it can unwind through.
+    Hand-written assembly is entitled to none, and OpenSSL -- which every title
+    with a network stack links -- is largely hand-written assembly. So its
+    routines are invisible to `.eh_frame`, and they are invisible to call-site
+    recovery too, because most of them are reached through a function pointer
+    rather than a direct `bl`.
+
+    The result is a lifted program that runs until the first TLS handshake and
+    then traps on an indirect branch into the middle of the image, with nothing
+    to say which function it was. `OPENSSL_cleanse` is the one that fires
+    first, because OpenSSL wipes a buffer on nearly every operation.
+
+    An `STT_FUNC` symbol with a nonzero size is exactly the pair we need, and it
+    comes from the linker rather than a heuristic. Duplicates with `.eh_frame`
+    are harmless -- the caller sorts and the emitter takes each start once.
+    """
+    out = []
+    for name in (".symtab", ".dynsym"):
+        section = elf.get_section_by_name(name)
+        if section is None:
+            continue
+        for sym in section.iter_symbols():
+            if sym["st_info"]["type"] != "STT_FUNC":
+                continue
+            # An undefined symbol is an import, and a size of zero says the
+            # linker did not know the extent -- neither can be lifted.
+            if sym["st_shndx"] == "SHN_UNDEF":
+                continue
+            start, size = sym["st_value"], sym["st_size"]
+            if start and size:
+                # Thumb-style low-bit tagging does not apply to aarch64, but a
+                # misaligned start would desynchronise the disassembler.
+                if start % 4 == 0:
+                    out.append((start, size))
+    out.sort()
+    return out
+
+
 def functions_from_plt(elf: ELFFile) -> list[tuple[int, int]]:
     """The PLT, as 16-byte functions.
 
@@ -2780,8 +2839,9 @@ def main() -> None:
         with open(lib, "rb") as fh:
             elf = ELFFile(fh)
             images.append((os.path.basename(lib),
-                           sorted(functions_from_eh_frame(elf) +
-                                  functions_from_plt(elf)),
+                           dedupe_starts(functions_from_eh_frame(elf),
+                                         functions_from_plt(elf),
+                                         functions_from_symbols(elf)),
                            code_sections(elf),
                            data_sections(elf),
                            plt_symbols(elf)))

@@ -115,7 +115,46 @@ def build_so() -> bytes:
     return bytes(image)
 
 
+def check_discovery() -> list[str]:
+    """Function discovery hands the emitter one extent per start.
+
+    Needs no build and no binary, because the invariant is about the union
+    rather than about any image: the emitter writes one C function per entry it
+    is given, so a start that appears twice is a duplicate definition and the
+    link fails. The symbol table names most of what `.eh_frame` already
+    describes, so the sources overlap by design and the dedupe is the only
+    thing standing between them and eleven thousand redefinitions.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from lifter import dedupe_starts
+
+    eh = [(0x1000, 32), (0x2000, 64)]
+    plt = [(0x3000, 16)]
+    # 0x1000 is described by both, with the sizes disagreeing; 0x4000 is the
+    # hand-written assembly only the symbol table knows about.
+    sym = [(0x1000, 48), (0x4000, 88)]
+    got = dedupe_starts(eh, plt, sym)
+
+    failures = []
+    starts = [a for a, _ in got]
+    if len(starts) != len(set(starts)):
+        failures.append("dedupe_starts returned a duplicate function start")
+    if starts != sorted(starts):
+        failures.append("dedupe_starts returned unsorted extents")
+    if dict(got).get(0x1000) != 32:
+        failures.append("dedupe_starts preferred a symbol size over .eh_frame")
+    if dict(got).get(0x4000) != 88:
+        failures.append("dedupe_starts dropped a symbol-table-only function")
+    return failures
+
+
 def main() -> int:
+    discovery = check_discovery()
+    if discovery:
+        for f in discovery:
+            print(f"FAIL: {f}", file=sys.stderr)
+        return 1
+
     host = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "build", "arc_host.exe" if os.name == "nt" else "arc_host")
@@ -156,7 +195,8 @@ def main() -> int:
             print(f"FAIL: {f}", file=sys.stderr)
         return 1
     print(f"ok -- loaded {len(ENTRY_POINTS)} entry points, 4 relocations, "
-          f"1 unresolved import bound to a trap slot")
+          f"1 unresolved import bound to a trap slot, "
+          f"function discovery deduped")
     return 0
 
 

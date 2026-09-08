@@ -83,6 +83,35 @@ Each of those is recovered differently, and all three were needed:
   repeating until no new ones appear, recovers the undescribed leaves.
 - **Gaps** — runs of executable bytes no function covers — catch what remains,
   which is everything reached only as an address in data.
+- **The symbol table.** An `STT_FUNC` symbol with a nonzero size is an exact
+  start and extent, from the linker rather than from a heuristic. This is how
+  hand-written assembly is found: it is entitled to no unwind entry, and most
+  of it is reached through a function pointer rather than a direct `bl`, so
+  call-site recovery misses it too.
+
+The last one is worth its own line because of what it turned out to be hiding.
+Any title with a network stack links OpenSSL, and OpenSSL's aarch64 core is
+largely hand-written assembly: 63 functions on Tapped Out — `bn_mul_mont`,
+the whole of P-256, `vpaes_*`, the SHA block functions, and `OPENSSL_cleanse`,
+which OpenSSL calls to wipe a buffer on nearly every operation. All of them
+were invisible. The program ran until the first TLS handshake and then trapped
+on an indirect branch into the middle of the image.
+
+Twenty-four of those did not lift, and that is fine: they are the ARMv8 crypto
+extensions (`aese`, `aesmc`, `pmull`, `sha256h`), and OpenSSL only calls them
+when `OPENSSL_armcap_P` says the CPU has them, which it reads from
+`getauxval(AT_HWCAP)`. Answering that with zero keeps the stack on the NEON
+and C paths, which do lift. **Do not "fix" `getauxval` to report real
+hardware capabilities** — that sends TLS straight into a function that does
+not exist.
+
+The sources overlap heavily — the symbol table names most of what `.eh_frame`
+already describes, 11,278 addresses of it here — and the emitter writes one C
+function per entry it is given, so the union has to be taken on the start
+address. Two entries for one address is two definitions of the same C function
+and the link fails. `dedupe_starts()` does that, preferring `.eh_frame`'s
+extent where the two disagree, and `tools/selftest.py` checks the invariant
+without needing a build.
 
 On the second engine that recovered 1,519 functions and took the stubs standing
 in for undescribed call targets from hundreds to one. Nothing about it is

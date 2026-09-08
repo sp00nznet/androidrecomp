@@ -315,17 +315,39 @@ void Sincosf(float x, float* sin_out, float* cos_out) {
   *cos_out = cosf(x);
 }
 
+void Getentropy_impl(void* buf, size_t len);
+
 int Getentropy(void* buf, size_t len) {
+  Getentropy_impl(buf, len);
+  return 0;
+}
+
+// getrandom(2), which Bionic has and the host CRT does not. This is where a
+// TLS stack gets its seed: BoringSSL and OpenSSL both reach for it before
+// anything else, and unseeded they fail SSL_connect without writing a byte.
+// The connection opens, nothing is ever sent, and the caller reports "no
+// internet" -- which is a long way from "the random number generator was
+// never wired up".
+//
+// GRND_NONBLOCK and GRND_RANDOM are both honoured by ignoring them: this
+// source never blocks and never runs short.
+int64_t Getrandom(void* buf, size_t len, unsigned /*flags*/) {
+  if (!buf) return -1;
+  Getentropy_impl(buf, len);
+  return static_cast<int64_t>(len);
+}
+
+void Getentropy_impl(void* buf, size_t len) {
   auto* out = static_cast<unsigned char*>(buf);
 #if defined(_WIN32)
   // RtlGenRandom, reached without dragging in the whole CryptoAPI header set.
   static auto gen = reinterpret_cast<BOOLEAN(WINAPI*)(PVOID, ULONG)>(
       GetProcAddress(LoadLibraryA("advapi32.dll"), "SystemFunction036"));
-  if (gen && gen(out, static_cast<ULONG>(len))) return 0;
+  if (gen && gen(out, static_cast<ULONG>(len))) return;
 #endif
   for (size_t i = 0; i < len; ++i) out[i] = static_cast<unsigned char>(rand());
-  return 0;
 }
+
 
 // ponytail: thread_local destructors are never run. We never unload an image
 // and the process exits wholesale, so there is nothing for them to clean up
@@ -477,7 +499,7 @@ const Entry kTable[] = {
     E("fputc", Fputc),
     E("fflush", Fflush),
     E("fclose", Fclose),
-    E("getentropy", Getentropy),
+    E("getentropy", Getentropy),    E("getrandom", Getrandom),
     E("__cxa_thread_atexit_impl", CxaThreadAtexit),
     E("qsort", Qsort),
     E("frexpf", Frexpf),            E("ldexpf", Ldexpf),

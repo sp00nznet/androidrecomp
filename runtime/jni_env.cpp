@@ -1,6 +1,7 @@
 #include "jni_env.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -245,6 +246,30 @@ void NoteCalled(const char* name) {
   g_method_called.push_back(name);
 }
 
+// What a variadic call actually carried, when the answer had to come from an
+// argument and none was recognised. "Not one of our handles" is the whole
+// failure and it is invisible otherwise: the call falls through to the table,
+// misses, and is reported as a method with no answer rather than as a method
+// whose argument we could not read. ARC_TRACE_PREFS=1.
+void TraceVaArgs(const char* name, Arm64Ctx* c) {
+  static const bool on = getenv("ARC_TRACE_PREFS") != nullptr;
+  if (!on) return;
+  fprintf(stderr, "[pref] %s  self=%#llx%s \"%.60s\"\n", name,
+          static_cast<unsigned long long>(c->x[1]),
+          arc_jni_owns(c->x[1]) ? " (ours)" : "",
+          arc_jni_owns(c->x[1]) ? reinterpret_cast<const char*>(c->x[1]) : "");
+  if (!c->x[3]) return;
+  std::vector<unsigned char> cursor(arc::ShimVaListSize());
+  memcpy(cursor.data(), reinterpret_cast<const void*>(c->x[3]), cursor.size());
+  for (int i = 0; i < 4; ++i) {
+    const uint64_t v = arc::ShimVaNextInt(cursor.data());
+    const bool ours = v && arc_jni_owns(v);
+    fprintf(stderr, "        arg%d = %#llx%s \"%.60s\"\n", i,
+            static_cast<unsigned long long>(v), ours ? " (ours)" : "",
+            ours ? reinterpret_cast<const char*>(v) : "");
+  }
+}
+
 // What a method returning a string should answer with. The engine builds paths
 // out of these, so an empty one is worse than a wrong one: it silently becomes
 // the filesystem root.
@@ -268,6 +293,14 @@ const MethodText kMethodText[] = {
     // saying so is different from having no answer.
     {"getVariant", ""},
     {"getStringPreference", ""},
+    // The device identity the title registers with its server under. Android
+    // answers this from settings that survive a reinstall, so it has to be
+    // stable across runs on this host too -- a new one each launch reads to
+    // the server as a new device every time. A fixed string is stable by
+    // construction; ARC_DEVICE_ID replaces it when one host has to look like
+    // several devices.
+    {"getUUID", "androidrecomp-00000000-0000-0000-0000-000000000000"},
+    {"getDeviceId", "androidrecomp-00000000-0000-0000-0000-000000000000"},
 };
 
 // The first argument in a guest va_list that is one of our own handles.
@@ -303,13 +336,41 @@ const MethodNumber kMethodNumbers[] = {
     // afterwards answers null, and the first one whose caller does not check
     // takes the process down. Four gigabytes free is an ordinary answer.
     {"getFreeDiskSpace", 4LL << 30},
+    // Memory, in bytes. Zero is the answer that says "this device is out",
+    // and a title that believes it drops to a reduced-texture path or refuses
+    // to load at all. Half a gigabyte free is unremarkable for a device that
+    // could run this.
+    {"getAvailableMemory", 512LL << 20},
+    {"getFreeMemory", 512LL << 20},
+    // A layout inset in pixels. Nothing here has a notch or a rounded corner
+    // to inset for, so none is the right answer rather than a missing one.
+    {"getHorizontalMargin", 0},
+    // GetUptime is not here: it is a clock, and a clock that answers the same
+    // number twice is not one. See Uptime() below.
 };
+
+// Milliseconds since the host started, which is what the engine is measuring
+// when it asks. A constant would be worse than useless: the callers that
+// matter subtract two readings, and a constant makes every interval zero --
+// so a frame takes no time, a timeout never expires, and a rate limiter lets
+// everything through at once.
+int64_t Uptime() {
+  static const auto start = std::chrono::steady_clock::now();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - start)
+             .count() +
+         60'000;  // as if the device had been up a minute before we started
+}
 
 int64_t NumberForMethod(uint64_t id, bool* answered) {
   *answered = false;
   const char* name = MethodName(id);
   if (!name) return 0;
   NoteCalled(name);
+  if (strcmp(name, "GetUptime") == 0 || strcmp(name, "getUptime") == 0) {
+    *answered = true;
+    return Uptime();
+  }
   for (const MethodNumber& m : kMethodNumbers)
     if (strcmp(m.name, name) == 0) {
       *answered = true;
@@ -328,15 +389,50 @@ int64_t NumberForMethod(uint64_t id, bool* answered) {
 // is a host setting, which is the point of doing this natively at all. Set
 // ARC_SERVER to the base URL -- "http://127.0.0.1:9000" for a loopback sidecar
 // -- and the engine asks that server for its directory instead of nothing.
+// Every key asked for and what it was answered with. getSharedPreference is
+// reported as one unanswered method however many questions went through it,
+// which is the least useful thing the report could say about the call that
+// decides where the game looks for its server. ARC_TRACE_PREFS=1.
+void TracePreference(const char* key, const char* value) {
+  static const bool on = getenv("ARC_TRACE_PREFS") != nullptr;
+  if (on)
+    fprintf(stderr, "[pref] %-40s -> %s\n", key, value ? value : "(no answer)");
+}
+
 const char* PreferenceValue(const char* key) {
   if (!key || !*key) return nullptr;
+  // A title's preference keys are its own. Tapped Out asks for none of the
+  // four below -- it asks for DLCSource, DLCLocation, DLCSecretKey and
+  // ServerEnvironment -- and the next title will ask for others again.
+  // ARC_PREF_<key> answers any of them, which is what turns a "(no answer)"
+  // in the trace into something that can be tried without a rebuild.
+  {
+    char name[96];
+    if (snprintf(name, sizeof name, "ARC_PREF_%s", key) <
+        static_cast<int>(sizeof name)) {
+      if (const char* v = getenv(name)) {
+        TracePreference(key, v);
+        return v;
+      }
+    }
+  }
   static const char* const kServerKeys[] = {"MayhemServerURL", "MayhemURL",
                                             "ServerURL", "DirectorURL"};
   for (const char* k : kServerKeys)
     if (strcmp(k, key) == 0) {
       static const char* v = getenv("ARC_SERVER");
+      TracePreference(key, v);
       return v;
     }
+  // The stored language, which is a preference rather than the device setting
+  // LocaleOverride answers -- the engine reads both and they are allowed to
+  // differ. Same knob, because a host that has one has no reason to have two.
+  if (strcmp(key, "language") == 0) {
+    static const char* v = getenv("ARC_LANG");
+    TracePreference(key, v ? v : "en");
+    return v ? v : "en";
+  }
+  TracePreference(key, nullptr);
   return nullptr;
 }
 
@@ -367,9 +463,8 @@ const MethodFlag kMethodFlags[] = {
     // not obviously the honest answer. Listed so the name is not reported as
     // unanswered.
     {"isThreadComplete", true},
-    // Java being asked to create a directory. False means it failed, and the
-    // caller treats that as a fatal setup error. The filesystem shim creates
-    // what the engine actually opens.
+    // mkdir is answered in the boolean slot above, by actually creating the
+    // directory. Listed so the name is not reported as unanswered.
     {"mkdir", true},
     // Reachability is a question the engine asks Java, not the network: it
     // never opens a socket to find out. Answered false, it never tries at all
@@ -377,6 +472,17 @@ const MethodFlag kMethodFlags[] = {
     // correct-looking screen produced without a single connect(). The host has
     // a network; say so, and let the connection succeed or fail on its own.
     {"hasConnectivity", true},
+    // A preference nobody has ever set is false, and that is a real answer
+    // rather than a missing one. Recorded so the report stops listing it.
+    {"getBooleanPreference", false},
+    // No previous install, so nothing was carried over and there is no saved
+    // state to migrate.
+    {"isFirstRun", true},
+    // Neither is true of a host launched from a command line: there is no
+    // notification to have been created or resumed by, and no music app.
+    {"wasCreatedViaLocalNotification", false},
+    {"wasResumedViaLocalNotification", false},
+    {"isOtherMusicPlaying", false},
 };
 
 // Tri-state on purpose: "not in the table" has to stay distinguishable from
@@ -445,6 +551,25 @@ const char* LocaleOverride(const char* name) {
   return nullptr;
 }
 
+// The version the title believes it is, which is a property of the APK and not
+// of this kit -- so it is a knob with a neutral default rather than a value
+// invented here. ARC_APP_VERSION, in the three components the parser needs.
+//
+// It is not cosmetic. A title asks its content server for an index and gets
+// back a list of entries tagged with the version each belongs to; it then picks
+// the one its own version selects. Claiming 1.0.0 against a catalogue that
+// starts at 4.x selects nothing, and the loading screen waits forever for a
+// download it never asked for -- with the server showing a clean 200 for the
+// index and nothing after it.
+const char* VersionOverride(const char* name) {
+  if (strcmp(name, "appVersion") == 0 || strcmp(name, "clientVersion") == 0 ||
+      strcmp(name, "getVersion") == 0 || strcmp(name, "deviceVersion") == 0) {
+    static const char* v = getenv("ARC_APP_VERSION");
+    return v;
+  }
+  return nullptr;
+}
+
 const char* DirectoryForName(const char* name) {
   static std::mutex lock;
   static std::string bundle, storage;
@@ -477,6 +602,7 @@ const char* TextForMethod(uint64_t id) {
   if (!name) return nullptr;
   NoteCalled(name);
   if (const char* v = LocaleOverride(name)) return v;
+  if (const char* v = VersionOverride(name)) return v;
   if (const char* dir = DirectoryForName(name)) return dir;
   for (const MethodText& m : kMethodText)
     if (strcmp(m.name, name) == 0) return m.text;
@@ -623,6 +749,10 @@ void Handle(size_t index, Arm64Ctx* c) {
           c->x[0] = AllocateText(dir);
           return;
         }
+        if (const char* v = VersionOverride(f->name)) {
+          c->x[0] = AllocateText(v);
+          return;
+        }
         if (const char* v = LocaleOverride(f->name)) {
           c->x[0] = AllocateText(v);
           return;
@@ -645,6 +775,16 @@ void Handle(size_t index, Arm64Ctx* c) {
     case 102: {  // GetFloatField -- the result belongs in v0, not x0
       const Field* f = FieldFromId(c->x[2]);
       arc_s_w(c, 0, f && f->kind == 'f' ? static_cast<float>(f->real) : 0.0f);
+      return;
+    }
+    case 167: {  // NewStringUTF(env, const char*)
+      // The guest's own bytes becoming a jstring, and the only place that text
+      // ever enters the Java side. Without this the slot fell to the default,
+      // which hands back a fresh block -- so every string the engine built for
+      // Java arrived empty. It reads as working, because an empty string is a
+      // legal string: the preference lookup that decides where the game's
+      // server lives was being asked for the key "", and answered nothing.
+      c->x[0] = AllocateText(reinterpret_cast<const char*>(c->x[1]));
       return;
     }
     case 164:    // GetStringLength
@@ -732,7 +872,9 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (name && (strcmp(name, "getSharedPreference") == 0 ||
                    strcmp(name, "getStringPreference") == 0)) {
         NoteCalled(name);
-        if (const uint64_t key = FirstOwnedArg(c)) {
+        TraceVaArgs(name, c);
+        const uint64_t key = FirstOwnedArg(c);
+        if (key) {
           if (const char* v =
                   PreferenceValue(reinterpret_cast<const char*>(key))) {
             c->x[0] = AllocateText(v);
@@ -810,6 +952,29 @@ void Handle(size_t index, Arm64Ctx* c) {
     case 117:    // CallStaticBooleanMethod
     case 118:    // CallStaticBooleanMethodV
     case 119: {  // CallStaticBooleanMethodA
+      // mkdir is the one boolean that has to do something rather than say
+      // something. Answering true without making the directory is the worst of
+      // the three possible answers: false would at least be reported, and
+      // making it is what the caller asked for. The engine creates its content
+      // directory this way and then writes downloads into it -- so a bare
+      // "true" left every one of those opens failing, and a download loop
+      // repeating forever with the server returning 200 each time.
+      const char* name = MethodName(c->x[2]);
+      if (name && strcmp(name, "mkdir") == 0) {
+        NoteCalled(name);
+        if (const uint64_t path = FirstOwnedArg(c)) {
+          std::error_code ec;
+          const auto* dir = reinterpret_cast<const char*>(path);
+          if (!std::filesystem::is_directory(dir, ec))
+            std::filesystem::create_directories(dir, ec);
+          static const bool trace = getenv("ARC_TRACE_FILES") != nullptr;
+          if (trace)
+            fprintf(stderr, "[file] mkdir    %-5s %s\n", ec ? "FAIL" : "ok",
+                    dir);
+          c->x[0] = ec ? 0 : 1;
+          return;
+        }
+      }
       bool answered = false;
       c->x[0] = FlagForMethod(c->x[2], &answered) ? 1 : 0;
       return;

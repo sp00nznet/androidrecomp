@@ -501,9 +501,29 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
       static const char* filter;
       static int checked;
       if (!checked) { filter = getenv("ARC_TRACE_CALLS"); checked = 1; }
-      /* "*" matches everything: a shell cannot easily pass an empty value. */
-      if (filter && (!*filter || filter[0] == '*' ||
-                     strstr(g_natives[i].name, filter)))
+      /* "*" matches everything: a shell cannot easily pass an empty value.
+         Otherwise the filter is a comma-separated list of substrings, because
+         a sequence is what answers most questions -- which call a socket got
+         between connect and being closed is not visible one name at a time. */
+      int matched = 0;
+      if (filter && (!*filter || filter[0] == '*')) {
+        matched = 1;
+      } else if (filter) {
+        const char* p = filter;
+        while (*p && !matched) {
+          const char* comma = strchr(p, ',');
+          const size_t n = comma ? (size_t)(comma - p) : strlen(p);
+          if (n) {
+            char term[64];
+            const size_t k = n < sizeof term - 1 ? n : sizeof term - 1;
+            memcpy(term, p, k);
+            term[k] = 0;
+            if (strstr(g_natives[i].name, term)) matched = 1;
+          }
+          p = comma ? comma + 1 : p + n;
+        }
+      }
+      if (matched)
         {
           /* A pointer says nothing about which file was wanted. For the
              calls whose first argument is a path by contract, the name

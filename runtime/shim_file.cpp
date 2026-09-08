@@ -16,11 +16,14 @@
 // Descriptors are the host's own, because every call that consumes one routes
 // through this file.
 
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 
 #include "shim.h"
@@ -275,6 +278,10 @@ int Open2(const char* path, int flags) { return Open(path, flags); }
 // They are separate namespaces and small descriptors are not socket handles in
 // practice, but the two could collide. Keep a set of the descriptors the socket
 // shim handed out if that ever bites.
+// Sockets the guest has asked to be non-blocking; see Fcntl below.
+std::mutex g_nonblock_lock;
+std::set<int> g_nonblock;
+
 bool IsSocket(int fd) {
   int type = 0;
   int len = sizeof type;
@@ -286,7 +293,13 @@ bool IsSocket(int fd) {
 int Close(int fd) {
   if (fd == kRandomFd) return 0;
 #if defined(_WIN32)
-  if (IsSocket(fd)) return ::closesocket(static_cast<SOCKET>(fd));
+  if (IsSocket(fd)) {
+    {
+      std::lock_guard<std::mutex> g(g_nonblock_lock);
+      g_nonblock.erase(fd);
+    }
+    return ::closesocket(static_cast<SOCKET>(fd));
+  }
   return _close(fd);
 #else
   return ::close(fd);
@@ -298,9 +311,12 @@ int64_t Read(int fd, void* buf, uint64_t n) {
     return static_cast<int64_t>(n);
   }
 #if defined(_WIN32)
-  if (IsSocket(fd))
-    return ::recv(static_cast<SOCKET>(fd), static_cast<char*>(buf),
-                  static_cast<int>(n), 0);
+  if (IsSocket(fd)) {
+    const int rc = ::recv(static_cast<SOCKET>(fd), static_cast<char*>(buf),
+                          static_cast<int>(n), 0);
+    if (rc < 0) ShimNetErrno();
+    return rc;
+  }
   return _read(fd, buf, static_cast<unsigned>(n));
 #else
   return ::read(fd, buf, n);
@@ -311,9 +327,12 @@ int64_t ReadChk(int fd, void* buf, uint64_t n, uint64_t) {
 }
 int64_t Write(int fd, const void* buf, uint64_t n) {
 #if defined(_WIN32)
-  if (IsSocket(fd))
-    return ::send(static_cast<SOCKET>(fd), static_cast<const char*>(buf),
-                  static_cast<int>(n), 0);
+  if (IsSocket(fd)) {
+    const int rc = ::send(static_cast<SOCKET>(fd), static_cast<const char*>(buf),
+                          static_cast<int>(n), 0);
+    if (rc < 0) ShimNetErrno();
+    return rc;
+  }
   return _write(fd, buf, static_cast<unsigned>(n));
 #else
   return ::write(fd, buf, n);
@@ -336,12 +355,21 @@ int Access(const char* path, int mode) {
 #endif
 }
 
+// Every component, not just the last one. Both the CRT's _mkdir and POSIX's
+// mkdir fail when a parent is missing, and a title asks for the whole path at
+// once -- on Android its data directory is built by the framework before any
+// native code runs, so the engine has never had to make the parents itself.
+// Here nothing built them, so the single-level call fails, the engine believes
+// the directory exists because we said the request succeeded, and the first
+// file it writes there cannot be opened.
 int Mkdir(const char* path, uint32_t) {
-#if defined(_WIN32)
-  return _mkdir(path);
-#else
-  return ::mkdir(path, 0755);
-#endif
+  if (!path || !*path) return -1;
+  std::error_code ec;
+  // Already there is success: mkdir -p semantics, because the caller wants the
+  // directory to exist rather than to have been the one that made it.
+  if (std::filesystem::is_directory(path, ec)) return 0;
+  std::filesystem::create_directories(path, ec);
+  return ec ? -1 : 0;
 }
 int Rmdir(const char* path) {
 #if defined(_WIN32)
@@ -406,7 +434,64 @@ int Chmod(const char*, uint32_t) { return 0; }
 int Fchmod(int, uint32_t) { return 0; }
 int Fchmodat(int, const char*, uint32_t, int) { return 0; }
 int Fchown(int, uint32_t, uint32_t) { return 0; }
-int Fcntl(int, int, ...) { return 0; }
+// fcntl was a stub returning success for everything, and that is the one
+// answer it must not give. An HTTP stack opens a socket, sets O_NONBLOCK, and
+// then connects expecting -1/EINPROGRESS and a writability wait. Reporting
+// success while leaving the socket blocking makes connect return 0 instead,
+// the stack sees a state its non-blocking path does not have, and it closes
+// the socket and tries the next address -- forever, without ever sending a
+// byte. From outside it looks exactly like a network that is down.
+//
+// Only the file-status flags are real, and only for sockets, because Winsock
+// is the only thing here with a switch to throw. Windows cannot read the flag
+// back, so F_GETFL answers from what we were last told.
+constexpr int kGuestFGetfd = 1;
+constexpr int kGuestFSetfd = 2;
+constexpr int kGuestFGetfl = 3;
+constexpr int kGuestFSetfl = 4;
+constexpr int kGuestONonblock = 0x800;
+constexpr int kGuestORdwr = 2;
+
+bool SetNonblocking(int fd, bool on) {
+#if defined(_WIN32)
+  u_long mode = on ? 1 : 0;
+  if (::ioctlsocket(static_cast<SOCKET>(fd), FIONBIO, &mode) != 0) {
+    ShimNetErrno();
+    return false;
+  }
+  std::lock_guard<std::mutex> g(g_nonblock_lock);
+  if (on) g_nonblock.insert(fd);
+  else g_nonblock.erase(fd);
+  return true;
+#else
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  return ::fcntl(fd, F_SETFL, on ? (flags | O_NONBLOCK)
+                                 : (flags & ~O_NONBLOCK)) == 0;
+#endif
+}
+
+int Fcntl(int fd, int cmd, ...) {
+#if defined(_WIN32)
+  if (cmd == kGuestFGetfl || cmd == kGuestFSetfl) {
+    if (!IsSocket(fd)) return cmd == kGuestFGetfl ? kGuestORdwr : 0;
+    if (cmd == kGuestFGetfl) {
+      std::lock_guard<std::mutex> g(g_nonblock_lock);
+      return kGuestORdwr | (g_nonblock.count(fd) ? kGuestONonblock : 0);
+    }
+    va_list ap;
+    va_start(ap, cmd);
+    const int flags = va_arg(ap, int);
+    va_end(ap);
+    return SetNonblocking(fd, (flags & kGuestONonblock) != 0) ? 0 : -1;
+  }
+  // F_GETFD/F_SETFD are close-on-exec, and nothing here execs.
+  if (cmd == kGuestFGetfd || cmd == kGuestFSetfd) return 0;
+#else
+  (void)fd;
+  (void)cmd;
+#endif
+  return 0;
+}
 int Utimes(const char*, const void*) { return 0; }
 int Utimensat(int, const char*, const void*, int) { return 0; }
 int64_t Pathconf(const char*, int) { return -1; }
@@ -593,6 +678,10 @@ const Entry kTable[] = {
 #undef E
 
 }  // namespace
+
+// The same entropy the /dev/urandom stand-in uses, for callers outside this
+// file: the syscall shim needs it for getrandom by number.
+void ShimFillRandom(void* buf, size_t n) { FillRandom(buf, n); }
 
 uint64_t ShimResolveFile(const char* name) {
   for (const Entry& e : kTable)

@@ -80,6 +80,22 @@ subtracts one gets -1, hands that to `memcpy`, and runs off the end of the arena
 a long way from the call that caused it. An empty bundle path becomes the
 filesystem root and every lookup beneath it fails.
 
+The worst instance of it was on the way *in* rather than out. `NewStringUTF` is
+how the guest's own bytes become a `jstring`, and it is the only place text
+ever enters the Java side. Without a case of its own it fell to the default for
+a slot that returns a handle — a fresh, empty block — so every string the
+engine built for Java arrived blank. Nothing failed: an empty string is a legal
+string. It surfaced as a preference lookup being asked for the key `""`, which
+is how the title asks where its server lives, and so the title never contacted
+a server at all.
+
+**A method that does something must do it, not claim it.** `mkdir` is the
+example: answering `true` without creating the directory is worse than
+answering `false`, because `false` gets reported. The engine makes its content
+directory this way and then writes downloads into it, so a bare `true` left
+every one of those opens failing — and a download loop repeating forever with
+the server returning 200 each time.
+
 ## Handles
 
 A `jobject` is an opaque token the engine holds and hands back. Here it is a

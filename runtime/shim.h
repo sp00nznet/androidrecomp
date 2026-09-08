@@ -72,6 +72,17 @@ void ShimRegisterGL();
 // straight through.
 uint64_t ShimResolveZlib(const char* name);
 
+// Entropy, from the same source the /dev/urandom stand-in uses. The syscall
+// shim needs it: a TLS stack that cannot find getrandom as a symbol asks for
+// it by number instead.
+void ShimFillRandom(void* buf, size_t n);
+
+// Winsock's last error, translated into errno using the guest libc's numbers
+// rather than the CRT's, and returned. Every socket call that can fail has to
+// go through this: the guest tests errno against Linux constants, and the two
+// disagree exactly where it matters most (EINPROGRESS is 115 there, 112 here).
+int ShimNetErrno();
+
 // The Android asset manager, over an ordinary directory. Claimed only once a
 // root is set, so that an unconfigured host leaves the names on the
 // outstanding-import list rather than opening nothing.

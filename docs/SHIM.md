@@ -46,6 +46,14 @@ precedes a `0x0A`, and stops at the first `0x1A`. A pack file read that way
 comes back shorter than it is with holes in the middle — which does not fail, it
 decodes to an image zero pixels wide.
 
+`mkdir` creates every component, not just the last. Both `_mkdir` and POSIX
+`mkdir` fail when a parent is missing, and a title asks for a whole path at
+once — on Android its data directory tree is built by the framework before any
+native code runs, so the engine has never had to make the parents itself. Here
+nothing built them. The same request usually arrives twice, once as this call
+and once through the JNI bridge; both have to actually make the directory. See
+[JNI.md](JNI.md).
+
 ### `shim_pthread` — never look at the bytes
 
 The engine allocates `pthread_mutex_t` and friends *inline* inside its own
@@ -70,9 +78,38 @@ unchanged. Two things do not, and both corrupt silently:
   swapped, and `ai_addrlen` is `size_t` rather than `socklen_t`. Passed through,
   the engine gets a canonical name where it expects a sockaddr. Results are
   translated into guest-shaped nodes instead.
-- **`SOL_SOCKET` option numbers.** `SO_REUSEADDR` is 2 on Linux and 4 on
-  Windows; `SO_RCVTIMEO` is 20 against `0x1006`. Unmapped, a timeout request
-  silently sets something else.
+- **`SOL_SOCKET` itself.** Not just the option numbers — the *level*. Linux
+  spells `SOL_SOCKET` 1, Winsock spells it `0xFFFF`, and 1 there is
+  `IPPROTO_ICMP`. Passed through, the call does not set the wrong option, it
+  fails outright with `WSAENOPROTOOPT`. The one that matters is the one nobody
+  calls deliberately: `getsockopt(SOL_SOCKET, SO_ERROR)` after a connect.
+- **`SOL_SOCKET` option numbers**, once the level is right. `SO_REUSEADDR` is 2
+  on Linux and 4 on Windows; `SO_RCVTIMEO` is 20 against `0x1006`. Two carry a
+  payload that differs as well as a number: a timeout is a `struct timeval`
+  there and a `DWORD` of milliseconds here, and `struct linger` is two ints
+  there and two shorts here.
+- **`MSG_*` flags.** Only the low three agree. `MSG_NOSIGNAL` is `0x4000` on
+  Linux and every HTTP stack sets it; Winsock rejects a flag it does not know
+  by failing the whole call with `WSAEOPNOTSUPP`. So *every* `send` fails on a
+  perfectly good socket. Windows never raises `SIGPIPE`, so dropping the bit is
+  the whole translation.
+- **`errno`, after any of them.** Winsock reports through `WSAGetLastError` and
+  leaves `errno` alone, and the guest reads `errno` against *Linux's* numbers.
+  `EINPROGRESS` is 115 there and 112 in the CRT — and a non-blocking connect
+  is *expected* to fail with it, so a stack that gets any other answer treats a
+  connection that is opening normally as refused. `ShimNetErrno()` is the one
+  translation every socket path uses.
+
+`fcntl` belongs to this list even though it lives in `shim_file`. It was a stub
+returning success for everything, and success is the one answer it must not
+give: a stack sets `O_NONBLOCK`, is told that worked, and then gets *blocking*
+semantics from `connect`. Windows cannot read the flag back, so `F_GETFL`
+answers from a note the shim keeps and `F_SETFL` goes through
+`ioctlsocket(FIONBIO)`.
+
+Each of these five, on its own, presents as "the network is down": the title
+opens a connection, never completes an exchange, and reports no internet. None
+of them fails loudly.
 
 This file also holds `dlopen`/`dlsym`/`dl_iterate_phdr` over the loaded images —
 which is how guest C++ exceptions find their `.eh_frame`.

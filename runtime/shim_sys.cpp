@@ -63,7 +63,17 @@ void EnsureWinsock() {
   });
 }
 
+// Linux spells SOL_SOCKET 1; Winsock spells it 0xFFFF, and 1 there is
+// IPPROTO_ICMP. Passing the level through unchanged is not a wrong-but-close
+// option value, it fails the whole call with WSAENOPROTOOPT -- which matters
+// most for the one nobody calls deliberately: a connect is followed by
+// getsockopt(SOL_SOCKET, SO_ERROR) to find out whether it succeeded, and a
+// stack that cannot read that treats the connection as dead, closes it and
+// tries again. From outside that looks like a host refusing to answer.
 constexpr int kGuestSolSocket = 1;
+int TranslateSockLevel(int level) {
+  return level == kGuestSolSocket ? SOL_SOCKET : level;
+}
 int TranslateSockopt(int level, int name) {
   if (level != kGuestSolSocket) return name;
   switch (name) {
@@ -80,6 +90,7 @@ int TranslateSockopt(int level, int name) {
 }
 #else
 void EnsureWinsock() {}
+int TranslateSockLevel(int level) { return level; }
 int TranslateSockopt(int, int name) { return name; }
 #endif
 
@@ -97,6 +108,24 @@ int TranslateSockopt(int, int name) { return name; }
 // The sockaddr the call returns carries the family too, in its first two
 // bytes, so that is translated on the way back and on the way in.
 constexpr int kGuestAfInet6 = 10;
+
+// Winsock reports failures through WSAGetLastError and leaves errno alone; the
+// guest reads errno, and reads it against Linux's numbers, which are not the
+// CRT's. EINPROGRESS is the one that decides everything: a non-blocking connect
+// is *expected* to fail with it, and a stack that gets any other answer treats
+// the connection as refused. Linux says 115. The MSVC CRT says 112.
+constexpr int kGuestEIntr = 4;
+constexpr int kGuestEAgain = 11;   // == EWOULDBLOCK on Linux
+constexpr int kGuestEInval = 22;
+constexpr int kGuestEPipe = 32;
+constexpr int kGuestEInProgress = 115;
+constexpr int kGuestEAlready = 114;
+constexpr int kGuestEIsConn = 106;
+constexpr int kGuestEConnRefused = 111;
+constexpr int kGuestEConnReset = 104;
+constexpr int kGuestETimedOut = 110;
+constexpr int kGuestENetUnreach = 101;
+constexpr int kGuestEHostUnreach = 113;
 
 int FamilyToHost(int family) {
 #if defined(_WIN32)
@@ -169,13 +198,55 @@ void SockaddrToGuest(void* addr, uint32_t len) {
 
 int Socket(int domain, int type, int protocol) {
   EnsureWinsock();
-  return static_cast<int>(::socket(FamilyToHost(domain), type, protocol));
+  const int fd = static_cast<int>(::socket(FamilyToHost(domain), type, protocol));
+  if (fd < 0) ShimNetErrno();
+  return fd;
 }
 int Bind(int fd, const void* addr, uint32_t len) {
   HostSockaddr host;
   if (!ToHostSockaddr(addr, len, &host)) return -1;
   return ::bind(fd, host.get(), static_cast<int>(len));
 }
+// What actually happened on a socket, which none of the callers report. A
+// connection that is opened and then never written to, or written to and never
+// answered, looks identical from outside to one that was never attempted --
+// and the engine reports all three as "no internet". ARC_TRACE_NET=1.
+bool TracingNet() {
+  static const bool on = getenv("ARC_TRACE_NET") != nullptr;
+  return on;
+}
+
+void TraceAddr(const char* what, int fd, const sockaddr* sa, int rc) {
+  if (!TracingNet()) return;
+  char host[64] = "?";
+  int port = 0;
+  if (sa && sa->sa_family == AF_INET) {
+    const auto* in = reinterpret_cast<const sockaddr_in*>(sa);
+    ::inet_ntop(AF_INET, &in->sin_addr, host, sizeof host);
+    port = ntohs(in->sin_port);
+  }
+  fprintf(stderr, "[net] %s fd=%d %s:%d -> rc=%d err=%d\n", what, fd, host,
+          port, rc,
+#if defined(_WIN32)
+          rc == 0 ? 0 : ::WSAGetLastError());
+#else
+          rc == 0 ? 0 : errno);
+#endif
+}
+
+void TraceIo(const char* what, int fd, int64_t n, int64_t rc) {
+  if (!TracingNet()) return;
+  fprintf(stderr, "[net] %s fd=%d want=%lld -> %lld%s", what, fd,
+          static_cast<long long>(n), static_cast<long long>(rc),
+          rc < 0 ? "" : "\n");
+  if (rc < 0)
+#if defined(_WIN32)
+    fprintf(stderr, " wsa=%d errno=%d\n", ::WSAGetLastError(), errno);
+#else
+    fprintf(stderr, " errno=%d\n", errno);
+#endif
+}
+
 // Where the game's server actually is.
 //
 // A title built for Android has its server address compiled in and rewritten
@@ -193,12 +264,15 @@ int Bind(int fd, const void* addr, uint32_t len) {
 // Deliberately not a hostname map: the point is to catch connections whose
 // destination we could not name in advance, which is the whole problem.
 //
-// ponytail: it redirects everything, which is too much. A title that checks for
-// internet by fetching a well-known https:// URL has that check sent to the
-// sidecar too, and a plain-HTTP sidecar cannot answer a TLS handshake -- so the
-// check fails and the title never gets as far as asking for its server. Narrow
-// this to the destination port, or to everything except the check, once it is
-// known which is which.
+// It does not redirect TLS. A title checks for internet by reaching a
+// well-known https:// host -- Tapped Out uses www.google.com -- and a sidecar
+// speaking plain HTTP cannot answer a handshake. Capturing that check
+// guarantees it fails, and the title then never gets as far as asking for its
+// server at all. Sending it to the real internet is both what the check is for
+// and the only answer that can succeed. A redirect target that is itself on
+// 443 is taken at its word.
+constexpr int kTlsPort = 443;
+
 bool RedirectTarget(sockaddr_in* out) {
   static bool looked = false;
   static bool have = false;
@@ -234,14 +308,47 @@ bool IsLoopback(const sockaddr* sa) {
   return (ntohl(in->sin_addr.s_addr) >> 24) == 127;
 }
 
+bool ShouldRedirect(const sockaddr* to, const sockaddr_in& target) {
+  if (IsLoopback(to)) return false;
+  if (!to || to->sa_family != AF_INET) return false;
+  const auto* in = reinterpret_cast<const sockaddr_in*>(to);
+  if (ntohs(in->sin_port) == kTlsPort && ntohs(target.sin_port) != kTlsPort)
+    return false;
+  return true;
+}
+
+// A connect on a non-blocking socket does not fail when it returns -1 -- it
+// has started, and the caller is expected to see EINPROGRESS and wait for the
+// socket to become writable. Winsock says WSAEWOULDBLOCK for that, which the
+// general mapping turns into EAGAIN; here it has to be EINPROGRESS, or the
+// caller reads "temporarily out of resources" and gives up on the address.
+int ConnectResult(int fd, const sockaddr* sa, int rc, const char* what) {
+#if defined(_WIN32)
+  if (rc != 0) {
+    const int wsa = ::WSAGetLastError();
+    ShimNetErrno();
+    if (wsa == WSAEWOULDBLOCK) errno = kGuestEInProgress;
+  }
+#endif
+  TraceAddr(what, fd, sa, rc);
+  return rc;
+}
+
 int Connect(int fd, const void* addr, uint32_t len) {
   HostSockaddr host;
-  if (!ToHostSockaddr(addr, len, &host)) return -1;
+  if (!ToHostSockaddr(addr, len, &host)) {
+    errno = kGuestEInval;
+    return -1;
+  }
   sockaddr_in target{};
-  if (RedirectTarget(&target) && !IsLoopback(host.get()))
-    return ::connect(fd, reinterpret_cast<const sockaddr*>(&target),
-                     static_cast<int>(sizeof target));
-  return ::connect(fd, host.get(), static_cast<int>(len));
+  if (RedirectTarget(&target) && ShouldRedirect(host.get(), target)) {
+    const int rc = ::connect(fd, reinterpret_cast<const sockaddr*>(&target),
+                             static_cast<int>(sizeof target));
+    return ConnectResult(fd, reinterpret_cast<const sockaddr*>(&target), rc,
+                         "connect(redirected)");
+  }
+  const int rc = ::connect(fd, host.get(), static_cast<int>(len));
+  return ConnectResult(fd, host.get(), rc, "connect");
 }
 int Listen(int fd, int backlog) { return ::listen(fd, backlog); }
 int Accept(int fd, void* addr, uint32_t* len) {
@@ -249,32 +356,116 @@ int Accept(int fd, void* addr, uint32_t* len) {
       ::accept(fd, static_cast<sockaddr*>(addr),
                reinterpret_cast<socklen_t*>(len)));
 }
+// Bionic's MSG_* bits, from the Linux headers. Only the low three agree with
+// Winsock's, and the rest are not merely ignored -- Winsock rejects a flag it
+// does not recognise by failing the whole call with WSAEOPNOTSUPP.
+//
+// MSG_NOSIGNAL is the one that matters and the one every HTTP stack sets: on
+// Linux it asks send() not to raise SIGPIPE on a closed peer. Forwarded here
+// it fails every write on a perfectly good socket, so the request is never
+// sent, the reply never comes, and the title reports the server as unreachable.
+// Windows never raises SIGPIPE, so dropping the bit is the whole translation.
+constexpr int kGuestMsgOob = 0x0001;
+constexpr int kGuestMsgPeek = 0x0002;
+constexpr int kGuestMsgDontroute = 0x0004;
+constexpr int kGuestMsgWaitall = 0x0100;
+
+int MsgFlagsToHost(int flags) {
+#if defined(_WIN32)
+  int host = 0;
+  if (flags & kGuestMsgOob) host |= MSG_OOB;
+  if (flags & kGuestMsgPeek) host |= MSG_PEEK;
+  if (flags & kGuestMsgDontroute) host |= MSG_DONTROUTE;
+  if (flags & kGuestMsgWaitall) host |= MSG_WAITALL;
+  // MSG_NOSIGNAL has nothing to signal here, and MSG_DONTWAIT cannot be said
+  // per call -- the socket carries that, and fcntl already set it.
+  return host;
+#else
+  return flags;
+#endif
+}
+
 int64_t Send(int fd, const void* buf, uint64_t n, int flags) {
-  return ::send(fd, static_cast<const char*>(buf), static_cast<int>(n), flags);
+  const int64_t rc = ::send(fd, static_cast<const char*>(buf),
+                            static_cast<int>(n), MsgFlagsToHost(flags));
+  if (rc < 0) ShimNetErrno();
+  TraceIo("send", fd, static_cast<int64_t>(n), rc);
+  return rc;
 }
 int64_t Recv(int fd, void* buf, uint64_t n, int flags) {
-  return ::recv(fd, static_cast<char*>(buf), static_cast<int>(n), flags);
+  const int64_t rc = ::recv(fd, static_cast<char*>(buf), static_cast<int>(n),
+                            MsgFlagsToHost(flags));
+  if (rc < 0) ShimNetErrno();
+  TraceIo("recv", fd, static_cast<int64_t>(n), rc);
+  return rc;
 }
 int64_t Sendto(int fd, const void* buf, uint64_t n, int flags,
                const void* addr, uint32_t len) {
-  return ::sendto(fd, static_cast<const char*>(buf), static_cast<int>(n), flags,
-                  static_cast<const sockaddr*>(addr), len);
+  // The same flag translation as Send, and the same address translation as
+  // Connect: a sockaddr from the guest carries Bionic's AF_INET6 either way.
+  HostSockaddr host;
+  const bool have = addr && ToHostSockaddr(addr, len, &host);
+  const int64_t rc =
+      ::sendto(fd, static_cast<const char*>(buf), static_cast<int>(n),
+               MsgFlagsToHost(flags), have ? host.get() : nullptr,
+               have ? static_cast<int>(len) : 0);
+  if (rc < 0) ShimNetErrno();
+  TraceIo("sendto", fd, static_cast<int64_t>(n), rc);
+  return rc;
 }
 int64_t Recvfrom(int fd, void* buf, uint64_t n, int flags, void* addr,
                  uint32_t* len) {
-  return ::recvfrom(fd, static_cast<char*>(buf), static_cast<int>(n), flags,
-                    static_cast<sockaddr*>(addr),
-                    reinterpret_cast<socklen_t*>(len));
+  const int64_t rc =
+      ::recvfrom(fd, static_cast<char*>(buf), static_cast<int>(n),
+                 MsgFlagsToHost(flags), static_cast<sockaddr*>(addr),
+                 reinterpret_cast<socklen_t*>(len));
+  if (rc < 0) ShimNetErrno();
+  // The family goes back in the guest's numbering, as it does from accept.
+  if (rc >= 0 && addr && len) SockaddrToGuest(addr, *len);
+  TraceIo("recvfrom", fd, static_cast<int64_t>(n), rc);
+  return rc;
 }
 int Shutdown(int fd, int how) { return ::shutdown(fd, how); }
 int Setsockopt(int fd, int level, int name, const void* val, uint32_t len) {
-  return ::setsockopt(fd, level, TranslateSockopt(level, name),
+  const int host_level = TranslateSockLevel(level);
+  const int host_name = TranslateSockopt(level, name);
+#if defined(_WIN32)
+  // Two options carry a payload that differs as well as a number. Both are set
+  // by every HTTP stack, and both fail the call outright if forwarded as-is.
+  // A timeout is a struct timeval (two 64-bit fields) on Linux and a DWORD of
+  // milliseconds here; linger is two ints there and two shorts here.
+  if (host_level == SOL_SOCKET &&
+      (host_name == SO_RCVTIMEO || host_name == SO_SNDTIMEO) && val &&
+      len >= 16) {
+    int64_t tv[2] = {0, 0};
+    memcpy(tv, val, sizeof tv);
+    const DWORD ms = static_cast<DWORD>(tv[0] * 1000 + tv[1] / 1000);
+    return ::setsockopt(fd, host_level, host_name,
+                        reinterpret_cast<const char*>(&ms), sizeof ms);
+  }
+  if (host_level == SOL_SOCKET && host_name == SO_LINGER && val && len >= 8) {
+    int32_t guest[2] = {0, 0};
+    memcpy(guest, val, sizeof guest);
+    ::linger host{static_cast<u_short>(guest[0]), static_cast<u_short>(guest[1])};
+    return ::setsockopt(fd, host_level, host_name,
+                        reinterpret_cast<const char*>(&host), sizeof host);
+  }
+#endif
+  return ::setsockopt(fd, host_level, host_name,
                       static_cast<const char*>(val), len);
 }
 int Getsockopt(int fd, int level, int name, void* val, uint32_t* len) {
-  return ::getsockopt(fd, level, TranslateSockopt(level, name),
-                      static_cast<char*>(val),
-                      reinterpret_cast<socklen_t*>(len));
+  const int host_level = TranslateSockLevel(level);
+  const int host_name = TranslateSockopt(level, name);
+  const int rc = ::getsockopt(fd, host_level, host_name,
+                              static_cast<char*>(val),
+                              reinterpret_cast<socklen_t*>(len));
+  if (TracingNet()) {
+    fprintf(stderr, "[net] getsockopt fd=%d level=%d opt=%d -> rc=%d val=%d\n",
+            fd, level, name, rc,
+            (val && len && *len >= 4) ? *static_cast<const int*>(val) : -1);
+  }
+  return rc;
 }
 int Getsockname(int fd, void* addr, uint32_t* len) {
   return ::getsockname(fd, static_cast<sockaddr*>(addr),
@@ -584,8 +775,34 @@ int64_t Sysconf(int name) {
   if (name == 97) return 8;
   return -1;
 }
+// Zero for everything, and AT_HWCAP is the one to leave that way on purpose.
+// OpenSSL's aarch64 code reads it to decide whether to use the ARMv8 crypto
+// extensions, and those routines are hand-written `aese`/`aesmc`/`pmull`
+// assembly the lifter cannot emit. Advertising the bits would send the TLS
+// stack straight into a function that does not exist; reporting none leaves it
+// on the NEON and C paths, which lift.
 uint64_t Getauxval(uint64_t) { return 0; }
-int64_t Syscall(int64_t, ...) { return -1; }
+// syscall(2). Almost everything that reaches here is something a host cannot
+// answer, and -1 is the honest reply -- but not for getrandom. A TLS stack
+// that cannot find getrandom as a symbol calls it by number instead, and -1
+// there leaves the random generator unseeded, which fails SSL_connect before
+// it writes anything: the connection opens, nothing is ever sent, and the
+// caller reports that it has no internet.
+constexpr int64_t kArm64SysGetrandom = 278;
+
+int64_t Syscall(int64_t number, ...) {
+  if (number == kArm64SysGetrandom) {
+    va_list ap;
+    va_start(ap, number);
+    void* buf = va_arg(ap, void*);
+    const size_t len = va_arg(ap, size_t);
+    va_end(ap);
+    if (!buf) return -1;
+    ShimFillRandom(buf, len);
+    return static_cast<int64_t>(len);
+  }
+  return -1;
+}
 int Uname(void* buf) {
   // Linux struct utsname: six 65-byte fields. Zeroed is a valid answer.
   if (buf) memset(buf, 0, 6 * 65);
@@ -784,6 +1001,34 @@ const Entry kTable[] = {
 #undef E
 
 }  // namespace
+
+// Translate the last Winsock error into errno, in the numbers the guest's libc
+// uses. Returns the value it set, so a caller can test it without a second
+// lookup. Shared with the socket paths in shim_file.cpp.
+int ShimNetErrno() {
+#if defined(_WIN32)
+  int e = kGuestEInval;
+  switch (::WSAGetLastError()) {
+    case WSAEWOULDBLOCK:   e = kGuestEAgain; break;
+    case WSAEINPROGRESS:   e = kGuestEInProgress; break;
+    case WSAEALREADY:      e = kGuestEAlready; break;
+    case WSAEISCONN:       e = kGuestEIsConn; break;
+    case WSAECONNREFUSED:  e = kGuestEConnRefused; break;
+    case WSAECONNRESET:    e = kGuestEConnReset; break;
+    case WSAECONNABORTED:  e = kGuestEPipe; break;
+    case WSAETIMEDOUT:     e = kGuestETimedOut; break;
+    case WSAENETUNREACH:   e = kGuestENetUnreach; break;
+    case WSAEHOSTUNREACH:  e = kGuestEHostUnreach; break;
+    case WSAEINTR:         e = kGuestEIntr; break;
+    case 0:                e = 0; break;
+    default:               break;
+  }
+  errno = e;
+  return e;
+#else
+  return errno;
+#endif
+}
 
 void ShimRegisterImage(const ElfImage* image) {
   std::lock_guard<std::mutex> g(g_images_lock);
