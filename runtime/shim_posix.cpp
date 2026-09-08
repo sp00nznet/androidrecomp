@@ -77,7 +77,12 @@ int ClockGettime(int clock_id, GuestTimespec* ts) {
   //
   // The epoch is this process's start, which is what a monotonic clock is
   // allowed to be and keeps the numbers small.
-  if (clock_id == kClockRealtime || clock_id == kClockRealtimeCoarse) {
+  // ARC_CLOCK_WALL answers every id from the wall clock, which is what this
+  // did before. Kept because a caller that mixes time() with a monotonic
+  // reading is comparing two epochs, and which epoch is the wrong one is
+  // then a question about the caller, not about correctness here.
+  static const bool wall = getenv("ARC_CLOCK_WALL") != nullptr;
+  if (wall || clock_id == kClockRealtime || clock_id == kClockRealtimeCoarse) {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     const auto sec = std::chrono::duration_cast<std::chrono::seconds>(now);
     ts->tv_sec = sec.count();
