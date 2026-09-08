@@ -247,6 +247,23 @@ void TraceAddr(const char* what, int fd, const sockaddr* sa, int rc) {
 #endif
 }
 
+// The bytes themselves, not just how many. A title talking to a server it
+// was not built for fails in the content of one request, and the sizes say
+// nothing about which one: ARC_TRACE_HTTP=1 prints the payload. Text is
+// printed as text and anything else as dots, because a protobuf body next to
+// an HTTP header is still worth seeing the shape of.
+void TraceBody(const char* what, const void* buf, int64_t rc) {
+  static const bool on = getenv("ARC_TRACE_HTTP") != nullptr;
+  if (!on || rc <= 0 || !buf) return;
+  KeepErrno keep;
+  const auto* p = static_cast<const unsigned char*>(buf);
+  const int64_t cap = rc < 1400 ? rc : 1400;
+  fprintf(stderr, "[http] %s %lld bytes\n", what, (long long)rc);
+  for (int64_t i = 0; i < cap; ++i)
+    fputc((p[i] >= 0x20 && p[i] < 0x7f) || p[i] == 0x0a ? p[i] : '.', stderr);
+  fprintf(stderr, "\n[http] --\n");
+}
+
 void TraceIo(const char* what, int fd, int64_t n, int64_t rc) {
   if (!TracingNet()) return;
   KeepErrno keep;
@@ -404,6 +421,7 @@ int64_t Send(int fd, const void* buf, uint64_t n, int flags) {
                             static_cast<int>(n), MsgFlagsToHost(flags));
   if (rc < 0) ShimNetErrno();
   TraceIo("send", fd, static_cast<int64_t>(n), rc);
+  TraceBody("send", buf, rc);
   return rc;
 }
 int64_t Recv(int fd, void* buf, uint64_t n, int flags) {
@@ -411,6 +429,7 @@ int64_t Recv(int fd, void* buf, uint64_t n, int flags) {
                             MsgFlagsToHost(flags));
   if (rc < 0) ShimNetErrno();
   TraceIo("recv", fd, static_cast<int64_t>(n), rc);
+  TraceBody("recv", buf, rc);
   return rc;
 }
 int64_t Sendto(int fd, const void* buf, uint64_t n, int flags,
