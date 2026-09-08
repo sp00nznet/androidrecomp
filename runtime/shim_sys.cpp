@@ -19,6 +19,7 @@
 // is a stub that succeeds. Those are honest: they exist so the engine's error
 // paths are not taken, not to pretend the behaviour was reproduced.
 
+#include <cerrno>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -218,8 +219,18 @@ bool TracingNet() {
   return on;
 }
 
+// Every trace below runs between a call setting errno and the guest reading
+// it, and fprintf and inet_ntop are both entitled to set errno themselves.
+// Left alone the trace destroys the value it exists to explain -- a run with
+// tracing on stops being a run of the same program. Saved and restored.
+struct KeepErrno {
+  int saved = errno;
+  ~KeepErrno() { errno = saved; }
+};
+
 void TraceAddr(const char* what, int fd, const sockaddr* sa, int rc) {
   if (!TracingNet()) return;
+  KeepErrno keep;
   char host[64] = "?";
   int port = 0;
   if (sa && sa->sa_family == AF_INET) {
@@ -238,6 +249,7 @@ void TraceAddr(const char* what, int fd, const sockaddr* sa, int rc) {
 
 void TraceIo(const char* what, int fd, int64_t n, int64_t rc) {
   if (!TracingNet()) return;
+  KeepErrno keep;
   fprintf(stderr, "[net] %s fd=%d want=%lld -> %lld%s", what, fd,
           static_cast<long long>(n), static_cast<long long>(rc),
           rc < 0 ? "" : "\n");

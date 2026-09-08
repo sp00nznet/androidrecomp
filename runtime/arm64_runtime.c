@@ -6,6 +6,7 @@
 
 #include "arm64_context.h"
 
+#include <errno.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -392,9 +393,17 @@ void arc_frame_note(uint64_t packed) {
      trace answers the other question: which branch a state machine took. */
   static int trace = -1;
   if (trace < 0) trace = getenv("ARC_TRACE_GUEST") != NULL;
-  if (trace)
+  /* errno is saved across this: the trace fires on every guest function
+     entry, including the one between a call that set errno and the guest
+     reading it, and fprintf may set errno itself. Without this a traced
+     run is not a run of the same program -- which is the one thing a
+     diagnostic must never be. */
+  if (trace) {
+    const int saved = errno;
     fprintf(stderr, "[fn] t%u %llx\n", arc_trace_thread(),
             (unsigned long long)packed);
+    errno = saved;
+  }
   t_frames[t_frame_next] = packed;
   t_frame_next = (t_frame_next + 1) % ARC_FRAME_RING;
   ++t_frame_seen;
@@ -540,6 +549,7 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
       }
       if (matched)
         {
+          const int saved_errno = errno;
           /* A pointer says nothing about which file was wanted. For the
              calls whose first argument is a path by contract, the name
              is the whole point of the trace. */
@@ -562,6 +572,7 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
                     g_natives[i].name, (unsigned long long)c->x[0],
                     (unsigned long long)c->x[1],
                     (unsigned long long)c->x[2]);
+          errno = saved_errno;
         }
     }
     ArcNative12 fn = (ArcNative12)(uintptr_t)target;
