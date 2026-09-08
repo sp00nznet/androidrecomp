@@ -60,11 +60,33 @@ struct GuestTimeval {
   int64_t tv_usec;
 };
 
-int ClockGettime(int /*clock_id*/, GuestTimespec* ts) {
-  // ponytail: every clock id answered from the system clock. Split out a
-  // steady clock for CLOCK_MONOTONIC if the engine ever measures deltas across
-  // a wall-clock adjustment and misbehaves.
-  const auto now = std::chrono::system_clock::now().time_since_epoch();
+// Bionic's clock ids. Only the split matters: the realtime ones are a date,
+// the rest are a stopwatch.
+constexpr int kClockRealtime = 0;
+constexpr int kClockRealtimeCoarse = 5;
+
+int ClockGettime(int clock_id, GuestTimespec* ts) {
+  // CLOCK_MONOTONIC is seconds since boot, not seconds since 1970, and the
+  // difference is not cosmetic. Answered from the wall clock it reads about
+  // 1.7e9, and a caller that turns a delta into milliseconds is doing that
+  // arithmetic on a number a billion times larger than it expects. An HTTP
+  // client is the first thing to notice: every connect it starts is measured
+  // against a deadline, and a deadline computed from the wrong magnitude has
+  // already passed. The connection opens, is judged to have timed out before
+  // it can finish, and is closed and retried forever.
+  //
+  // The epoch is this process's start, which is what a monotonic clock is
+  // allowed to be and keeps the numbers small.
+  if (clock_id == kClockRealtime || clock_id == kClockRealtimeCoarse) {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto sec = std::chrono::duration_cast<std::chrono::seconds>(now);
+    ts->tv_sec = sec.count();
+    ts->tv_nsec =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - sec).count();
+    return 0;
+  }
+  static const auto start = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now() - start;
   const auto sec = std::chrono::duration_cast<std::chrono::seconds>(now);
   ts->tv_sec = sec.count();
   ts->tv_nsec =
@@ -74,7 +96,7 @@ int ClockGettime(int /*clock_id*/, GuestTimespec* ts) {
 
 int Gettimeofday(GuestTimeval* tv, void*) {
   GuestTimespec ts;
-  ClockGettime(0, &ts);
+  ClockGettime(kClockRealtime, &ts);
   tv->tv_sec = ts.tv_sec;
   tv->tv_usec = ts.tv_nsec / 1000;
   return 0;

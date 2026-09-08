@@ -372,6 +372,19 @@ static uint64_t t_frames[ARC_FRAME_RING];
 static size_t t_frame_next;
 static size_t t_frame_seen;
 
+/* Which thread a trace line came from. Both traces below are written by
+   every guest thread at once, and interleaved they answer nothing: the
+   question is always what one thread did in order, and a title does its
+   networking on a worker while the renderer fills the log. A small number
+   rather than the OS id because it has to be readable in a grep. */
+static ARC_THREAD_LOCAL unsigned t_trace_id;
+static unsigned g_trace_ids;
+
+unsigned arc_trace_thread(void) {
+  if (!t_trace_id) t_trace_id = ++g_trace_ids;
+  return t_trace_id;
+}
+
 #if defined(ARC_FRAMES)
 void arc_frame_note(uint64_t packed) {
   /* The ring holds sixteen frames, which says where a fault happened and
@@ -379,7 +392,9 @@ void arc_frame_note(uint64_t packed) {
      trace answers the other question: which branch a state machine took. */
   static int trace = -1;
   if (trace < 0) trace = getenv("ARC_TRACE_GUEST") != NULL;
-  if (trace) fprintf(stderr, "[fn] %llx\n", (unsigned long long)packed);
+  if (trace)
+    fprintf(stderr, "[fn] t%u %llx\n", arc_trace_thread(),
+            (unsigned long long)packed);
   t_frames[t_frame_next] = packed;
   t_frame_next = (t_frame_next + 1) % ARC_FRAME_RING;
   ++t_frame_seen;
@@ -539,10 +554,11 @@ void arc_dispatch_miss(Arm64Ctx* c, uint64_t target) {
           for (const char* const* q = kPathFirst; *q; ++q)
             if (strcmp(g_natives[i].name, *q) == 0) { path_first = 1; break; }
           if (path_first && c->x[0])
-            fprintf(stderr, "[call] %-12s \"%.160s\"\n",
+            fprintf(stderr, "[call] t%u %-12s \"%.160s\"\n", arc_trace_thread(),
                     g_natives[i].name, (const char*)(uintptr_t)c->x[0]);
           else
-            fprintf(stderr, "[call] %-12s x0=%#llx x1=%#llx x2=%#llx\n",
+            fprintf(stderr, "[call] t%u %-12s x0=%#llx x1=%#llx x2=%#llx\n",
+                    arc_trace_thread(),
                     g_natives[i].name, (unsigned long long)c->x[0],
                     (unsigned long long)c->x[1],
                     (unsigned long long)c->x[2]);
