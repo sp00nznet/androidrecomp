@@ -73,6 +73,39 @@ B=Java_com_bight_android_jni_BGCoreJNIBridge
 The order is Android's, and it is not optional: the GL surface exists before the
 game boots, because the game's boot allocates out of the renderer's heap.
 
+### The setup call that has to be made by hand
+
+The order being Android's is necessary and it is not always sufficient. An
+engine can hold a piece of setup behind a one-shot -- a flag it tests once,
+acts on, and clears -- and that one-shot can fire before the thing it depends
+on exists. Android gets away with it because Java calls back in again later;
+a host that issues its entry points once and then renders does not.
+
+Tapped Out is the worked example. Its font and menu registry is initialised
+from a function gated on a byte that only `LifecycleStart` sets, and that
+function is reached from a one-shot which fires during the game's own `init`
+-- before `LifecycleStart`, because `LifecycleStart` faults if the game has
+not been built yet. So it bails, clears its flag, and the chance does not come
+back. The registry stays empty, every font lookup answers null, and the first
+menu to add a null child faults on frame one.
+
+Nothing in the entry order fixes this, because no order satisfies both
+constraints. The initialiser takes no arguments -- it fetches the singleton
+itself -- so it can simply be called:
+
+```sh
+  --entry=0x12c89dc ```
+
+`--entry` takes a raw image offset as well as a name, which is what makes an
+unexported function callable at all. Two things make one findable: the fault's
+guest call stack names the function that faulted and everyone above it, and
+`--peek` reads the byte a branch turned on. Between them the question "why was
+this skipped" is answerable without a debugger.
+
+A one-shot spent too early looks like nothing at boot and like a null
+dereference much later, so it is worth suspecting whenever a fault is a null
+that something should have filled in.
+
 Constructors are also a good measure precisely because a whole boot is not one:
 the failures come back as a histogram, and a histogram is diagnosable. Thirty-six
 of the second engine's constructors failed at address `0x28`, one address, one
