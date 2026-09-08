@@ -344,6 +344,33 @@ int GuestThreadFault(EXCEPTION_POINTERS* ep, const Arm64Ctx* c, unsigned id) {
     }
     fprintf(stderr, "\n");
   }
+  // The frame ring above is global and so is shared with every other thread,
+  // which makes it nearly useless here. The frame pointer is not: lifted code
+  // keeps ARM64's stp x29, x30 chain, so this thread's own stack can be walked
+  // out of its own context. Addresses are raw -- subtract the image base the
+  // loader printed at startup.
+  {
+    unsigned long long fp = c->x[29];
+    fprintf(stderr, "  guest call stack, innermost first:\n");
+    if (c->x[30]) fprintf(stderr, "    in   %#llx\n", (unsigned long long)c->x[30]);
+    for (int depth = 0; depth < 32; ++depth) {
+      MEMORY_BASIC_INFORMATION mbi;
+      if (!fp || (fp & 15)) break;
+      if (!VirtualQuery((void*)fp, &mbi, sizeof mbi)) break;
+      if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) break;
+      if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY))) break;
+      if (fp + 16 > (unsigned long long)mbi.BaseAddress + mbi.RegionSize) break;
+      unsigned long long next = 0, ret = 0;
+      memcpy(&next, (const void*)fp, sizeof next);
+      memcpy(&ret, (const void*)(fp + 8), sizeof ret);
+      if (!ret) break;
+      fprintf(stderr, "    from %#llx\n", ret);
+      if (next <= fp) break;
+      fp = next;
+    }
+  }
   fprintf(stderr, "  guest registers:\n");
   for (int i = 0; i < 31; i += 4) {
     fprintf(stderr, "   ");
