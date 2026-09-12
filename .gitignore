@@ -87,3 +87,6 @@ run-*.bat
 *.out
 *.err
 *.ppm
+
+# Verification build output, alongside build-lifted.
+build-verify/

@@ -62,6 +62,9 @@ class Ctx(ctypes.Structure):
         ("cf", ctypes.c_uint32), ("vf", ctypes.c_uint32),
         ("q", (ctypes.c_uint64 * 2) * 32),
         ("image_base", ctypes.c_uint64),
+        # Only written by a --pc-notes lift, but it is part of the struct
+        # either way, and a layout that disagrees stops the harness dead.
+        ("pc", ctypes.c_uint64),
     ]
 
 
@@ -171,8 +174,17 @@ def generated_functions(generated: str) -> set:
     return out
 
 
-def pick_functions(path: str, count: int, rng, available: set):
-    """Self-contained functions with real control flow in them."""
+def pick_functions(path: str, count: int, rng, available: set,
+                   window=None, max_size=400):
+    """Self-contained functions with real control flow in them.
+
+    A random sweep answers "is the lifter broadly right". It is the wrong
+    tool for "is *this* code right", and by the time a title fails in one
+    library-shaped corner -- a crypto routine, a decompressor -- that is
+    the only question left. `window` restricts the draw to an address
+    range, which is how a suspect neighbourhood gets swept exhaustively
+    instead of sampled.
+    """
     md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
     md.detail = True
     with open(path, "rb") as fh:
@@ -183,7 +195,9 @@ def pick_functions(path: str, count: int, rng, available: set):
 
     candidates = []
     for start, size in funcs:
-        if not (16 <= size <= 400):
+        if not (16 <= size <= max_size):
+            continue
+        if window and not (window[0] <= start < window[1]):
             continue
         if available and start not in available:
             continue
@@ -223,6 +237,10 @@ def main() -> None:
     ap.add_argument("--build-dir", default="build-lifted",
                     help="kept between runs; rebuilding 430 MB is not free")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--range", dest="window",
+                    help="only functions starting in LO:HI (hex offsets)")
+    ap.add_argument("--max-size", type=int, default=400,
+                    help="largest function body to test, in bytes")
     ap.add_argument("--real-floats", action="store_true",
                     help="seed vector registers with ordinary numbers rather "
                          "than random bits")
@@ -231,7 +249,12 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     available = generated_functions(args.generated)
-    picks = pick_functions(args.library, args.count, rng, available)
+    window = None
+    if args.window:
+        lo, _, hi = args.window.partition(":")
+        window = (int(lo, 16), int(hi, 16))
+    picks = pick_functions(args.library, args.count, rng, available,
+                           window, args.max_size)
     print(f"{len(picks)} self-contained functions with control flow selected")
     if not picks:
         return

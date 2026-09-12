@@ -1456,16 +1456,22 @@ class Lifter:
                     d, f"arc_add{w}(c, {self.read(a)}, {rhs}, (c)->cf)")]
             return [self.write(
                 d, f"(({cast})({self.read(a)}) + ({cast})({rhs}) + (c)->cf)")]
-        if m in ("negs", "ngcs"):
+        # ngc is ngcs without the flags, and its absence stopped a whole
+        # function lifting: a bignum negate that appears once in the program
+        # and only on the path a title takes after it has logged in. The
+        # function became a stub, the stub trapped, and the run ended there.
+        if m in ("negs", "ngc", "ngcs"):
             d, src = ops[0], ops[1]
             is64 = self.dest_is64(d)
             w = "64" if is64 else "32"
             if m == "negs":
                 return [self.write(d, f"arc_sub{w}(c, 0, {self.read(src)})")]
             cast = "uint64_t" if is64 else "uint32_t"
-            return [self.write(
-                d, f"arc_add{w}(c, 0, (({cast})~({cast})({self.read(src)})),"
-                   f" (c)->cf)")]
+            rhs = f"(({cast})~({cast})({self.read(src)}))"
+            if m == "ngc":
+                # 0 + ~m + C, in the destination's width, flags untouched.
+                return [self.write(d, f"(({cast})({rhs}) + (c)->cf)")]
+            return [self.write(d, f"arc_add{w}(c, 0, {rhs}, (c)->cf)")]
         if m == "cmp":  return compare(sub=True)
         if m == "cmn":  return compare(sub=False)
 

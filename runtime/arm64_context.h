@@ -63,9 +63,18 @@ typedef struct Arm64Ctx {
 
 // --- register access -------------------------------------------------------
 #define ARC_X_R(c, r) ((r) == 31 ? UINT64_C(0) : (c)->x[(r)])
-#define ARC_X_W(c, r, v)               \
-  do {                                 \
-    if ((r) != 31) (c)->x[(r)] = (v);  \
+// The value is computed into a temporary *before* the destination is tested,
+// and that ordering is the point rather than a style choice. A flag-setting
+// instruction is emitted as a write of a helper's return value, and the
+// helper is what sets the flags -- so with `v` used only inside the discarded
+// branch, `sbcs xzr, x0, x1` evaluated nothing at all and left NZCV holding
+// whatever the previous instruction put there. That form has no alias, so it
+// survives disassembly as itself, and it is exactly how a bignum library
+// propagates a borrow whose difference it does not want.
+#define ARC_X_W(c, r, v)                    \
+  do {                                      \
+    const uint64_t arc_wv_ = (uint64_t)(v); \
+    if ((r) != 31) (c)->x[(r)] = arc_wv_;   \
   } while (0)
 
 #define ARC_W_R(c, r) ((uint32_t)ARC_X_R(c, r))
@@ -516,9 +525,17 @@ static inline uint64_t arc_rev16_64(uint64_t v) {
   return ((v & UINT64_C(0x00FF00FF00FF00FF)) << 8) |
          ((v >> 8) & UINT64_C(0x00FF00FF00FF00FF));
 }
+// Each word is reversed *where it is*. The two words do not trade places --
+// which is the whole difference between this and a 64-bit REV, and it is
+// invisible in anything that reads the result a byte at a time. SHA-1 is
+// where it shows: OpenSSL's aarch64 code loads two message words with one
+// `ldr x`, byte-swaps them with `rev32 x`, and then takes W[i] from the low
+// half and W[i+1] from the high half. Exchanging the halves feeds the
+// compression function the right sixteen words in the wrong order, so every
+// digest is wrong and every one of them still looks like a digest.
 static inline uint64_t arc_rev32_64(uint64_t v) {
-  return ((uint64_t)arc_rev32((uint32_t)v) << 32) |
-         arc_rev32((uint32_t)(v >> 32));
+  return ((uint64_t)arc_rev32((uint32_t)(v >> 32)) << 32) |
+         arc_rev32((uint32_t)v);
 }
 
 uint64_t arc_smulh(uint64_t a, uint64_t b);
@@ -663,6 +680,12 @@ size_t arc_frame_count(void);
 size_t arc_frame_seen(void);
 uint64_t arc_frame_at(size_t back);  // 0 is the most recent
 void arc_frame_clear(void);
+
+/* A per-frame tally of how often each guest function ran, for finding a loop
+   that runs once per drawn thing. Off unless ARC_FN_CENSUS is set. */
+void arc_census_note(uint64_t packed);
+void arc_census_report(int top);
+int arc_census_pending(void);
 size_t arc_trace_count(void);
 const char* arc_trace_at(size_t back);  // 0 is the most recent
 void arc_trace_clear(void);
@@ -679,6 +702,8 @@ typedef void (*Arc64Fn)(Arm64Ctx*);
 // the native bridge, which is exactly right for a host that only has imports.
 typedef void (*ArcDispatchFn)(Arm64Ctx*, uint64_t);
 void arc_set_dispatch(ArcDispatchFn fn);
+// Where the main image landed, so ARC_WATCH can name a function by offset.
+void arc_set_image_base(uint64_t base);
 void arc_dispatch(Arm64Ctx* c, uint64_t target);
 
 #ifdef __cplusplus
