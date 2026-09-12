@@ -448,15 +448,16 @@ void ShowVertices(unsigned texture, GLsizei count, GLenum type,
       float f[4] = {0, 0, 0, 0};
       const size_t off = static_cast<size_t>(v) *
                          static_cast<size_t>(attrs[a].stride);
-      const size_t n = sizeof(float) *
-                       (attrs[a].size > 4 ? 4 : attrs[a].size);
+      const size_t nbytes = sizeof(float) *
+                            (attrs[a].size > 4 ? 4 : attrs[a].size);
       if (attrs[a].buf)
         get_sub(0x8892,
                 static_cast<intptr_t>(
                     reinterpret_cast<uintptr_t>(attrs[a].base) + off),
-                static_cast<intptr_t>(n), f);
+                static_cast<intptr_t>(nbytes), f);
       else if (attrs[a].base)
-        memcpy(f, static_cast<const unsigned char*>(attrs[a].base) + off, n);
+        memcpy(f, static_cast<const unsigned char*>(attrs[a].base) + off,
+               nbytes);
       fprintf(stderr, "[gl]     attr %d size %d:  % .3f % .3f % .3f % .3f\n",
               a, attrs[a].size, f[0], f[1], f[2], f[3]);
     }
