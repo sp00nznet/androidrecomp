@@ -41,6 +41,30 @@ uint64_t ShimResolvePthread(const char* name);
 size_t ShimPthreadCount();
 
 // POSIX, BSD and locale entry points the host CRT does not export by name.
+// The one monotonic clock. Android's SystemClock.uptimeMillis() and
+// CLOCK_MONOTONIC are the same clock, and anything that reads one and
+// compares against the other -- an HTTP stack timing a connect is the usual
+// one -- needs them to still be the same clock here.
+uint64_t ShimMonotonicMillis();
+
+// A guest symbol's address, from the images the loader mapped. The shim
+// occasionally has to call *into* the guest rather than answer a call out of
+// it -- a Java callback the host has to deliver itself, say -- and the entry
+// point for that is a guest symbol like any other.
+uint64_t ShimGuestSymbol(const char* name);
+
+// Trace a stream being closed, by the path it was opened with. A no-op
+// unless ARC_TRACE_FILES is set.
+void ShimTraceClose(void* stream);
+
+// A host implementation that must win over a lifted dependency's, or 0.
+// Consulted before anything else when an import is bound.
+uint64_t ShimOverride(const char* name);
+
+// The float-taking and float-returning imports, bound as context-taking
+// natives because the integer bridge cannot pass or return an FP register.
+uint64_t ShimResolveMath(const char* name);
+
 uint64_t ShimResolvePosix(const char* name);
 size_t ShimPosixCount();
 

@@ -386,29 +386,153 @@ unsigned arc_trace_thread(void) {
   return t_trace_id;
 }
 
+/* ARC_TRACE_GUEST prints every guest function entered, which for a title
+   that has booted is millions of lines a second -- a firehose that costs far
+   more than the thing it is watching, and buries the one call the question is
+   about. ARC_TRACE_FN names that call instead: a comma-separated list of
+   packed values in hex, and only those are printed. Same trace, with a
+   filter, so a question about one function costs one function's worth of
+   output. */
+static int arc_traced_fn(uint64_t packed) {
+  static const char* list;
+  static int looked;
+  const char* p;
+  if (!looked) {
+    looked = 1;
+    list = getenv("ARC_TRACE_FN");
+  }
+  if (!list) return 1;
+  for (p = list; *p;) {
+    char* end;
+    unsigned long long v = strtoull(p, &end, 16);
+    if (end != p && v == packed) return 1;
+    p = (end != p) ? end : p + 1;
+    while (*p && *p != ',') ++p;
+    while (*p == ',') ++p;
+  }
+  return 0;
+}
+
 #if defined(ARC_FRAMES)
 void arc_frame_note(uint64_t packed) {
   /* The ring holds sixteen frames, which says where a fault happened and
      nothing about how a call that returned cleanly spent its time. A whole
      trace answers the other question: which branch a state machine took. */
   static int trace = -1;
-  if (trace < 0) trace = getenv("ARC_TRACE_GUEST") != NULL;
+  if (trace < 0)
+    trace = getenv("ARC_TRACE_GUEST") != NULL || getenv("ARC_TRACE_FN") != NULL;
   /* errno is saved across this: the trace fires on every guest function
      entry, including the one between a call that set errno and the guest
      reading it, and fprintf may set errno itself. Without this a traced
      run is not a run of the same program -- which is the one thing a
      diagnostic must never be. */
-  if (trace) {
+  if (trace && arc_traced_fn(packed)) {
     const int saved = errno;
     fprintf(stderr, "[fn] t%u %llx\n", arc_trace_thread(),
             (unsigned long long)packed);
     errno = saved;
   }
+  arc_census_note(packed);
   t_frames[t_frame_next] = packed;
   t_frame_next = (t_frame_next + 1) % ARC_FRAME_RING;
   ++t_frame_seen;
 }
 #endif
+
+/* How often each guest function runs.
+ *
+ * The ring says which functions ran most recently; it cannot say which ran
+ * ten thousand times. That is the question when a layer draws far more
+ * sprites than it should: the loop responsible is whichever function runs
+ * once per sprite, and nothing else in this kit counts. ARC_FN_CENSUS turns
+ * it on; arc_census_report prints the busiest and starts again.
+ *
+ * ponytail: a fixed open-addressed table with no growth and no eviction --
+ * it counts a few thousand distinct functions and stops learning new ones
+ * after that, which is enough to find a hot loop. Make it grow if a run ever
+ * needs more than the report says it saw. */
+#define ARC_CENSUS_SLOTS 8192
+static uint64_t g_census_key[ARC_CENSUS_SLOTS];
+static uint64_t g_census_hits[ARC_CENSUS_SLOTS];
+static int g_census_on = -1;
+static uint64_t g_census_lost;
+
+/* Where to start counting from.
+ *
+ * A frame number is the wrong handle on work that happens once. The town's
+ * sprites are built during loading, and a tally that starts when the process
+ * does buries twenty thousand one-time calls under a million steady-state
+ * ones. ARC_FN_CENSUS_FROM=<image offset> clears the tally the first time
+ * that guest function runs, so the next report covers the build and not the
+ * history before it. */
+static uint64_t g_census_from;
+static int g_census_started;
+static int g_census_pending;
+
+/* True once the marker has run and the tally has not been reported yet, so
+   the caller can report at the first frame boundary after it -- which is the
+   work the marker introduces, and nothing after. */
+int arc_census_pending(void) { return g_census_pending; }
+
+static void arc_census_clear(void) {
+  size_t i;
+  for (i = 0; i < ARC_CENSUS_SLOTS; ++i) {
+    g_census_key[i] = 0;
+    g_census_hits[i] = 0;
+  }
+  g_census_lost = 0;
+}
+
+void arc_census_note(uint64_t packed) {
+  size_t i;
+  if (g_census_on < 0) {
+    const char* from = getenv("ARC_FN_CENSUS_FROM");
+    g_census_on = getenv("ARC_FN_CENSUS") != NULL || from != NULL;
+    if (from) g_census_from = strtoull(from, NULL, 16);
+  }
+  if (!g_census_on) return;
+  if (g_census_from && !g_census_started && packed == g_census_from) {
+    g_census_started = 1;
+    g_census_pending = 1;
+    arc_census_clear();
+    fprintf(stderr, "[fncensus] counting from %#llx\n",
+            (unsigned long long)packed);
+  }
+  i = (size_t)((packed * 0x9E3779B97F4A7C15ull) >> 51) % ARC_CENSUS_SLOTS;
+  for (;;) {
+    if (g_census_key[i] == packed) { ++g_census_hits[i]; return; }
+    if (g_census_key[i] == 0) {
+      g_census_key[i] = packed;
+      g_census_hits[i] = 1;
+      return;
+    }
+    i = (i + 1) % ARC_CENSUS_SLOTS;
+    if (g_census_key[i] == 0 && g_census_key[(i + 1) % ARC_CENSUS_SLOTS] == 0) {
+      /* Wrapped far enough to call it full. */
+      ++g_census_lost;
+      return;
+    }
+  }
+}
+
+void arc_census_report(int top) {
+  size_t i, k;
+  if (g_census_on <= 0) return;
+  g_census_pending = 0;
+  fprintf(stderr, "[fncensus] busiest guest functions this frame:\n");
+  for (k = 0; k < (size_t)top; ++k) {
+    size_t best = ARC_CENSUS_SLOTS;
+    uint64_t most = 0;
+    for (i = 0; i < ARC_CENSUS_SLOTS; ++i)
+      if (g_census_hits[i] > most) { most = g_census_hits[i]; best = i; }
+    if (best == ARC_CENSUS_SLOTS) break;
+    fprintf(stderr, "[fncensus]   %#llx  %llu\n",
+            (unsigned long long)g_census_key[best],
+            (unsigned long long)g_census_hits[best]);
+    g_census_hits[best] = 0;
+  }
+  arc_census_clear();
+}
 
 size_t arc_frame_count(void) {
   return t_frame_seen < ARC_FRAME_RING ? t_frame_seen : ARC_FRAME_RING;
@@ -436,12 +560,94 @@ static ArcExplainFn g_explain;
 
 void arc_set_explain(ArcExplainFn fn) { g_explain = fn; }
 
-void arc_dispatch(Arm64Ctx* c, uint64_t target) {
-  if (g_dispatch) {
-    g_dispatch(c, target);
-    return;
+/* One guest function, watched: its arguments going in and its result coming
+   out, with the memory each pointer argument names.
+ *
+ * A statically linked library still reaches its own exported functions through
+ * the PLT, and a lifted PLT stub is an indirect branch -- so every such call
+ * arrives here, with the context in hand. That makes this the one place a
+ * specific guest function can be observed without regenerating the program:
+ * ARC_WATCH names it by address, and the dump is what a printf inside it would
+ * have printed if the source were ours to edit. Answering "is this routine
+ * computing the right thing" is otherwise a rebuild of 430 MB of C away.
+ */
+/* Named by image offset rather than by mapped address: the address moves
+   every run, and the offset is what a disassembler and every other trace in
+   this kit already speak. */
+static uint64_t g_watch_base;
+
+void arc_set_image_base(uint64_t base) { g_watch_base = base; }
+
+static int arc_watched(uint64_t target) {
+  static const char* list;
+  static int looked;
+  const char* p;
+  if (!looked) {
+    looked = 1;
+    list = getenv("ARC_WATCH");
   }
-  arc_dispatch_miss(c, target);
+  if (!list || target < g_watch_base) return 0;
+  target -= g_watch_base;
+  for (p = list; *p;) {
+    char* end;
+    unsigned long long v = strtoull(p, &end, 16);
+    if (end != p && v == target) return 1;
+    p = (end != p) ? end : p + 1;
+    while (*p && *p != ',') ++p;
+    while (*p == ',') ++p;
+  }
+  return 0;
+}
+
+static void arc_watch_bytes(const char* label, uint64_t p, int n) {
+  int i;
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION mbi;
+  if (!p || !VirtualQuery((void*)(uintptr_t)p, &mbi, sizeof mbi)) return;
+  if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return;
+  if (p + (uint64_t)n >
+      (uint64_t)(uintptr_t)mbi.BaseAddress + (uint64_t)mbi.RegionSize)
+    return;
+#else
+  if (!p) return;
+#endif
+  fprintf(stderr, "  %s %#llx:", label, (unsigned long long)p);
+  for (i = 0; i < n; ++i)
+    fprintf(stderr, " %02x", ((const unsigned char*)(uintptr_t)p)[i]);
+  fprintf(stderr, "  |");
+  for (i = 0; i < n; ++i) {
+    unsigned char b = ((const unsigned char*)(uintptr_t)p)[i];
+    fputc(b >= 0x20 && b < 0x7f ? b : '.', stderr);
+  }
+  fprintf(stderr, "|\n");
+}
+
+/* x8 is dumped on the way out as well as in, from the value it had on entry.
+   A C++ function returning anything larger than two words returns it through
+   a buffer the caller passes in x8, so for a great deal of real code the
+   result is not in x0 at all -- and x8 itself is caller-saved, so reading it
+   afterwards reads whatever the callee left there. */
+static void arc_watch_report(const char* when, const Arm64Ctx* c,
+                             uint64_t target, uint64_t sret) {
+  int i;
+  fprintf(stderr, "[watch] %s %#llx t%u  ", when, (unsigned long long)target,
+          arc_trace_thread());
+  for (i = 0; i < 6; ++i)
+    fprintf(stderr, "x%d=%llx ", i, (unsigned long long)c->x[i]);
+  fprintf(stderr, "x8=%llx\n", (unsigned long long)sret);
+  for (i = 0; i < 4; ++i) arc_watch_bytes("arg", c->x[i], 64);
+  arc_watch_bytes("x8 ", sret, 32);
+}
+
+void arc_dispatch(Arm64Ctx* c, uint64_t target) {
+  const int watch = arc_watched(target);
+  const uint64_t sret = c->x[8];
+  if (watch) arc_watch_report("call", c, target, sret);
+  if (g_dispatch)
+    g_dispatch(c, target);
+  else
+    arc_dispatch_miss(c, target);
+  if (watch) arc_watch_report("back", c, target, sret);
 }
 
 // Big enough for an unwinder or a C++ initialiser, which is what these

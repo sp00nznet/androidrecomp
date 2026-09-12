@@ -105,6 +105,39 @@ constexpr size_t kGuestThreadStack = 16 * 1024 * 1024;
 constexpr size_t kGuestThreadHeadroom = 1 * 1024 * 1024;
 constexpr size_t kHostThreadStack = 256u << 20;
 
+// How many guest threads are alive, and the ceiling on that.
+//
+// A real system has one: pthread_create answers EAGAIN when a process asks
+// for more than it may have. A host with no ceiling instead gives a runaway
+// everything it asks for, and the first thing to notice is the machine
+// rather than the port -- which is not a diagnosis anyone can act on.
+//
+// It is a backstop, not a policy, and the number is deliberately far above
+// what any title needs: a guest that reaches it aborts, because the NDK's
+// std::thread turns EAGAIN into an exception nothing catches, so a ceiling
+// low enough to be tidy would kill runs that were working. Set
+// ARC_MAX_THREADS lower to find out *which* function is asking, together
+// with ARC_TRACE_THREADS; leave it alone otherwise.
+std::atomic<long> g_live_threads{0};
+std::atomic<long> g_threads_made{0};
+const std::chrono::steady_clock::time_point g_first_thread =
+    std::chrono::steady_clock::now();
+
+long GuestThreadCeiling() {
+  static const long limit = [] {
+    const char* s = getenv("ARC_MAX_THREADS");
+    const long v = s ? strtol(s, nullptr, 10) : 0;
+    // Two thousand. Measured rather than chosen: this host stopped being able
+    // to start threads at all somewhere past ten thousand, and by then every
+    // other program on it was in trouble too -- including the tools looking
+    // at the problem. A guest that aborts with the message above is a bug
+    // report; a machine that cannot fork is not.
+    return v > 0 ? v : 2048;
+  }();
+  return limit;
+}
+
+
 struct Thread {
 #if defined(_WIN32)
   void* handle = nullptr;
@@ -397,16 +430,48 @@ void GuestThreadBody(uint64_t entry, Arm64Ctx* ctx, unsigned id) {
 #endif
 }
 
+// A guest stack, sixteen megabytes of address space and almost none of it
+// real.
+//
+// This was a std::vector, whose constructor zeroes what it allocates -- so
+// every guest thread touched all sixteen megabytes before running an
+// instruction, and every page of it was resident for the life of the thread.
+// A title that leaks threads then leaks *memory* at sixteen megabytes a go,
+// and what should have been a wasted handle becomes a machine that stops
+// responding. Demand-zero instead: the pages arrive as the guest stack is
+// actually used, which for most threads is a few kilobytes, and the size can
+// stay generous because it costs nothing to promise it.
+void* AllocGuestStack(size_t size) {
+#if defined(_WIN32)
+  return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+  // calloc, not malloc+memset: for a block this size it is a fresh mapping,
+  // which the kernel already guarantees zeroed without anyone writing to it.
+  return calloc(1, size);
+#endif
+}
+
+void FreeGuestStack(void* p) {
+#if defined(_WIN32)
+  if (p) VirtualFree(p, 0, MEM_RELEASE);
+#else
+  free(p);
+#endif
+}
+
 void RunGuestThread(GuestThreadStart* s) {
   t_self_id = s->id;
-  std::vector<uint8_t> stack(kGuestThreadStack);
+  ++g_live_threads;
+  void* stack = AllocGuestStack(kGuestThreadStack);
   Arm64Ctx ctx;
   memset(&ctx, 0, sizeof(ctx));
-  ctx.sp = (reinterpret_cast<uint64_t>(stack.data()) + kGuestThreadStack -
+  ctx.sp = (reinterpret_cast<uint64_t>(stack) + kGuestThreadStack -
             kGuestThreadHeadroom) & ~15ULL;
   ctx.x[0] = s->arg;
   GuestThreadBody(s->entry, &ctx, s->id);
   s->slot->result = reinterpret_cast<void*>(ctx.x[0]);
+  FreeGuestStack(stack);
+  --g_live_threads;
   delete s;
 }
 
@@ -422,15 +487,68 @@ void* GuestThreadMain(void* p) {
 }
 #endif
 
+// Which guest function each thread was started on, and how many there are so
+// far. A title that leaks threads looks from outside like a title that leaks
+// memory -- every thread carries a stack -- and the two have very different
+// fixes. ARC_TRACE_THREADS=1; the address is an image offset, so it names a
+// function in the same terms as every other trace here.
+void TraceCreate(uint64_t start) {
+  static const bool on = getenv("ARC_TRACE_THREADS") != nullptr;
+  const long n = ++g_threads_made;
+  if (!on) return;
+  fprintf(stderr, "[thread] #%ld start=%#llx from", n,
+          (unsigned long long)start);
+  // Who asked. "A title makes threads it never stops" is a symptom; the
+  // function doing the asking is the cause, and the frame ring already knows
+  // it -- printed as image offsets, the same currency as every other trace.
+  const size_t frames = arc_frame_count();
+  for (size_t i = 0; i < frames && i < 8; ++i) {
+    const unsigned long long packed = arc_frame_at(i);
+    fprintf(stderr, " %llx", packed & 0x00FFFFFFFFFFFFFFull);
+  }
+  fputc('\n', stderr);
+}
+
 int Create(uint64_t* out, const void*, uint64_t start, uint64_t arg) {
+  TraceCreate(start);
+  if (g_live_threads.load() >= GuestThreadCeiling()) {
+    // Said once. The caller retries, and a line per retry buries whatever the
+    // run was actually about.
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) {
+      // How fast, not just how many. A rate near the frame rate says the
+      // caller is doing this once per frame, which is a different bug from
+      // one that does it once per request or once per retry -- and it is the
+      // first thing worth knowing about a runaway.
+      const double secs = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - g_first_thread)
+                              .count();
+      fprintf(stderr,
+              "\n%ld guest threads are alive and none are finishing -- "
+              "refusing to make more.\n%.0f started in %.1f seconds (%.0f a "
+              "second).\nRun with ARC_TRACE_THREADS=1 to see which function "
+              "is asking, or raise ARC_MAX_THREADS.\n",
+              g_live_threads.load(), (double)g_threads_made.load(), secs,
+              secs > 0 ? g_threads_made.load() / secs : 0.0);
+    }
+    return 11 /* EAGAIN */;
+  }
   uint32_t id = 0;
   Thread* t = g_threads.Obtain(&id);
   if (!t) return 11 /* EAGAIN */;
 
   auto* s = new GuestThreadStart{start, arg, id, t};
 #if defined(_WIN32)
-  t->handle = CreateThread(nullptr, kHostThreadStack, GuestThreadMain, s, 0,
-                           nullptr);
+  // STACK_SIZE_PARAM_IS_A_RESERVATION, and it is not optional. Without the
+  // flag CreateThread reads its size argument as how much to *commit*, so a
+  // quarter-gigabyte stack is a quarter-gigabyte of real memory per thread
+  // before the thread has run an instruction. A title with a thread pool
+  // reaches ten gigabytes in seconds and dies -- with no fault, no message,
+  // and an exit code that reads like anything else. Reserved, the address
+  // space is there for a deep guest call chain and the pages arrive as the
+  // stack is actually used.
+  t->handle = CreateThread(nullptr, kHostThreadStack, GuestThreadMain, s,
+                           STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
   if (!t->handle) {
     delete s;
     return 11;

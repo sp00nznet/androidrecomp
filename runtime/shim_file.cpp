@@ -26,6 +26,7 @@
 #include <set>
 #include <string>
 
+#include <map>
 #include "shim.h"
 
 #if defined(_WIN32)
@@ -148,6 +149,46 @@ void TraceFile(const char* what, const char* path, bool found) {
             path ? path : "(null)");
 }
 
+// Which file a stream is, so that closing it can be traced by name.
+//
+// A trace of opens with no closes answers "did it find the file" and nothing
+// about lifetime, which is the question when a fault looks like something
+// reading through a handle another part of the engine has already let go.
+// Only kept while tracing: otherwise it is a map insertion per fopen for
+// nobody's benefit.
+std::mutex g_open_lock;
+std::map<FILE*, std::string> g_open_paths;
+
+void RememberOpen(FILE* f, const char* path) {
+  if (!TracingFiles() || !f) return;
+  std::lock_guard<std::mutex> held(g_open_lock);
+  g_open_paths[f] = path ? path : "(null)";
+}
+
+void TraceCloseImpl(FILE* f) {
+  if (!TracingFiles()) return;
+  std::string path = "(never opened here)";
+  {
+    std::lock_guard<std::mutex> held(g_open_lock);
+    auto it = g_open_paths.find(f);
+    if (it != g_open_paths.end()) {
+      path = it->second;
+      g_open_paths.erase(it);
+    }
+  }
+  fprintf(stderr, "[file] %-8s %-5s %s\n", "fclose", "ok", path.c_str());
+}
+
+}  // namespace
+
+// fclose lives in the posix half of the shim; the map of open paths lives
+// here, next to fopen that fills it.
+void ShimTraceClose(void* stream) {
+  TraceCloseImpl(static_cast<FILE*>(stream));
+}
+
+namespace {
+
 int StatPath(const char* path, GuestStat* out) {
 #if defined(_WIN32)
   struct __stat64 st;
@@ -235,6 +276,7 @@ FILE* Fopen(const char* path, const char* mode) {
   if (!has_b) binary[n++] = 'b';
   FILE* f = fopen(path, binary);
   TraceFile("fopen", path, f != nullptr);
+  RememberOpen(f, path);
   return f;
 }
 

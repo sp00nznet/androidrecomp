@@ -554,6 +554,12 @@ int Select(int n, void* r, void* w, void* e, void* timeout) {
   GuestFdsToHost(e, n, &he);
   const int rc = ::select(n, r ? &hr : nullptr, w ? &hw : nullptr,
                           e ? &he : nullptr, static_cast<timeval*>(timeout));
+  if (TracingNet()) {
+    KeepErrno keep;
+    fprintf(stderr, "[net] select n=%d r=%u w=%u e=%u -> rc=%d\n", n,
+            r ? hr.fd_count : 0u, w ? hw.fd_count : 0u, e ? he.fd_count : 0u,
+            rc);
+  }
   if (r) HostFdsToGuest(&hr, r, n);
   if (w) HostFdsToGuest(&hw, w, n);
   if (e) HostFdsToGuest(&he, e, n);
@@ -600,6 +606,29 @@ void FreeGuestAddrinfo(GuestAddrinfo* list) {
   }
 }
 
+// "127.0.0.1" and "localhost" are already where the sidecar is, and sending
+// them through the redirect would only send it to itself.
+bool IsLoopbackName(const char* node) {
+  if (!node) return false;
+  in_addr a{};
+  if (::inet_pton(AF_INET, node, &a) == 1)
+    return (ntohl(a.s_addr) >> 24) == 127;
+  return strcmp(node, "localhost") == 0;
+}
+
+// One answer, in the shape getaddrinfo returns and the guest expects.
+GuestAddrinfo* OneAddress(const sockaddr_in& addr, const addrinfo* hints) {
+  auto* g = static_cast<GuestAddrinfo*>(calloc(1, sizeof(GuestAddrinfo)));
+  g->ai_family = FamilyToGuest(AF_INET);
+  g->ai_socktype = hints && hints->ai_socktype ? hints->ai_socktype : SOCK_STREAM;
+  g->ai_protocol = hints && hints->ai_protocol ? hints->ai_protocol : IPPROTO_TCP;
+  g->ai_addrlen = sizeof(sockaddr_in);
+  g->ai_addr = static_cast<sockaddr*>(malloc(sizeof(sockaddr_in)));
+  memcpy(g->ai_addr, &addr, sizeof(sockaddr_in));
+  SockaddrToGuest(g->ai_addr, sizeof(sockaddr_in));
+  return g;
+}
+
 int Getaddrinfo(const char* node, const char* service, const void* hints_in,
                 GuestAddrinfo** out) {
   EnsureWinsock();
@@ -614,6 +643,31 @@ int Getaddrinfo(const char* node, const char* service, const void* hints_in,
     hints.ai_socktype = g->ai_socktype;
     hints.ai_protocol = g->ai_protocol;
     hints_ptr = &hints;
+  }
+
+  // A name whose connection is going to be redirected anyway does not need
+  // resolving, and resolving it is not free: the servers this title was built
+  // against are gone, so every lookup runs to the resolver's own timeout on a
+  // thread the HTTP stack made for it. It then gives up, makes another
+  // thread, and asks again. That is the whole of the thread storm -- thousands
+  // of threads, each holding a stack, and a process that dies of memory
+  // exhaustion long before it finishes loading. Answering here with the
+  // address the connection was going to be sent to costs nothing and is the
+  // same answer.
+  //
+  // TLS is the exception, as it is at connect: the reachability check reaches
+  // a real well-known host over 443, and only a real lookup can answer it.
+  {
+    sockaddr_in target{};
+    const int port = service ? atoi(service) : 0;
+    if (node && RedirectTarget(&target) && port != kTlsPort &&
+        !IsLoopbackName(node)) {
+      *out = OneAddress(target, hints_ptr);
+      if (TracingNet())
+        fprintf(stderr, "[net] getaddrinfo(%s, %s) answered with the redirect "
+                        "target\n", node, service ? service : "(null)");
+      return 0;
+    }
   }
 
   addrinfo* host = nullptr;
@@ -726,6 +780,15 @@ int Poll(void* fds_in, unsigned long nfds, int timeout) {
     host[i].revents = 0;
   }
   const int rc = ::WSAPoll(host.data(), static_cast<ULONG>(nfds), timeout);
+  // Only the waits that are asking "is this connect finished yet", which is
+  // the one poll a stalled HTTP stack repeats and the one worth seeing. The
+  // readable-data waits are the steady state and would bury it.
+  if (TracingNet() && (host[0].events & POLLWRNORM)) {
+    KeepErrno keep;
+    fprintf(stderr, "[net] poll n=%lu fd=%d ev=%#x t=%d -> rc=%d rev=%#x\n",
+            nfds, (int)host[0].fd, host[0].events, timeout, rc,
+            host[0].revents);
+  }
   for (unsigned long i = 0; i < nfds; ++i) {
     short r = 0;
     if (host[i].revents & (POLLRDNORM | POLLRDBAND)) r |= kGuestPollIn;
@@ -821,10 +884,31 @@ int Getpwuid_r(uint32_t, void*, char*, uint64_t, void** result) {
   if (result) *result = nullptr;
   return 0;
 }
+// How many cores to admit to.
+//
+// The number is not cosmetic: an engine sizes its worker pools from it, so it
+// decides how much of the asset pipeline runs at once. A shipped Android
+// binary has whatever races a shipped Android binary has, and more workers
+// means losing them more often -- so this is the first knob to reach for when
+// a fault looks like one thread using what another just freed. ARC_CORES=1
+// serialises the pools, which is slower and answers the question.
+int64_t CoreCount() {
+  static const int64_t cores = [] {
+    const char* how = getenv("ARC_CORES");
+    const int64_t asked = how ? strtoll(how, nullptr, 10) : 0;
+    return asked > 0 ? asked : 8;
+  }();
+  return cores;
+}
+
 int64_t Sysconf(int name) {
   // _SC_PAGESIZE (39) and _SC_NPROCESSORS_ONLN (97) on Bionic.
   if (name == 39) return 4096;
-  if (name == 97) return 8;
+  if (name == 97) return CoreCount();
+  // _SC_NPROCESSORS_CONF (96) is the same question about cores that exist
+  // rather than cores that are online, and a pool sized from it would ignore
+  // the knob above.
+  if (name == 96) return CoreCount();
   return -1;
 }
 // Zero for everything, and AT_HWCAP is the one to leave that way on purpose.
@@ -1053,6 +1137,14 @@ const Entry kTable[] = {
 #undef E
 
 }  // namespace
+
+uint64_t ShimGuestSymbol(const char* name) {
+  std::lock_guard<std::mutex> g(g_images_lock);
+  for (const ElfImage* img : g_images)
+    if (uint64_t a = img->Lookup(name)) return a;
+  return 0;
+}
+
 
 // Translate the last Winsock error into errno, in the numbers the guest's libc
 // uses. Returns the value it set, so a caller can test it without a second

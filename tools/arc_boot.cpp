@@ -12,6 +12,9 @@
 
 #include <setjmp.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #if defined(_WIN32)
@@ -26,6 +29,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <dbghelp.h>
 #endif
 
 #include "arm64_context.h"
@@ -39,6 +43,9 @@ namespace {
 
 arc::ElfImage g_image;
 std::vector<std::unique_ptr<arc::ElfImage>> g_deps;
+// The subset of those the lifted program actually covers, which is the only
+// subset whose symbols an import may be bound to.
+std::vector<arc::ElfImage*> g_lifted_deps;
 
 // Unresolved imports bind into a guard page, one slot each, so a fault inside
 // it names the missing shim exactly. Turning an address back into a symbol is
@@ -138,7 +145,14 @@ const char* ExplainForRuntime(uint64_t addr) {
 // A pointer chain, hex-dumped. "d58/358:32" reads the image at +0xd58, follows
 // the 64-bit value there, adds 0x358, and prints 32 bytes -- which is how a
 // field of an engine singleton is reached from the outside, with no debugger.
-void ReportPeek(uint64_t image_base, const std::string& spec) {
+#if defined(_WIN32)
+bool ReadableHere(const void* at, size_t n);
+#endif
+
+void ReportPeek(uint64_t image_base, const std::string& spec_in) {
+  std::string spec = spec_in;
+  const bool deref_each = !spec.empty() && spec.back() == '*';
+  if (deref_each) spec.pop_back();
   const size_t colon = spec.find(':');
   const size_t len = colon == std::string::npos
                          ? 64
@@ -169,6 +183,32 @@ void ReportPeek(uint64_t image_base, const std::string& spec) {
   printf("  peek %s = %#llx\n", spec.c_str(),
          static_cast<unsigned long long>(at));
   const auto* p = reinterpret_cast<const unsigned char*>(at);
+  // A trailing "*" says the range is an array of pointers, and prints what
+  // each one points at rather than the pointer. That is the shape of a
+  // std::vector of polymorphic objects, where the interesting word is each
+  // element's vtable -- and picking the one element out of a thousand whose
+  // vtable is not what its neighbours' are is otherwise a run per element.
+  if (deref_each) {
+    for (size_t i = 0; i + 8 <= len; i += 8) {
+      uint64_t slot = 0;
+      memcpy(&slot, p + i, sizeof slot);
+      uint64_t word = 0;
+      bool readable = false;
+#if defined(_WIN32)
+      readable = slot >= 0x10000 && ReadableHere(
+                                        reinterpret_cast<const void*>(slot),
+                                        sizeof word);
+#else
+      readable = slot >= 0x10000;
+#endif
+      if (readable) memcpy(&word, reinterpret_cast<const void*>(slot),
+                           sizeof word);
+      printf("    [%zu] %#llx -> %#llx\n", i / 8,
+             static_cast<unsigned long long>(slot),
+             static_cast<unsigned long long>(word));
+    }
+    return;
+  }
   for (size_t i = 0; i < len; i += 16) {
     printf("    +%04zx ", i);
     for (size_t j = 0; j < 16 && i + j < len; ++j) printf("%02x ", p[i + j]);
@@ -321,6 +361,100 @@ void ReportGuestStack(const Arm64Ctx* c) {
 // null and what the ones around it were -- an object pointer that survived a
 // null check, with a zero where its vtable should be, says something quite
 // different from a null argument.
+#if defined(_WIN32)
+bool ReadableHere(const void* at, size_t n) {
+  MEMORY_BASIC_INFORMATION info;
+  if (!VirtualQuery(at, &info, sizeof info)) return false;
+  if (info.State != MEM_COMMIT) return false;
+  const DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                   PAGE_EXECUTE_WRITECOPY;
+  if (!(info.Protect & ok) || (info.Protect & PAGE_GUARD)) return false;
+  // And it has to be n bytes inside *this* region: the next one up may be
+  // unmapped, and a dump is not worth a second fault.
+  const auto start = reinterpret_cast<const char*>(info.BaseAddress);
+  const auto here = reinterpret_cast<const char*>(at);
+  return static_cast<size_t>(here - start) + n <= info.RegionSize;
+}
+#endif
+
+// What the registers point at, for the ones that point at anything.
+//
+// A register dump names an address; the bytes there name the object. Engine
+// objects carry their own identity -- a std::string with a pack's name, a
+// four-byte tag, a vtable pointer that places the class -- and the field that
+// actually held the bad value is usually a long way into the object, so this
+// prints enough of it to reach one. Where a value here looks like a pointer to
+// another object, ARC_DUMP_DEEP follows it one level: a field that is -1 says
+// nothing on its own, and the object that owns it says everything.
+void DumpBytes(const char* label, uint64_t at, size_t want) {
+  char bytes[0x100];
+  if (want > sizeof bytes) want = sizeof bytes;
+#if defined(_WIN32)
+  // Reading it is the whole risk, so ask first rather than fault inside the
+  // fault report.
+  while (want && !ReadableHere(reinterpret_cast<const void*>(at), want))
+    want /= 2;
+  if (!want) return;
+#endif
+  memcpy(bytes, reinterpret_cast<const void*>(at), want);
+  for (size_t i = 0; i < want; i += 16) {
+    printf("    %-8s +%03zx  ", i ? "" : label, i);
+    for (size_t j = 0; j < 16; ++j)
+      printf("%s", j < want - i ? "" : "   ");
+    for (size_t j = 0; j < 16 && i + j < want; ++j)
+      printf("%02x%s", static_cast<unsigned char>(bytes[i + j]),
+             (j % 8) == 7 ? " " : "");
+    printf(" |");
+    for (size_t j = 0; j < 16 && i + j < want; ++j)
+      putchar(bytes[i + j] >= 32 && bytes[i + j] < 127 ? bytes[i + j] : '.');
+    printf("|\n");
+  }
+}
+
+void ReportPointedAt(const Arm64Ctx* c) {
+  // Deliberately narrow: the callee-saved registers plus the first two
+  // arguments are where a `this` lives, and dumping all thirty-one buries it.
+  static const int kInteresting[] = {0, 1, 19, 20, 21, 22};
+  // How much of each object, and whether to follow the pointers inside it.
+  // Default is small because most faults are answered by the first line.
+  static const char* deep = getenv("ARC_DUMP_DEEP");
+  const size_t span = deep ? strtoull(deep, nullptr, 0) : 32;
+  bool any = false;
+  for (int which : kInteresting) {
+    const uint64_t at = c->x[which];
+    if (at < 0x10000) continue;
+    if (!any) {
+      printf("  what they point at:\n");
+      any = true;
+    }
+    char label[8];
+    snprintf(label, sizeof label, "x%d", which);
+    DumpBytes(label, at, span ? span : 32);
+    // One level down, at an offset the reader names. A field holding -1 says
+    // nothing about which object owns it; the object at the pointer beside it
+    // usually says everything, and its name is often literally in there.
+    static const char* follow = getenv("ARC_DUMP_FOLLOW");
+    if (!follow) continue;
+    for (const char* p = follow; *p;) {
+      const uint64_t off = strtoull(p, nullptr, 16);
+      const char* comma = strchr(p, ',');
+      p = comma ? comma + 1 : p + strlen(p);
+      uint64_t inner = 0;
+#if defined(_WIN32)
+      if (!ReadableHere(reinterpret_cast<const void*>(at + off), sizeof inner))
+        continue;
+#endif
+      memcpy(&inner, reinterpret_cast<const void*>(at + off), sizeof inner);
+      if (inner < 0x10000) continue;
+      char deeper[24];
+      snprintf(deeper, sizeof deeper, "x%d+%llx", which,
+               static_cast<unsigned long long>(off));
+      DumpBytes(deeper, inner, span ? span : 32);
+    }
+  }
+}
+
 void ReportRegisters(const Arm64Ctx* c) {
   // Only a program lifted with --pc-notes keeps this, and it is the one thing
   // that turns "somewhere in this function" into an instruction.
@@ -348,6 +482,7 @@ void ReportRegisters(const Arm64Ctx* c) {
     printf("\n");
   }
   printf("     sp =%016llx\n", static_cast<unsigned long long>(c->sp));
+  ReportPointedAt(c);
   ReportGuestStack(c);
 }
 
@@ -360,6 +495,37 @@ void ReportTrail() {
     printf(" %s", what ? what : "?");
   }
   printf("\n");
+}
+
+// A frame that never ends looks exactly like a slow one from outside. On
+// Windows it looks like a window that stopped responding, which is all the
+// user is ever told: the loop is inside the guest and never comes back to
+// pump messages. The guest is blocked somewhere specific, and being blocked
+// is the one state where reading its stack from another thread is safe --
+// nothing is moving. ARC_STALL_SECONDS, 30 by default, 0 to switch it off.
+std::atomic<long> g_frames_done{0};
+
+void StartStallWatch(const Arm64Ctx* c) {
+  const char* s = getenv("ARC_STALL_SECONDS");
+  const long limit = s ? strtol(s, nullptr, 10) : 30;
+  if (limit <= 0) return;
+  std::thread([c, limit] {
+    long seen = -1, still = 0;
+    bool said = false;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      const long now = g_frames_done.load();
+      if (now != seen) { seen = now; still = 0; said = false; continue; }
+      if (++still < limit || said) continue;
+      said = true;
+      printf("\nno frame completed in %ld seconds -- the guest is blocked\n",
+             still);
+      ReportFrames();
+      ReportTrail();
+      ReportRegisters(c);
+      fflush(stdout);
+    }
+  }).detach();
 }
 
 // The guest stack, and where in it the stack pointer starts.
@@ -395,10 +561,92 @@ int RunWithRecovery(Arm64Ctx* c, uint64_t target) {
 uint64_t g_fault_address;
 const char* g_fault_kind = "";
 
+// And which code touched it. A guest address alone cannot say whether lifted
+// code or a shim read it: both are compiled into this executable. The host
+// program counter can, because this build has symbols -- so a fault can answer
+// "inside AlGenBuffers" or "inside fn0_13e4410" instead of leaving a register
+// dump to be read as tea leaves. That matters because a dumped guest context
+// holds the *guest's* registers, which host code neither uses nor updates:
+// read as the faulting state, it is a fiction.
+uint64_t g_fault_pc;
+
+std::string HostSymbol(uint64_t pc) {
+  if (!pc) return std::string();
+  static const bool ready =
+      SymInitialize(GetCurrentProcess(), nullptr, TRUE) != 0;
+  char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+  auto* info = reinterpret_cast<SYMBOL_INFO*>(buf);
+  info->SizeOfStruct = sizeof(SYMBOL_INFO);
+  info->MaxNameLen = MAX_SYM_NAME;
+  DWORD64 delta = 0;
+  char out[MAX_PATH + MAX_SYM_NAME];
+  // The nearest symbol is reported *after* the module offset, never instead of
+  // it. A Release build has no PDB, so SymFromAddr can only see what the image
+  // exports -- and an executable exports almost nothing, so it answers with
+  // whichever CRT internal happens to be nearest and a delta of any size. That
+  // is not a location; the offset into the module is, and arc_boot.map turns
+  // it into a name.
+  HMODULE mod = nullptr;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCSTR>(pc), &mod) &&
+      mod) {
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(mod, path, sizeof path);
+    char nearby[MAX_SYM_NAME + 32] = {};
+    if (ready && SymFromAddr(GetCurrentProcess(), pc, &delta, info))
+      snprintf(nearby, sizeof nearby, " (nearest export %s+%#llx)", info->Name,
+               static_cast<unsigned long long>(delta));
+    const char* leaf = strrchr(path, '\\');
+    snprintf(out, sizeof out, "%s+%#llx%s", leaf ? leaf + 1 : path,
+             static_cast<unsigned long long>(pc -
+                                             reinterpret_cast<uint64_t>(mod)),
+             nearby);
+    return out;
+  }
+  return std::string();
+}
+
+// The host stack at the fault, which is a different question from the guest's.
+// A fault inside the C runtime says nothing about who called it, and the guest
+// call stack cannot say either -- the call left the guest. RtlVirtualUnwind
+// needs no symbols, only the unwind tables every x64 image carries, so this
+// works in a Release build with no PDB.
+uint64_t g_host_frames[24];
+unsigned g_host_frame_count;
+
+void CaptureHostStack(const CONTEXT* at) {
+  g_host_frame_count = 0;
+  if (!at) return;
+  CONTEXT c = *at;
+  for (unsigned i = 0; i < 24 && c.Rip; ++i) {
+    g_host_frames[g_host_frame_count++] = c.Rip;
+    DWORD64 image = 0;
+    RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+    if (!fn) {
+      // A leaf with no unwind entry: the return address is at the top of the
+      // stack, and one step by hand keeps the walk going.
+      uint64_t ret = 0;
+      if (!c.Rsp) break;
+      memcpy(&ret, reinterpret_cast<void*>(c.Rsp), sizeof ret);
+      if (!ret) break;
+      c.Rip = ret;
+      c.Rsp += 8;
+      continue;
+    }
+    void* handler_data = nullptr;
+    DWORD64 establisher = 0;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fn, &c, &handler_data,
+                     &establisher, nullptr);
+  }
+}
+
 int FaultFilter(EXCEPTION_POINTERS* ep, unsigned long* code) {
   *code = ep->ExceptionRecord->ExceptionCode;
   g_fault_address = 0;
   g_fault_kind = "";
+  g_fault_pc = ep->ContextRecord ? ep->ContextRecord->Rip : 0;
+  CaptureHostStack(ep->ContextRecord);
   if (ep->ExceptionRecord->NumberParameters >= 2) {
     g_fault_address = ep->ExceptionRecord->ExceptionInformation[1];
     switch (ep->ExceptionRecord->ExceptionInformation[0]) {
@@ -413,7 +661,20 @@ int FaultFilter(EXCEPTION_POINTERS* ep, unsigned long* code) {
 #else
 uint64_t g_fault_address;
 const char* g_fault_kind = "";
+uint64_t g_fault_pc;
+std::string HostSymbol(uint64_t) { return std::string(); }
+uint64_t g_host_frames[24];
+unsigned g_host_frame_count;
 #endif
+
+void ReportHostStack() {
+  if (!g_host_frame_count) return;
+  printf("  host stack at the fault, innermost first:\n");
+  for (unsigned i = 0; i < g_host_frame_count; ++i) {
+    const std::string where = HostSymbol(g_host_frames[i]);
+    printf("    %s\n", where.empty() ? "(unknown)" : where.c_str());
+  }
+}
 
 int CallGuarded(Arm64Ctx* c, uint64_t target, unsigned long* code) {
 #if defined(_WIN32)
@@ -658,10 +919,29 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Where an imported name is looked for, in order of preference.
+  //
+  // A dependency the APK ships wins over the shim -- it is the
+  // implementation the title was built against. But only if the lifted
+  // program covers it: an image that is mapped and *not* lifted is ARM code
+  // the dispatcher has nothing to route a branch to, so binding an import
+  // there is binding it to a dead end. The miss is reported on whichever
+  // thread makes the call, and when that is the render thread it ends the
+  // run -- which is how one unlifted audio library stopped a boot eight
+  // seconds in, forty-four frames after the window opened.
+  //
+  // So: lifted dependencies, then the shim, then an unlifted dependency as a
+  // last resort, because a branch that traps somewhere nameable is still
+  // better than an unresolved import.
   auto resolve = [](const char* name) -> uint64_t {
+    // Before anything, the short list of names the host has to win.
+    if (uint64_t a = arc::ShimOverride(name)) return a;
+    for (const auto& d : g_lifted_deps)
+      if (uint64_t a = d->Lookup(name)) return a;
+    if (uint64_t a = arc::ShimResolve(name)) return a;
     for (const auto& d : g_deps)
       if (uint64_t a = d->Lookup(name)) return a;
-    return arc::ShimResolve(name);
+    return 0;
   };
 
   for (const std::string& need : arc::ElfImage::ReadNeeded(path.string())) {
@@ -672,6 +952,12 @@ int main(int argc, char** argv) {
       arc::ShimRegisterImage(img.get());
       AnnounceImage(need, reinterpret_cast<uint64_t>(img->base()),
                     img->span(), img.get());
+      bool lifted = false;
+      for (size_t k = 0; k < ARC_IMAGE_COUNT; ++k) {
+        const char* known = arc_image_name(k);
+        if (known && need == known) { lifted = true; break; }
+      }
+      if (lifted) g_lifted_deps.push_back(img.get());
       g_deps.push_back(std::move(img));
     }
   }
@@ -760,6 +1046,7 @@ int main(int argc, char** argv) {
   Arm64Ctx ctx;
   memset(&ctx, 0, sizeof(ctx));
   ctx.image_base = reinterpret_cast<uint64_t>(g_image.base());
+  arc_set_image_base(ctx.image_base);
   ctx.sp = stack_top;
 
   // What the Java runtime does once a library is loaded: hand it the VM. A
@@ -974,6 +1261,21 @@ int main(int argc, char** argv) {
           if (*p == ',') ++p;
           continue;
         }
+        // `self:TEXT` names the object the method is called *on*, rather
+        // than an argument after it. Most JNI entry points ignore their
+        // object, but a bridge whose Java half kept one object per component
+        // does not: its native side asks Java which component this is, and
+        // the only honest answer is the one the caller had in mind. Written
+        // as an argument because that is where a command line can say it; it
+        // replaces x1 rather than taking a slot.
+        if (strncmp(p, "self:", 5) == 0) {
+          const char* comma = strchr(p + 5, ',');
+          const std::string text(p + 5, comma ? comma - (p + 5)
+                                              : strlen(p + 5));
+          ctx.x[1] = arc_jni_string(text.c_str());
+          p = comma ? comma + 1 : p + strlen(p);
+          continue;
+        }
         // `str:TEXT` for a Java String argument. The engine reads these
         // through GetStringUTFChars, so a number in the slot is a pointer it
         // follows into nothing.
@@ -1015,6 +1317,9 @@ int main(int argc, char** argv) {
       ReportRegisters(&ctx);
     } else {
       const std::string what = ExplainAddress(g_fault_address);
+      const std::string where = HostSymbol(g_fault_pc);
+      if (!where.empty()) printf("  faulted in %s\n", where.c_str());
+      ReportHostStack();
       printf("  %s on %s of %#llx%s%s\n", FaultName(code), g_fault_kind,
              static_cast<unsigned long long>(g_fault_address),
              what.empty() ? "" : " -- ", what.c_str());
@@ -1064,6 +1369,12 @@ int main(int argc, char** argv) {
       // stopping is the only outcome that reports rather than repeats.
       if (c.rc == 1) printf("\n%s\n", c.trap);
       else
+        {
+          const std::string where = HostSymbol(g_fault_pc);
+          if (!where.empty())
+            printf("\nfaulted in %s\n", where.c_str());
+          ReportHostStack();
+        }
         printf("\n%s on %s of %#llx -- %s\n", FaultName(c.code), g_fault_kind,
                static_cast<unsigned long long>(g_fault_address),
                ExplainAddress(g_fault_address).c_str());
@@ -1088,6 +1399,7 @@ int main(int argc, char** argv) {
     // succeeds, so keying purely off it would repeat a step every time the GL
     // context could not be taken.
     std::vector<char> issued(entries.size(), 0);
+    StartStallWatch(&ctx);
     while (alive && window.PumpEvents()) {
       if (window.TakeResized())
         alive = call(resize, {static_cast<uint64_t>(window.width()),
@@ -1135,6 +1447,36 @@ int main(int argc, char** argv) {
         }
       } else {
         ++frames;
+        g_frames_done.store(frames);
+        // What the guest is doing *now*, on a timer.
+        //
+        // A title that is running but not progressing is the hardest state to
+        // read: no fault, no trap, no stall -- the frames keep coming and the
+        // log goes quiet, because whatever it is waiting for it is waiting
+        // for silently. The frame ring already knows which guest functions
+        // are being entered; printing it every few seconds turns "it sits at
+        // the loading screen" into a list of addresses, which is a list of
+        // functions. ARC_WATCH_FRAMES=<seconds>.
+        {
+          static const long every = [] {
+            const char* v = getenv("ARC_WATCH_FRAMES");
+            return v ? strtol(v, nullptr, 10) : 0;
+          }();
+          static auto last = std::chrono::steady_clock::now();
+          if (every > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last)
+                    .count() >= every) {
+              last = now;
+              printf("\nguest functions being entered, most recent first:\n");
+              ReportFrames();
+              // Cleared *after* reporting, so each dump is the interval just
+              // gone rather than everything since the program started.
+              arc_frame_clear();
+              fflush(stdout);
+            }
+          }
+        }
         if (shot && frames == (frame_limit ? frame_limit : 1))
           SaveFrame(shot, window.width(), window.height());
         window.Present();
@@ -1142,6 +1484,18 @@ int main(int argc, char** argv) {
       }
       if (frame_limit && frames >= frame_limit) break;
     }
+    // Why the loop ended. Three things end it and they mean entirely
+    // different problems: the window went away, the guest faulted on a call
+    // we made, or the frame limit was reached. Ending silently made a title
+    // that quit after eight seconds look exactly like one that was still
+    // running and merely quiet -- which sent a whole investigation after the
+    // wrong thing.
+    printf("\nstopped after %ld frames: %s\n", frames,
+           !alive ? "a call into the guest failed"
+                  : (frame_limit && frames >= frame_limit)
+                        ? "the frame limit was reached"
+                        : "the window closed");
+    fflush(stdout);
   }
   return 0;
 }

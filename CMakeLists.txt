@@ -19,6 +19,7 @@ add_library(androidrecomp STATIC
   runtime/elf_image.cpp
   runtime/shim.cpp
   runtime/shim_pthread.cpp
+  runtime/shim_math.cpp
   runtime/shim_posix.cpp
   runtime/shim_gl.cpp
   runtime/shim_asset.cpp
@@ -36,7 +37,7 @@ if(UNIX AND NOT APPLE)
   target_link_libraries(androidrecomp PUBLIC dl)
 endif()
 if(WIN32)
-  target_link_libraries(androidrecomp PUBLIC ws2_32)
+  target_link_libraries(androidrecomp PUBLIC ws2_32 dbghelp)
 endif()
 
 # zlib satisfies a dozen imports directly -- Bionic ships stock zlib, so every
@@ -118,6 +119,10 @@ if(ARC_LIFTED_DIR)
   target_link_libraries(arc_boot PRIVATE androidrecomp)
   if(MSVC)
     target_compile_options(arc_boot PRIVATE /Od /MP)
+    # A map file, because a Release build has no PDB and the lifted functions
+    # are not exported: without it a fault in this executable can only be
+    # reported as an offset. /MAP costs a relink, not a rebuild.
+    target_link_options(arc_boot PRIVATE /MAP)
   else()
     target_compile_options(arc_boot PRIVATE -O0)
   endif()

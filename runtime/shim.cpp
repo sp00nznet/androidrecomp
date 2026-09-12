@@ -1,3 +1,9 @@
+#if defined(_WIN32)
+#include <malloc.h>
+#else
+#include <malloc.h>
+#endif
+
 #include "shim.h"
 
 #include "arm64_context.h"
@@ -6,6 +12,7 @@
 #include <deque>
 #include <string>
 #include <mutex>
+#include <vector>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -118,13 +125,290 @@ void CxaFinalize(void*) {}
   abort();
 }
 
+// Audio, declined politely.
+//
+// The APK ships OpenAL and the title imports thirty-two of its functions. The
+// library is real ARM code and is not lifted, so a call into it is a branch
+// the dispatcher cannot route -- reported as a miss and, when the render
+// thread makes it, the end of the run.
+//
+// A host with no audio backend has a truthful answer available: there is no
+// device. OpenAL is specified for exactly this -- alcOpenDevice returns null
+// when it cannot open one, and a caller that handles null never asks for a
+// context, a buffer or a source. So this is the device and context lifecycle
+// and nothing else; the twenty-odd AL calls are unreachable behind a null
+// device, and writing them before anything asks for them would be inventing
+// behaviour rather than declining it.
+void* AlcOpenDevice(const char*) { return nullptr; }
+int AlcCloseDevice(void*) { return 1; }  // ALC_TRUE: nothing to fail
+void* AlcCreateContext(void*, const int*) { return nullptr; }
+int AlcMakeContextCurrent(void*) { return 1; }
+void* AlcGetCurrentContext() { return nullptr; }
+void* AlcGetContextsDevice(void*) { return nullptr; }
+void AlcDestroyContext(void*) {}
+void AlcProcessContext(void*) {}
+void AlcSuspendContext(void*) {}
+int AlcGetError(void*) { return 0; }  // ALC_NO_ERROR
+// AL_NO_ERROR. A caller polls this after every call it makes and an invented
+// error is worse than none: it turns "there is no sound" into "sound is
+// broken", which a title is entitled to treat as fatal.
+int AlGetError() { return 0; }
+// Never null. A caller measures what this returns.
+const char* AlGetString(int) { return ""; }
+const char* AlcGetString(void*, int) { return ""; }
+
+// And the rest of the title's audio surface, because it does not check.
+//
+// A null device is supposed to be the end of it, and the title asks for one,
+// gets null, and then sets the distance model anyway -- so "unreachable
+// behind a null device" was wrong about this engine. These are the thirty-two
+// names it imports and no more: not a guess at OpenAL, an answer to the list.
+//
+// The queries are where care is needed. A setter that does nothing is
+// invisible; a getter that leaves its output untouched hands back whatever
+// was on the caller's stack, and a getter that answers "still playing"
+// forever is a loading screen that never ends. So state reads as stopped and
+// counts read as zero.
+constexpr int kAlPosition = 0x1004;
+constexpr int kAlDirection = 0x1005;
+constexpr int kAlVelocity = 0x1006;
+constexpr int kAlSourceState = 0x1010;
+constexpr int kAlStopped = 0x1014;
+
+int AlFloatCount(int param) {
+  return (param == kAlPosition || param == kAlDirection ||
+          param == kAlVelocity)
+             ? 3
+             : 1;
+}
+
+// Ids are handed out rather than zeroed: zero is "no object" in OpenAL, and a
+// caller that is given it either retries or reports a failure.
+unsigned AlNextName() {
+  static std::atomic<unsigned> next{1};
+  return next++;
+}
+
+void AlGenBuffers(int n, unsigned* out) {
+  for (int i = 0; out && i < n; ++i) out[i] = AlNextName();
+}
+void AlGenSources(int n, unsigned* out) {
+  for (int i = 0; out && i < n; ++i) out[i] = AlNextName();
+}
+void AlDeleteBuffers(int, const unsigned*) {}
+void AlDeleteSources(int, const unsigned*) {}
+void AlBufferData(unsigned, int, const void*, int, int) {}
+void AlDistanceModel(int) {}
+void AlListener3f(int, float, float, float) {}
+void AlListenerf(int, float) {}
+void AlListenerfv(int, const float*) {}
+void AlGetListener3f(int, float* a, float* b, float* c) {
+  if (a) *a = 0.0f;
+  if (b) *b = 0.0f;
+  if (c) *c = 0.0f;
+}
+void AlSource3f(unsigned, int, float, float, float) {}
+void AlSourcef(unsigned, int, float) {}
+void AlSourcei(unsigned, int, int) {}
+void AlGetSourcef(unsigned, int, float* out) {
+  if (out) *out = 0.0f;
+}
+void AlGetSourcefv(unsigned, int param, float* out) {
+  for (int i = 0; out && i < AlFloatCount(param); ++i) out[i] = 0.0f;
+}
+void AlGetSourcei(unsigned, int param, int* out) {
+  if (out) *out = param == kAlSourceState ? kAlStopped : 0;
+}
+void AlSourcePlay(unsigned) {}
+void AlSourcePause(unsigned) {}
+void AlSourceStop(unsigned) {}
+void AlSourceRewind(unsigned) {}
+void AlSourceQueueBuffers(unsigned, int, const unsigned*) {}
+void AlSourceUnqueueBuffers(unsigned, int, unsigned*) {}
+
 struct Entry {
   const char* name;
   void* fn;
 };
 
 
+// free, so that reuse can be delayed.
+//
+// A recompiled program is the same program, so a lifetime bug it has on the
+// device it shipped on it has here too -- but "has" and "shows" are different
+// things. The device's allocator hands a freed block back on its own schedule;
+// this one hands it back immediately and to whoever asks next, which turns a
+// dangling pointer that used to read stale-but-plausible fields into a read of
+// somebody else's string. ARC_LEAK_FREE stops recycling entirely, which is not
+// a fix and is not meant to be: if a fault goes away under it, the fault was a
+// use-after-free, and that is worth knowing in one run rather than five.
+//
+// ponytail: leak-everything, because it answers the question. If a real
+// quarantine is wanted -- hold N megabytes of freed blocks aside and release
+// the oldest -- that is the upgrade, and it belongs here.
+void ArcFree(void* p) {
+  static const bool leak = getenv("ARC_LEAK_FREE") != nullptr;
+  if (leak) return;
+  free(p);
+}
+
+// malloc, so that what it hands back can be zeroed.
+//
+// Bionic grows its heap by mapping pages, and a fresh page is zero. A program
+// that never shrinks -- a game loading its content -- therefore sees zeroed
+// memory from most of its allocations, and shipped code can depend on that
+// without anybody noticing, because on the device it is true. This heap hands
+// back whatever the last owner left. ARC_ZERO_HEAP makes the two agree.
+//
+// ponytail: zeroes everything rather than working out who needs it. The cost
+// is one memset per allocation; if that ever shows up in a profile, the answer
+// is to find the type that depends on it, not to make this cleverer.
+void* ArcMalloc(size_t n) {
+  static const bool zero = getenv("ARC_ZERO_HEAP") != nullptr;
+  return zero ? calloc(1, n) : malloc(n);
+}
+
+void* ArcRealloc(void* p, size_t n) {
+  static const bool zero = getenv("ARC_ZERO_HEAP") != nullptr;
+  if (!zero) return realloc(p, n);
+  // Only the part past the old contents is new, and only that part may be
+  // zeroed: realloc's contract is that everything up to the old size survives.
+#if defined(_WIN32)
+  const size_t had = p ? _msize(p) : 0;
+#else
+  const size_t had = p ? malloc_usable_size(p) : 0;
+#endif
+  void* q = realloc(p, n);
+  if (q && n > had) memset(static_cast<char*>(q) + had, 0, n - had);
+  return q;
+}
+
+// A pure virtual call, answered instead of aborted.
+//
+// libc++ prints "Pure virtual function called!" and aborts, which is the right
+// thing when the program is at fault. Here the program is a shipped binary and
+// the fault is ours: an object it still has listed has had its derived
+// destructor run, so its vptr is its abstract base's and slot after slot is
+// this handler. The engine hits it while walking its consumable registry,
+// calling getName() on 1525 entries to find one by name -- and eighteen of
+// those entries are dead.
+//
+// Aborting there ends the boot. Answering with an empty string does not: the
+// caller strcmp()s the name it got against the one it wants, does not match,
+// and moves on to the next entry. The one it wants is still in the list.
+//
+// ponytail: an empty string is the right answer for the getName() this is
+// actually hit from, and a plausible-but-wrong one for any other pure virtual
+// -- a caller expecting a number gets a pointer-sized one. So it is off unless
+// ARC_PURE_VIRTUAL=skip asks for it, and it says how many times it answered,
+// because a boot that needed this a thousand times is not a boot that worked.
+// The fix is to stop the engine destroying registered objects; this is what
+// makes the rest of the boot reachable while that is still true.
+const char* PureVirtual() {
+  static std::atomic<long> answered{0};
+  const long n = ++answered;
+  if (n <= 3 || n % 1000 == 0)
+    fprintf(stderr,
+            "[pure] a pure virtual was called on a dead object; answered with"
+            " an empty string (%ld so far)\n",
+            n);
+  return "";
+}
+
+// strrchr and atoi, given a name that is not there.
+//
+// FetchMTXItems builds a store request by taking each item's id and reading
+// the number after its last dot: atoi(strrchr(id, '.') + 1), falling back to
+// atoi(id) when there is no dot. One of this catalogue's items has no id at
+// all, so both calls get a null pointer -- and Bionic's versions would fault
+// on that too, which says the item is meant to have an id and ours does not.
+//
+// The store is not on the way into the town, so the honest options are to
+// crash on the way past it or to let it produce a zero. These produce the
+// zero: strrchr answers "no dot", which is a case the caller already handles,
+// and atoi answers 0, which is what it answers for any string without digits.
+//
+// ponytail: two functions, not a null-safe libc. Off unless
+// ARC_NULL_SAFE_STR is set, and each one says so the first time, because a
+// null name is a missing catalogue and that is worth fixing rather than
+// tolerating forever.
+bool NullSafeStrings() {
+  static const bool on = getenv("ARC_NULL_SAFE_STR") != nullptr;
+  return on;
+}
+
+void SaidNull(const char* fn) {
+  static std::mutex lock;
+  static std::vector<const char*> said;
+  std::lock_guard<std::mutex> held(lock);
+  for (const char* p : said)
+    if (strcmp(p, fn) == 0) return;
+  said.push_back(fn);
+  fprintf(stderr, "[str] %s was given a null pointer; answering as if the"
+                  " string were empty\n", fn);
+}
+
+char* StrrchrSafe(const char* s, int c) {
+  if (!s) {
+    if (!NullSafeStrings()) return const_cast<char*>(strrchr(s, c));
+    SaidNull("strrchr");
+    return nullptr;
+  }
+  return const_cast<char*>(strrchr(s, c));
+}
+
+int AtoiSafe(const char* s) {
+  if (!s) {
+    if (!NullSafeStrings()) return atoi(s);
+    SaidNull("atoi");
+    return 0;
+  }
+  return atoi(s);
+}
+
 const Entry kExplicit[] = {
+    {"strrchr", reinterpret_cast<void*>(&StrrchrSafe)},
+    {"atoi", reinterpret_cast<void*>(&AtoiSafe)},
+    {"free", reinterpret_cast<void*>(&ArcFree)},
+    {"malloc", reinterpret_cast<void*>(&ArcMalloc)},
+    {"realloc", reinterpret_cast<void*>(&ArcRealloc)},
+    {"alcOpenDevice", reinterpret_cast<void*>(&AlcOpenDevice)},
+    {"alcCloseDevice", reinterpret_cast<void*>(&AlcCloseDevice)},
+    {"alcCreateContext", reinterpret_cast<void*>(&AlcCreateContext)},
+    {"alcMakeContextCurrent", reinterpret_cast<void*>(&AlcMakeContextCurrent)},
+    {"alcGetCurrentContext", reinterpret_cast<void*>(&AlcGetCurrentContext)},
+    {"alcGetContextsDevice", reinterpret_cast<void*>(&AlcGetContextsDevice)},
+    {"alcDestroyContext", reinterpret_cast<void*>(&AlcDestroyContext)},
+    {"alcProcessContext", reinterpret_cast<void*>(&AlcProcessContext)},
+    {"alcSuspendContext", reinterpret_cast<void*>(&AlcSuspendContext)},
+    {"alcGetError", reinterpret_cast<void*>(&AlcGetError)},
+    {"alcGetString", reinterpret_cast<void*>(&AlcGetString)},
+    {"alGetError", reinterpret_cast<void*>(&AlGetError)},
+    {"alGetString", reinterpret_cast<void*>(&AlGetString)},
+    {"alGenBuffers", reinterpret_cast<void*>(&AlGenBuffers)},
+    {"alGenSources", reinterpret_cast<void*>(&AlGenSources)},
+    {"alDeleteBuffers", reinterpret_cast<void*>(&AlDeleteBuffers)},
+    {"alDeleteSources", reinterpret_cast<void*>(&AlDeleteSources)},
+    {"alBufferData", reinterpret_cast<void*>(&AlBufferData)},
+    {"alDistanceModel", reinterpret_cast<void*>(&AlDistanceModel)},
+    {"alListener3f", reinterpret_cast<void*>(&AlListener3f)},
+    {"alListenerf", reinterpret_cast<void*>(&AlListenerf)},
+    {"alListenerfv", reinterpret_cast<void*>(&AlListenerfv)},
+    {"alGetListener3f", reinterpret_cast<void*>(&AlGetListener3f)},
+    {"alSource3f", reinterpret_cast<void*>(&AlSource3f)},
+    {"alSourcef", reinterpret_cast<void*>(&AlSourcef)},
+    {"alSourcei", reinterpret_cast<void*>(&AlSourcei)},
+    {"alGetSourcef", reinterpret_cast<void*>(&AlGetSourcef)},
+    {"alGetSourcefv", reinterpret_cast<void*>(&AlGetSourcefv)},
+    {"alGetSourcei", reinterpret_cast<void*>(&AlGetSourcei)},
+    {"alSourcePlay", reinterpret_cast<void*>(&AlSourcePlay)},
+    {"alSourcePause", reinterpret_cast<void*>(&AlSourcePause)},
+    {"alSourceStop", reinterpret_cast<void*>(&AlSourceStop)},
+    {"alSourceRewind", reinterpret_cast<void*>(&AlSourceRewind)},
+    {"alSourceQueueBuffers", reinterpret_cast<void*>(&AlSourceQueueBuffers)},
+    {"alSourceUnqueueBuffers",
+     reinterpret_cast<void*>(&AlSourceUnqueueBuffers)},
+
     {"__android_log_print", reinterpret_cast<void*>(&AndroidLogPrint)},
     {"__android_log_vprint", reinterpret_cast<void*>(&AndroidLogVPrint)},
     {"__android_log_write", reinterpret_cast<void*>(&AndroidLogWrite)},
@@ -201,10 +485,28 @@ void* HostLookup(const char* name) {
 
 }  // namespace
 
+// Names the host must answer even though a lifted dependency defines them.
+//
+// The resolver prefers lifted code for everything, and rightly: a guest's own
+// implementation is the one the guest was built against. The exception is a
+// function whose whole job is to end the process.
+uint64_t ShimOverride(const char* name) {
+  static const char* const how = getenv("ARC_PURE_VIRTUAL");
+  if (how && strcmp(how, "skip") == 0 &&
+      strcmp(name, "__cxa_pure_virtual") == 0)
+    return reinterpret_cast<uint64_t>(&PureVirtual);
+  return 0;
+}
+
 uint64_t ShimResolve(const char* name) {
   // First: anything taking a guest va_list. Several of these also exist as
   // plain forwarders elsewhere in the shim, and forwarding is the wrong answer
   // -- the argument layouts do not match.
+  // Before all of them: the imports that take or return a float. Those
+  // cannot go through the integer bridge the rest of these use, so they are
+  // bound as context-taking natives and have to win over any plain forwarder
+  // of the same name elsewhere in the shim.
+  if (uint64_t a = ShimResolveMath(name)) return a;
   if (uint64_t a = ShimResolveVarargs(name)) return a;
   if (uint64_t a = ShimResolvePthread(name)) return a;
   if (uint64_t a = ShimResolvePosix(name)) return a;

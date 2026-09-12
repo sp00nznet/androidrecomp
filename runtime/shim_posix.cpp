@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +66,22 @@ struct GuestTimeval {
 constexpr int kClockRealtime = 0;
 constexpr int kClockRealtimeCoarse = 5;
 
+// One origin, shared. Two monotonic clocks with two origins is not a smaller
+// version of the same bug -- it is the same bug: a caller that starts a
+// stopwatch on one and reads it on the other measures the distance between
+// their origins rather than any elapsed time, every time, from the first
+// reading. Here that distance was a minute, so every network timeout in the
+// program had already expired when it was set, and every request was
+// abandoned and remade as fast as the machine could do it.
+std::chrono::steady_clock::duration MonotonicSinceStart() {
+  static const auto start = std::chrono::steady_clock::now();
+  // Offset by a minute, because a device has been up a while by the time a
+  // game starts and some code treats a monotonic reading near zero as "no
+  // reading yet". The offset belongs to the clock rather than to one of its
+  // two readers, which is the point: whatever it is, both see the same one.
+  return std::chrono::steady_clock::now() - start + std::chrono::seconds(60);
+}
+
 int ClockGettime(int clock_id, GuestTimespec* ts) {
   // CLOCK_MONOTONIC is seconds since boot, not seconds since 1970, and the
   // difference is not cosmetic. Answered from the wall clock it reads about
@@ -90,8 +107,7 @@ int ClockGettime(int clock_id, GuestTimespec* ts) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(now - sec).count();
     return 0;
   }
-  static const auto start = std::chrono::steady_clock::now();
-  const auto now = std::chrono::steady_clock::now() - start;
+  const auto now = MonotonicSinceStart();
   const auto sec = std::chrono::duration_cast<std::chrono::seconds>(now);
   ts->tv_sec = sec.count();
   ts->tv_nsec =
@@ -99,10 +115,32 @@ int ClockGettime(int clock_id, GuestTimespec* ts) {
   return 0;
 }
 
+// A wall clock the host can be asked to lie about.
+//
+// Seasonal content is a comparison between now and a window, so "does this
+// depend on the date at all" is answered by moving the date and looking.
+// ARC_FAKE_TIME=<epoch seconds> shifts every wall-clock reading by a constant
+// so the run believes it is then; the monotonic clock is left alone, because
+// timeouts and frame pacing are not what is being asked about.
+int64_t ClockSkew() {
+  static const int64_t skew = [] {
+    const char* when = getenv("ARC_FAKE_TIME");
+    if (!when) return (int64_t)0;
+    return (int64_t)strtoll(when, nullptr, 10) - (int64_t)time(nullptr);
+  }();
+  return skew;
+}
+
+time_t TimeNow(time_t* out) {
+  const time_t now = time(nullptr) + (time_t)ClockSkew();
+  if (out) *out = now;
+  return now;
+}
+
 int Gettimeofday(GuestTimeval* tv, void*) {
   GuestTimespec ts;
   ClockGettime(kClockRealtime, &ts);
-  tv->tv_sec = ts.tv_sec;
+  tv->tv_sec = ts.tv_sec + ClockSkew();
   tv->tv_usec = ts.tv_nsec / 1000;
   return 0;
 }
@@ -121,21 +159,160 @@ unsigned Sleep_(unsigned seconds) {
   return 0;
 }
 
-// The _r forms take their arguments the other way round from the Microsoft _s
-// forms, so these are wrappers rather than aliases.
-struct tm* GmtimeR(const time_t* t, struct tm* out) {
+// Bionic's `struct tm`, which carries two fields the Microsoft CRT's does not.
+//
+// The note at the top of this file says filling a larger guest struct from a
+// smaller host one is safe because the tail is untouched. For this struct that
+// is wrong, and the engine is what proves it: NimbleCppUtility's
+// getLocalTimeZone() calls localtime and then strlen on tm_zone at +0x30
+// without a null check. Untouched tail means whatever the caller's memory held
+// -- and the non-_r forms are worse, because they answer with a pointer to the
+// host's own 36-byte static, so +0x30 is past its end entirely. Either way the
+// engine reads a wild pointer and dereferences it.
+//
+// So the two fields are real here, and the layout is written out rather than
+// borrowed: `long` is 8 bytes on arm64 and 4 in the Microsoft CRT, which is
+// the same class of mismatch one field further along.
+struct BionicTm {
+  int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year;
+  int tm_wday, tm_yday, tm_isdst;
+  int pad;
+  int64_t tm_gmtoff;
+  const char* tm_zone;
+};
+static_assert(sizeof(BionicTm) == 56, "Bionic arm64 struct tm is 56 bytes");
+static_assert(offsetof(BionicTm, tm_zone) == 0x30, "tm_zone is at +0x30");
+
+// The zone name has to outlive the call, and the guest may ask on any thread.
+// Bionic's own answer points into its loaded timezone data and never expires,
+// so a per-thread buffer is the closest honest equivalent.
+const char* ZoneName(const struct tm* host, bool utc) {
+  if (utc) return "UTC";
+  static thread_local char name[64];
+  // %Z is the one portable way to ask the C library, and it already accounts
+  // for whether this timestamp is in daylight saving time.
+  if (strftime(name, sizeof name, "%Z", host) == 0) return "UTC";
+  return name;
+}
+
+int64_t ZoneOffset(const struct tm* host, bool utc) {
+  if (utc) return 0;
 #if defined(_WIN32)
-  return gmtime_s(out, t) == 0 ? out : nullptr;
+  // Microsoft reports seconds *west* of UTC, and the daylight bias separately;
+  // tm_gmtoff is seconds east, with the bias already folded in.
+  long west = 0, bias = 0;
+  if (_get_timezone(&west) != 0) west = 0;
+  if (_get_dstbias(&bias) != 0) bias = 0;
+  return -static_cast<int64_t>(west + (host->tm_isdst > 0 ? bias : 0));
 #else
-  return gmtime_r(t, out);
+  (void)host;
+  return 0;
 #endif
 }
-struct tm* LocaltimeR(const time_t* t, struct tm* out) {
+
+void ToBionic(const struct tm* host, BionicTm* out, bool utc) {
+  out->tm_sec = host->tm_sec;
+  out->tm_min = host->tm_min;
+  out->tm_hour = host->tm_hour;
+  out->tm_mday = host->tm_mday;
+  out->tm_mon = host->tm_mon;
+  out->tm_year = host->tm_year;
+  out->tm_wday = host->tm_wday;
+  out->tm_yday = host->tm_yday;
+  out->tm_isdst = host->tm_isdst;
+  out->pad = 0;
+  out->tm_gmtoff = ZoneOffset(host, utc);
+  out->tm_zone = ZoneName(host, utc);
+}
+
+// Bionic breaks down any time_t it is given. The Microsoft CRT refuses
+// anything negative or past 23:59:59 on 31 December 3000 and answers EINVAL,
+// and the caller here does not check: the engine converts a double to a
+// time_t, calls gmtime, and reads tm_min out of the result. A null there is a
+// read of address 8, one frame into gameplay.
+//
+// So the time is clamped into the range this CRT will accept rather than
+// refused. A clamped answer is wrong about the date; a null answer is wrong
+// about whether the function works at all, and only one of those is
+// survivable. Both are visible under the note below.
+constexpr int64_t kEarliest = 0;
+constexpr int64_t kLatest = 32535215999LL;  // 3000-12-31T23:59:59Z
+
+// Every distinct date the engine asks about.
+//
+// A seasonal event is a comparison between now and a window, and if a title
+// decides it is midwinter in September the disagreement is visible here
+// before it is visible anywhere else. ARC_TRACE_TIME prints each distinct
+// timestamp broken down, once.
+void NoteDate(time_t when, const struct tm* out, bool utc) {
+  static const bool trace = getenv("ARC_TRACE_TIME") != nullptr;
+  if (!trace || !out) return;
+  static std::mutex lock;
+  static std::vector<long long> seen;
+  std::lock_guard<std::mutex> held(lock);
+  for (long long v : seen)
+    if (v == static_cast<long long>(when)) return;
+  if (seen.size() > 40) return;
+  seen.push_back(static_cast<long long>(when));
+  fprintf(stderr, "[time] %s %lld -> %04d-%02d-%02d %02d:%02d:%02d\n",
+          utc ? "gmtime  " : "localtime", static_cast<long long>(when),
+          out->tm_year + 1900, out->tm_mon + 1, out->tm_mday, out->tm_hour,
+          out->tm_min, out->tm_sec);
+}
+
+bool HostBreakdown(const time_t* t, struct tm* out, bool utc) {
+  if (!t) return false;
+  time_t when = *t;
 #if defined(_WIN32)
-  return localtime_s(out, t) == 0 ? out : nullptr;
+  if (static_cast<int64_t>(when) < kEarliest ||
+      static_cast<int64_t>(when) > kLatest) {
+    static bool said = false;
+    if (!said) {
+      said = true;
+      fprintf(stderr,
+              "[time] %lld is outside the range this C library will break"
+              " down; clamping\n",
+              static_cast<long long>(when));
+    }
+    when = static_cast<time_t>(static_cast<int64_t>(when) < kEarliest
+                                   ? kEarliest
+                                   : kLatest);
+  }
+  const bool ok = (utc ? gmtime_s(out, &when) : localtime_s(out, &when)) == 0;
+  if (ok) NoteDate(when, out, utc);
+  return ok;
 #else
-  return localtime_r(t, out);
+  return (utc ? gmtime_r(&when, out) : localtime_r(&when, out)) != nullptr;
 #endif
+}
+
+// The _r forms take their arguments the other way round from the Microsoft _s
+// forms, so these are wrappers rather than aliases -- and they write the
+// guest's struct in the guest's layout, which is the point.
+BionicTm* GmtimeR(const time_t* t, BionicTm* out) {
+  struct tm host;
+  if (!out || !HostBreakdown(t, &host, true)) return nullptr;
+  ToBionic(&host, out, true);
+  return out;
+}
+BionicTm* LocaltimeR(const time_t* t, BionicTm* out) {
+  struct tm host;
+  if (!out || !HostBreakdown(t, &host, false)) return nullptr;
+  ToBionic(&host, out, false);
+  return out;
+}
+
+// Bionic's non-_r forms return a pointer to storage of their own. Per thread
+// rather than one global: the engine breaks timestamps down on its network and
+// tracking threads, and a shared buffer would have them overwriting each
+// other's answer between the call and the read.
+BionicTm* Gmtime(const time_t* t) {
+  static thread_local BionicTm slot;
+  return GmtimeR(t, &slot);
+}
+BionicTm* Localtime(const time_t* t) {
+  static thread_local BionicTm slot;
+  return LocaltimeR(t, &slot);
 }
 
 long g_timezone = 0;  // data symbol
@@ -301,7 +478,9 @@ int Fflush(FILE* f) { return fflush(f ? Stream(f) : nullptr); }
 int Fclose(FILE* f) {
   // Closing a standard stream would take the host's own logging with it.
   FILE* h = Stream(f);
-  return (h == stdin || h == stderr || h == stdout) ? 0 : fclose(h);
+  if (h == stdin || h == stderr || h == stdout) return 0;
+  ShimTraceClose(h);
+  return fclose(h);
 }
 
 // Bionic's `_ctype_` is a 257-entry table indexed as `_ctype_[c + 1]`, with
@@ -508,11 +687,11 @@ const Entry kTable[] = {
     E("gmtime_r", GmtimeR),
     E("localtime_r", LocaltimeR),
     E("timezone", g_timezone),
-    E("time", time),
+    E("time", TimeNow),
     E("mktime", mktime),
     E("difftime", difftime),
-    E("gmtime", gmtime),
-    E("localtime", localtime),
+    E("gmtime", Gmtime),
+    E("localtime", Localtime),
     E("ctime", ctime),
 
     // stdio the host hides behind inline definitions
@@ -594,6 +773,13 @@ const Entry kTable[] = {
 #undef E
 
 }  // namespace
+
+uint64_t ShimMonotonicMillis() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          MonotonicSinceStart())
+          .count());
+}
 
 uint64_t ShimResolvePosix(const char* name) {
   for (const Entry& e : kTable)

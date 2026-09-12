@@ -7,8 +7,11 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -87,6 +90,13 @@ uint64_t Allocate() {
   if (g_arena_used + kBlock > kArenaSize) g_arena_used = 0;  // wrap; nothing frees
   const uint64_t p = reinterpret_cast<uint64_t>(g_arena + g_arena_used);
   g_arena_used += kBlock;
+  // Cleared, because the arena wraps and nothing frees: a handle handed back
+  // for a question we could not answer is meant to read as empty, and an
+  // uncleared block reads as whatever string last occupied it. That is worse
+  // than a wrong answer -- it is a *plausible* one, from somewhere else in
+  // the program. It arrived here as a proxy host named "LandDataVersion",
+  // which the network stack then spent every request trying to resolve.
+  memset(reinterpret_cast<void*>(p), 0, kBlock);
   return p;
 }
 
@@ -208,6 +218,22 @@ std::mutex g_method_lock;
 std::deque<std::string> g_method_names;
 std::deque<std::string> g_method_unanswered;
 
+// Java methods to report as missing, from ARC_JNI_ABSENT -- a comma-separated
+// list of names. Matched on the method name alone, which is how the rest of
+// this bridge identifies a method too.
+bool MethodIsAbsent(const char* name) {
+  static const char* const list = getenv("ARC_JNI_ABSENT");
+  if (!list || !*list) return false;
+  const size_t n = strlen(name);
+  for (const char* p = list; *p;) {
+    const char* comma = strchr(p, ',');
+    const size_t len = comma ? static_cast<size_t>(comma - p) : strlen(p);
+    if (len == n && strncmp(p, name, n) == 0) return true;
+    p = comma ? comma + 1 : p + len;
+  }
+  return false;
+}
+
 uint64_t MethodIdFor(const char* name) {
   const std::string wanted = name ? name : "?";
   std::lock_guard<std::mutex> held(g_method_lock);
@@ -301,6 +327,24 @@ const MethodText kMethodText[] = {
     // several devices.
     {"getUUID", "androidrecomp-00000000-0000-0000-0000-000000000000"},
     {"getDeviceId", "androidrecomp-00000000-0000-0000-0000-000000000000"},
+    // A device with no mobile network, described honestly: no carrier, and a
+    // model name that is this host rather than a phone it is pretending to
+    // be. Empty is a real answer to both; absent is not, and an SDK that gets
+    // a blank handle where it expected a string measures it and gets zero
+    // either way -- but only one of the two is recorded as answered.
+    {"getCarrier", ""},
+    {"getDeviceString", "androidrecomp"},
+    // No proxy. Nimble asks Java for one and puts whatever comes back in
+    // front of every request it makes, so this has to be empty rather than
+    // absent -- and empty rather than left to a blank handle, because the
+    // question is asked once and the answer is used for the whole run.
+    {"getHttpProxy", ""},
+    // Nimble's network status, which it reads as a Java enum: getStatus()
+    // hands back the constant and ordinal() turns it into a number. Three is
+    // "reachable over wifi", and it is the answer a machine on a wire should
+    // give -- a host that says "unknown" leaves the SDK waiting for a network
+    // it has, so nothing is ever sent and nothing ever fails.
+    {"getStatus", "3"},
 };
 
 // The first argument in a guest va_list that is one of our own handles.
@@ -309,6 +353,138 @@ const MethodText kMethodText[] = {
 // which we do not have -- but a handle we made is recognisable, and no other
 // argument will be. So "the first one that is ours" is both the answer and the
 // only question we can actually ask.
+// An object array a handle can actually be.
+//
+// Everything else here is a block of text, and an "array" was that text with
+// its length measured by strlen -- which is right for the byte arrays the
+// engine fills and wrong for an array *of objects*, which the SDK reads
+// element by element. Handing it a string there is not a smaller answer, it
+// is a zero-length one: the caller collects nothing, then reads the elements
+// it was promised and runs off the end of its own vector.
+//
+// So: an array handle starts with a NUL, so anything that reads it as text
+// still sees an empty string, and carries its count and its elements after
+// a magic word that ordinary text will not begin with.
+constexpr uint64_t kArrayMagic = 0x0A11A77A7C0DEULL;
+constexpr size_t kArrayMagicOffset = 8;
+constexpr size_t kArrayCountOffset = 16;
+constexpr size_t kArrayFirstOffset = 24;
+
+bool IsObjectArray(uint64_t handle) {
+  if (!handle || !arc_jni_owns(handle)) return false;
+  uint64_t magic = 0;
+  memcpy(&magic, reinterpret_cast<const void*>(handle + kArrayMagicOffset),
+         sizeof magic);
+  return magic == kArrayMagic;
+}
+
+uint64_t ArrayCount(uint64_t handle) {
+  uint64_t n = 0;
+  memcpy(&n, reinterpret_cast<const void*>(handle + kArrayCountOffset),
+         sizeof n);
+  return n;
+}
+
+uint64_t ArrayElement(uint64_t handle, uint64_t i) {
+  if (i >= ArrayCount(handle)) return 0;
+  uint64_t v = 0;
+  memcpy(&v,
+         reinterpret_cast<const void*>(handle + kArrayFirstOffset + i * 8),
+         sizeof v);
+  return v;
+}
+
+uint64_t AllocateObjectArray(const uint64_t* items, size_t n) {
+  const uint64_t p = Allocate();
+  if (!p) return 0;
+  if (kArrayFirstOffset + n * 8 > kBlock) n = 0;
+  const uint64_t magic = kArrayMagic, count = n;
+  memcpy(reinterpret_cast<void*>(p + kArrayMagicOffset), &magic, sizeof magic);
+  memcpy(reinterpret_cast<void*>(p + kArrayCountOffset), &count, sizeof count);
+  for (size_t i = 0; i < n; ++i)
+    memcpy(reinterpret_cast<void*>(p + kArrayFirstOffset + i * 8), &items[i],
+           sizeof items[i]);
+  return p;
+}
+
+// The Nimble SDK's callbacks, which on Android are delivered by Java.
+//
+// Its C++ half hands Java an object carrying a small integer id, asks Java to
+// go and do something, and returns. Java does the work and calls back through
+// BaseNativeCallback.nativeCallback(id, result), which finds the id in a map
+// and resumes the C++ side. There is no Java here, so nothing ever calls
+// back: the C++ waits for an answer that cannot arrive.
+//
+// That is not a corner case. The anonymous login -- the one that gets a
+// player into the game without an account -- asks for a Google SafetyNet
+// attestation this way and stops there. No request is made, so nothing fails;
+// the Nexus service simply never leaves status Unknown and the title reports
+// it as an error.
+//
+// So the host delivers the callback itself. On another thread and after a
+// beat, because that is what Java does and because the C++ side is still
+// inside the call that asked: answering synchronously would re-enter it.
+uint64_t g_native_callback;
+
+void DeliverNimbleCallback(long id, const char* result) {
+  if (!g_native_callback) {
+    g_native_callback = arc::ShimGuestSymbol(
+        "Java_com_ea_nimble_bridge_BaseNativeCallback_nativeCallback");
+    if (!g_native_callback) return;
+  }
+  // Two elements, which is what the SDK's bridge reads back out: the value
+  // and the error beside it. An attestation this host cannot produce is an
+  // empty one, and no error -- which is what a device without Play Services
+  // reports and what the SDK is written to carry on from.
+  const uint64_t items[2] = {AllocateText(result ? result : ""),
+                             AllocateText("")};
+  const uint64_t answer = AllocateObjectArray(items, 2);
+  const uint64_t fn = g_native_callback;
+  const uint64_t env = arc_jni_env();
+  const uint64_t cls = arc_jni_object();
+  const uint64_t args[4] = {env, cls, static_cast<uint64_t>(id), answer};
+  // ARC_NIMBLE_CALLBACK=thread delivers it the way Java would, from another
+  // thread and a beat later. That is the honest shape and it is also the one
+  // that crashes at the moment, so the default is the blunt one: answer
+  // before returning, on the thread that asked.
+  static const char* how = getenv("ARC_NIMBLE_CALLBACK");
+  if (how && strcmp(how, "thread") == 0) {
+    std::thread([fn, args] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      arc_call_guest(fn, args, 4);
+    }).detach();
+    return;
+  }
+  arc_call_guest(fn, args, 4);
+}
+
+// The id the SDK put in a callback object. Ours carry their text, and for one
+// of these the text is the id in decimal -- the same trick an enum's ordinal
+// uses, for the same reason: the number belongs to the handle, not to the
+// call that later hands it back.
+long CallbackIdOf(uint64_t handle) {
+  if (!handle || !arc_jni_owns(handle)) return -1;
+  const char* text = reinterpret_cast<const char*>(handle);
+  if (!*text) return -1;
+  char* end = nullptr;
+  const long v = strtol(text, &end, 10);
+  return (end && *end == '\0') ? v : -1;
+}
+
+// All of them, in order, for a call whose interesting argument is not the
+// first -- a logger's message behind its title, say.
+std::vector<uint64_t> OwnedArgs(Arm64Ctx* c) {
+  std::vector<uint64_t> found;
+  if (!c->x[3]) return found;
+  std::vector<unsigned char> cursor(arc::ShimVaListSize());
+  memcpy(cursor.data(), reinterpret_cast<const void*>(c->x[3]), cursor.size());
+  for (int i = 0; i < 6; ++i) {
+    const uint64_t v = arc::ShimVaNextInt(cursor.data());
+    if (v && arc_jni_owns(v)) found.push_back(v);
+  }
+  return found;
+}
+
 uint64_t FirstOwnedArg(Arm64Ctx* c) {
   if (!c->x[3]) return 0;
   std::vector<unsigned char> cursor(arc::ShimVaListSize());
@@ -338,10 +514,12 @@ const MethodNumber kMethodNumbers[] = {
     {"getFreeDiskSpace", 4LL << 30},
     // Memory, in bytes. Zero is the answer that says "this device is out",
     // and a title that believes it drops to a reduced-texture path or refuses
-    // to load at all. Half a gigabyte free is unremarkable for a device that
-    // could run this.
-    {"getAvailableMemory", 512LL << 20},
-    {"getFreeMemory", 512LL << 20},
+    // to load at all. It is also not a number to be shy with: the engine sizes
+    // its asset caches from it, and a small answer means a cache that evicts
+    // while the game is still reading what it evicted. Three gigabytes is an
+    // ordinary answer for a device that could run this, and this host has more.
+    {"getAvailableMemory", 3LL << 30},
+    {"getFreeMemory", 3LL << 30},
     // A layout inset in pixels. Nothing here has a notch or a rounded corner
     // to inset for, so none is the right answer rather than a missing one.
     {"getHorizontalMargin", 0},
@@ -355,11 +533,15 @@ const MethodNumber kMethodNumbers[] = {
 // so a frame takes no time, a timeout never expires, and a rate limiter lets
 // everything through at once.
 int64_t Uptime() {
-  static const auto start = std::chrono::steady_clock::now();
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::steady_clock::now() - start)
-             .count() +
-         60'000;  // as if the device had been up a minute before we started
+  // The same clock CLOCK_MONOTONIC answers from, because on Android they are
+  // the same clock: SystemClock.uptimeMillis() is CLOCK_MONOTONIC in
+  // milliseconds. This used to keep its own origin and add a minute to it, on
+  // the reasoning that a device has usually been up a while -- which is true
+  // of a device and false of a stopwatch two pieces of the same program are
+  // sharing. Code that started a timer through one and read it through the
+  // other measured a minute of elapsed time immediately, so every network
+  // timeout expired the moment it was set.
+  return static_cast<int64_t>(arc::ShimMonotonicMillis());
 }
 
 int64_t NumberForMethod(uint64_t id, bool* answered) {
@@ -399,8 +581,85 @@ void TracePreference(const char* key, const char* value) {
     fprintf(stderr, "[pref] %-40s -> %s\n", key, value ? value : "(no answer)");
 }
 
+// Where a preference actually lives.
+//
+// Everything a title and its SDKs write down between runs comes through two
+// Java calls -- one to set a value, one to read it -- and a host that answers
+// neither has no memory at all. Every run is then a first run: no account, no
+// token, no anonymous id, no age check, nothing carried over. The SDK's own
+// log says so plainly and repeatedly ("Data not found in persistence") and
+// the title reads the sum of it as a failure to sign in.
+//
+// A flat file of key=value beside the title's own data, which is where
+// Android would have put it. One store rather than one per component: the
+// keys are already distinct enough to have collided by now if they were
+// going to, and a scheme that puts each component's file somewhere different
+// has to know the component, which the Java call does not tell us.
+std::mutex g_prefs_lock;
+std::map<std::string, std::string> g_prefs;
+bool g_prefs_loaded = false;
+
+std::string PrefsPath() {
+  const char* root = arc::ShimAssetRoot();
+  return std::string(root && *root ? root : ".") + "/prefs.txt";
+}
+
+void LoadPrefs() {
+  if (g_prefs_loaded) return;
+  g_prefs_loaded = true;
+  std::ifstream in(PrefsPath(), std::ios::binary);
+  std::string key;
+  // "key length value", with the length counted rather than the value
+  // escaped. A stored value is whatever the title wrote -- a token, a JSON
+  // document, something with a newline in it -- and a format that has to
+  // escape is a format that can hand back something subtly different from
+  // what it was given.
+  while (in >> key) {
+    size_t n = 0;
+    if (!(in >> n)) break;
+    in.get();  // the single space before the value
+    std::string value(n, 0);
+    in.read(&value[0], static_cast<std::streamsize>(n));
+    in.get();  // the newline after it
+    g_prefs[key] = value;
+  }
+}
+
+void SavePrefs() {
+  std::ofstream out(PrefsPath(), std::ios::binary | std::ios::trunc);
+  for (const auto& kv : g_prefs)
+    out << kv.first << " " << kv.second.size() << " " << kv.second << std::endl;
+}
+
+void SetPreference(const char* key, const char* value) {
+  if (!key || !*key) return;
+  std::lock_guard<std::mutex> held(g_prefs_lock);
+  LoadPrefs();
+  g_prefs[key] = value ? value : "";
+}
+
+void SyncPreferences() {
+  std::lock_guard<std::mutex> held(g_prefs_lock);
+  if (g_prefs_loaded) SavePrefs();
+}
+
+const char* StoredPreference(const char* key) {
+  std::lock_guard<std::mutex> held(g_prefs_lock);
+  LoadPrefs();
+  auto it = g_prefs.find(key);
+  return it == g_prefs.end() ? nullptr : it->second.c_str();
+}
+
 const char* PreferenceValue(const char* key) {
   if (!key || !*key) return nullptr;
+  // What was written down last time wins over any default below it: a title
+  // that stored a value expects to read that value back, and a default that
+  // overrode it would make the store look broken in exactly the cases it
+  // exists for.
+  if (const char* v = StoredPreference(key)) {
+    TracePreference(key, v);
+    return v;
+  }
   // A title's preference keys are its own. Tapped Out asks for none of the
   // four below -- it asks for DLCSource, DLCLocation, DLCSecretKey and
   // ServerEnvironment -- and the next title will ask for others again.
@@ -483,6 +742,28 @@ const MethodFlag kMethodFlags[] = {
     {"wasCreatedViaLocalNotification", false},
     {"wasResumedViaLocalNotification", false},
     {"isOtherMusicPlaying", false},
+    // A machine on a wire is not on a metered connection, and the title asks
+    // before it downloads anything large.
+    {"UsingMobileData", false},
+    // On a wire, which for a title deciding whether it may download is the
+    // same answer wifi gives.
+    {"isNetworkWifi", true},
+    // A stock, unmodified install on a machine that is not a phone. These are
+    // anti-tamper questions with one true answer here, and "no answer" is not
+    // it: a title that cannot tell whether it has been tampered with is
+    // entitled to assume the worst.
+    {"isDeviceRooted", false},
+    {"isAppCracked", false},
+    // Whether an override exists for a config value. Nothing here overrides
+    // any, and saying so is different from not answering.
+    {"configValueExists", false},
+    // Nimble asks its Java half whether the Synergy environment -- the
+    // directory of EA services it was configured with -- has been fetched.
+    // Answered false, its Nexus service never leaves status Unknown, the
+    // title reads that as an unrecoverable error, and nothing has been tried:
+    // no request is made, so nothing can fail informatively. Here the
+    // environment is a fixed loopback address that is always available.
+    {"isDataAvailable", true},
 };
 
 // Tri-state on purpose: "not in the table" has to stay distinguishable from
@@ -507,7 +788,7 @@ bool ThreadComplete() {
   return polls++ >= wait;
 }
 
-bool FlagForMethod(uint64_t id, bool* answered) {
+bool FlagForMethod(Arm64Ctx* c, uint64_t id, bool* answered) {
   *answered = false;
   const char* name = MethodName(id);
   if (!name) return false;
@@ -515,6 +796,24 @@ bool FlagForMethod(uint64_t id, bool* answered) {
   if (strcmp(name, "isThreadComplete") == 0) {
     *answered = true;
     return ThreadComplete();
+  }
+  // "Is this feature switched off?" is the one unanswered question whose
+  // default is not neutral. Answering false says every feature the title asks
+  // about is on -- including the seasonal ones, which is how a September boot
+  // ends up covered in snow. What the name is matters, so it is logged.
+  if (strcmp(name, "isFeatureDisabled") == 0) {
+    static const char* const how = getenv("ARC_JNI_FEATURES");
+    const bool off = how && strcmp(how, "off") == 0;
+    if (getenv("ARC_TRACE_FEATURES")) {
+      // A handle is a pointer to its own text, which is what makes the name
+      // readable here at all.
+      const uint64_t arg = FirstOwnedArg(c);
+      const char* which = arg ? reinterpret_cast<const char*>(arg) : nullptr;
+      fprintf(stderr, "[feature] isFeatureDisabled(%s) -> %s\n",
+              which && *which ? which : "?", off ? "true" : "false");
+    }
+    *answered = true;
+    return off;
   }
   for (const MethodFlag& m : kMethodFlags)
     if (strcmp(m.name, name) == 0) {
@@ -540,7 +839,8 @@ bool FlagForMethod(uint64_t id, bool* answered) {
 // than the one you guessed.
 const char* LocaleOverride(const char* name) {
   if (strcmp(name, "language") == 0 || strcmp(name, "getLanguage") == 0 ||
-      strcmp(name, "getCurrentLanguage") == 0) {
+      strcmp(name, "getCurrentLanguage") == 0 ||
+      strcmp(name, "getApplicationLanguageCode") == 0) {
     static const char* v = getenv("ARC_LANG");
     return v;
   }
@@ -561,9 +861,30 @@ const char* LocaleOverride(const char* name) {
 // starts at 4.x selects nothing, and the loading screen waits forever for a
 // download it never asked for -- with the server showing a clean 200 for the
 // index and nothing after it.
+// Identity the title asked Java for after it had just been told it by the
+// server and written it down itself. getCurrentSynergyId is the telemetry id
+// read back, and answering nothing there leaves the loading task list waiting
+// on a value it is holding in its own preferences.
+const char* IdentityOverride(const char* name) {
+  if (strcmp(name, "getCurrentSynergyId") == 0 ||
+      strcmp(name, "getSynergyId") == 0)
+    return StoredPreference("telemetryId");
+  // No override, which is a real answer: the id is whatever the server said.
+  if (strcmp(name, "getOverrideSynergyId") == 0) return "";
+  if (strcmp(name, "getUniqueDeviceID") == 0 ||
+      strcmp(name, "getCurrentEADeviceId") == 0 ||
+      strcmp(name, "getEADeviceId") == 0 ||
+      strcmp(name, "getEAHardwareId") == 0) {
+    if (const char* v = StoredPreference("deviceIdentifier")) return v;
+    return StoredPreference("androidId");
+  }
+  return nullptr;
+}
+
 const char* VersionOverride(const char* name) {
   if (strcmp(name, "appVersion") == 0 || strcmp(name, "clientVersion") == 0 ||
-      strcmp(name, "getVersion") == 0 || strcmp(name, "deviceVersion") == 0) {
+      strcmp(name, "getVersion") == 0 || strcmp(name, "deviceVersion") == 0 ||
+      strcmp(name, "getApplicationVersion") == 0) {
     static const char* v = getenv("ARC_APP_VERSION");
     return v;
   }
@@ -583,6 +904,7 @@ const char* DirectoryForName(const char* name) {
     return bundle.c_str();
   }
   if (strcmp(name, "getStorageDir") == 0 ||
+      strcmp(name, "getCachePath") == 0 ||
       strcmp(name, "writablePath") == 0) {
     // The same directory, not the one above it. Android hands a title one data
     // directory and it both reads its content out of that and writes beside
@@ -601,7 +923,21 @@ const char* TextForMethod(uint64_t id) {
   const char* name = MethodName(id);
   if (!name) return nullptr;
   NoteCalled(name);
+  // ARC_JNI_<method> answers any string-returning Java method, the same way
+  // ARC_PREF_<key> answers any preference. The values these carry -- a client
+  // id, a shared secret, an account identifier -- belong to a title and its
+  // server, not to this kit, and a table here would be the wrong place to
+  // keep them. It also turns the report's "had no value to return" list into
+  // something that can be tried one name at a time without a rebuild.
+  {
+    char var[96];
+    if (snprintf(var, sizeof var, "ARC_JNI_%s", name) <
+        static_cast<int>(sizeof var)) {
+      if (const char* v = getenv(var)) return v;
+    }
+  }
   if (const char* v = LocaleOverride(name)) return v;
+  if (const char* v = IdentityOverride(name)) return v;
   if (const char* v = VersionOverride(name)) return v;
   if (const char* dir = DirectoryForName(name)) return dir;
   for (const MethodText& m : kMethodText)
@@ -831,7 +1167,51 @@ void Handle(size_t index, Arm64Ctx* c) {
     }
     case 33:     // GetMethodID(env, class, name, signature)
     case 113: {  // GetStaticMethodID
-      c->x[0] = MethodIdFor(reinterpret_cast<const char*>(c->x[2]));
+      const char* name = reinterpret_cast<const char*>(c->x[2]);
+      // "This method is not there." Every method id this bridge hands out is
+      // a stand-in, so a title that looks one up always finds it -- and a
+      // title that asks Java for something optional is written to cope with
+      // not finding it, which is a cleaner answer than a stand-in it will
+      // then call.
+      //
+      // FetchMTXItems is the case that needs it: it looks up
+      // retrieveSkuInformation, and if the id is null it returns before it
+      // touches anything. Given an id, it goes on to build the store request
+      // out of a catalogue this host has no Java billing service to fill,
+      // and reads a name out of an item that has none.
+      if (name && MethodIsAbsent(name)) {
+        c->x[0] = 0;
+        return;
+      }
+      c->x[0] = MethodIdFor(name);
+      return;
+    }
+
+    // Constructing a Java object. The one that matters is the SDK's callback
+    // wrapper, whose whole content is the id it was constructed with -- so
+    // the handle is given that id as its text and can be recognised later.
+    case 28:     // NewObject
+    case 29:     // NewObjectV
+    case 30: {   // NewObjectA
+      uint64_t made = Allocate();
+      if (index == 29 && c->x[3]) {
+        std::vector<unsigned char> cursor(arc::ShimVaListSize());
+        memcpy(cursor.data(), reinterpret_cast<const void*>(c->x[3]),
+               cursor.size());
+        for (int i = 0; i < 4; ++i) {
+          const uint64_t v = arc::ShimVaNextInt(cursor.data());
+          // A small number that is not one of our handles is the id. Ids
+          // start at zero and wrap at a million, so the range is the test.
+          if (v < 1000000 && !arc_jni_owns(v)) {
+            char text[24];
+            snprintf(text, sizeof text, "%llu",
+                     static_cast<unsigned long long>(v));
+            made = AllocateText(text);
+            break;
+          }
+        }
+      }
+      c->x[0] = made;
       return;
     }
 
@@ -852,25 +1232,54 @@ void Handle(size_t index, Arm64Ctx* c) {
       // way instead, and answering it with a blank handle made every path the
       // engine asked for come back empty.
       const char* name = MethodName(c->x[2]);
+      // getComponentId is the same question in a different vocabulary: the
+      // Nimble bridge hands Java an object per registered component and asks
+      // it back which component that was. A handle we made carries its own
+      // text, and here that text *is* the id.
       if (name && (strcmp(name, "getBytes") == 0 ||
-                   strcmp(name, "toString") == 0)) {
+                   strcmp(name, "toString") == 0 ||
+                   strcmp(name, "getComponentId") == 0)) {
         NoteCalled(name);
-        const char* self = reinterpret_cast<const char*>(c->x[1]);
+        // getBytes and toString are called *on* the object; getComponentId
+        // is static and takes it as an argument, where x1 is the class.
+        const uint64_t which = strcmp(name, "getComponentId") == 0
+                                   ? FirstOwnedArg(c)
+                                   : c->x[1];
+        const char* self = reinterpret_cast<const char*>(which);
         // Whether the object carries text at all is the question these turn
         // on: a handle we made for a string does, and one we handed back for
         // something we did not understand is a zeroed block that does not.
         static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
         if (trace)
           fprintf(stderr, "[jni] %s on %#llx %s text=\"%.48s\"\n", name,
-                  static_cast<unsigned long long>(c->x[1]),
-                  arc_jni_owns(c->x[1]) ? "ours" : "not ours",
+                  static_cast<unsigned long long>(which),
+                  arc_jni_owns(which) ? "ours" : "not ours",
                   self ? self : "");
         c->x[0] = AllocateText(self);
         return;
       }
+      // Where the Nimble SDK expects its backend to be. Its C++ half is a
+      // proxy over a Java component, so every question about the environment
+      // -- which server, which client id -- is a Java call, and a host that
+      // answers nothing leaves the SDK convinced it has no environment at
+      // all. One loopback server answers every service, so the key is not
+      // read: the answer is the same address whatever was asked for.
+      if (name && strcmp(name, "getServerUrlWithKey") == 0) {
+        NoteCalled(name);
+        static const char* v = getenv("ARC_SERVER");
+        TraceVaArgs(name, c);
+        if (v) {
+          c->x[0] = AllocateText(v);
+          return;
+        }
+      }
       // Read by key: the method name says only that a preference was wanted.
+      // Nimble's persistence and its environment both ask this shape of
+      // question, in their own vocabulary, so they share the answer.
       if (name && (strcmp(name, "getSharedPreference") == 0 ||
-                   strcmp(name, "getStringPreference") == 0)) {
+                   strcmp(name, "getStringPreference") == 0 ||
+                   strcmp(name, "getParameter") == 0 ||
+                   strcmp(name, "getStringValue") == 0)) {
         NoteCalled(name);
         TraceVaArgs(name, c);
         const uint64_t key = FirstOwnedArg(c);
@@ -913,6 +1322,19 @@ void Handle(size_t index, Arm64Ctx* c) {
     case 126: case 127: case 128:  // CallStaticShortMethod
     case 129: case 130: case 131:  // CallStaticIntMethod
     case 132: case 133: case 134: {  // CallStaticLongMethod
+      // A Java enum reaches C++ as an object whose ordinal() is asked for
+      // separately, so the number is a property of the handle rather than of
+      // the method name. Ours carry their text; an enum constant's text is
+      // its ordinal, and reading it back is what keeps "which constant" and
+      // "what number" the same answer.
+      const char* name = MethodName(c->x[2]);
+      if (name && strcmp(name, "ordinal") == 0) {
+        NoteCalled(name);
+        const char* self = reinterpret_cast<const char*>(c->x[1]);
+        c->x[0] = arc_jni_owns(c->x[1]) && self ? strtoull(self, nullptr, 10)
+                                                : 0;
+        return;
+      }
       bool answered = false;
       c->x[0] = static_cast<uint64_t>(NumberForMethod(c->x[2], &answered));
       return;
@@ -934,10 +1356,65 @@ void Handle(size_t index, Arm64Ctx* c) {
       // Only the va_list forms carry arguments we can walk; the varargs forms
       // spread theirs across registers we were not handed.
       const bool va = index == 62 || index == 142;
+      // The write half of the preference store. Both arguments are handles we
+      // made, so "the first two of ours, in order" is the key and the value.
+      if (name && va &&
+          (strcmp(name, "setValue") == 0 ||
+           strcmp(name, "setSharedPreference") == 0 ||
+           strcmp(name, "setStringPreference") == 0)) {
+        const std::vector<uint64_t> args = OwnedArgs(c);
+        if (!args.empty()) {
+          SetPreference(reinterpret_cast<const char*>(args[0]),
+                        args.size() > 1
+                            ? reinterpret_cast<const char*>(args[1])
+                            : "");
+          TracePreference(reinterpret_cast<const char*>(args[0]),
+                          args.size() > 1
+                              ? reinterpret_cast<const char*>(args[1])
+                              : "(set empty)");
+        }
+        c->x[0] = 0;
+        return;
+      }
+      // Asked Java to go and do something and then wait to be called back.
+      // Nothing here will do the work, so the honest answer is the one Java
+      // gives a device with no Play Services: the callback, with nothing in
+      // it. What matters is that it arrives -- the SDK handles an empty
+      // attestation, and handles never being answered by waiting forever.
+      // ARC_NIMBLE_CALLBACK=off to go back to not answering, which is what
+      // this did before and which stops the anonymous login dead.
+      static const char* mode = getenv("ARC_NIMBLE_CALLBACK");
+      const bool deliver = !(mode && strcmp(mode, "off") == 0);
+      if (deliver && name && va &&
+          strcmp(name, "requestSafetyNetAttestation") == 0) {
+        for (uint64_t arg : OwnedArgs(c)) {
+          const long id = CallbackIdOf(arg);
+          if (id >= 0) {
+            DeliverNimbleCallback(id, getenv("ARC_SAFETYNET_TOKEN"));
+            break;
+          }
+        }
+        c->x[0] = 0;
+        return;
+      }
+      if (name && strcmp(name, "synchronize") == 0) {
+        SyncPreferences();
+        c->x[0] = 0;
+        return;
+      }
       if (name && va && IsLogMethod(name)) {
-        if (const uint64_t msg = FirstOwnedArg(c))
-          fprintf(stderr, "[game] %.400s\n",
-                  reinterpret_cast<const char*>(msg));
+        // Every string argument, not just the first. A logger that takes a
+        // title and a message puts the title first, so printing one argument
+        // prints the category and throws the line away -- which is how the
+        // Nimble SDK's entire diagnostic stream arrived as the word
+        // "NexusService", repeated.
+        bool any = false;
+        for (uint64_t arg : OwnedArgs(c)) {
+          fprintf(stderr, any ? "  %.400s" : "[game] %.400s",
+                  reinterpret_cast<const char*>(arg));
+          any = true;
+        }
+        if (any) fputc('\n', stderr);
       }
       c->x[0] = 0;
       return;
@@ -976,16 +1453,29 @@ void Handle(size_t index, Arm64Ctx* c) {
         }
       }
       bool answered = false;
-      c->x[0] = FlagForMethod(c->x[2], &answered) ? 1 : 0;
+      c->x[0] = FlagForMethod(c, c->x[2], &answered) ? 1 : 0;
       return;
     }
 
     case 171: {  // GetArrayLength
-      // Our byte arrays are the same NUL-terminated text a string handle
-      // holds, so their length is simply that. An array we did not fill is a
-      // zeroed block, which measures zero -- which is the truth about it.
+      // An array of objects knows its own count. Everything else here is a
+      // byte array, which is the same NUL-terminated text a string handle
+      // holds, so its length is simply that -- and an array we did not fill
+      // is a zeroed block, which measures zero, which is the truth about it.
+      if (IsObjectArray(c->x[1])) {
+        c->x[0] = ArrayCount(c->x[1]);
+        return;
+      }
       const char* s = reinterpret_cast<const char*>(c->x[1]);
       c->x[0] = s ? strlen(s) : 0;
+      return;
+    }
+    case 173: {  // GetObjectArrayElement
+      if (IsObjectArray(c->x[1])) {
+        c->x[0] = ArrayElement(c->x[1], c->x[2]);
+        return;
+      }
+      c->x[0] = Allocate();
       return;
     }
     case 184:    // GetByteArrayElements
