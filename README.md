@@ -3,12 +3,12 @@
 > A toolkit for turning Android games' native engines into native desktop
 > applications. Bring your own APK.
 
-**Status: a title renders.** *The Simpsons: Tapped Out*'s 28 MB Scorpio engine
+**Status: a title plays.** *The Simpsons: Tapped Out*'s 28 MB Scorpio engine
 resolves **770 of 776 imports**, runs **all 1,527** of its static constructors
-with no faults, boots its game state machine, reads its own asset packs, and
-renders and presents frames through a desktop GL context while forwarding mouse
-input as touch — its own splash screen, drawn by lifted ARM64 code with no
-emulator and no Android runtime. There is a screenshot in
+with no faults, boots its game state machine, reads its own asset packs, talks
+to its server, loads a save, and reaches **its own tutorial** — the first
+mission, running and advancing on input, drawn by lifted ARM64 code on x86-64
+with no emulator and no Android runtime. Screenshots are in
 [tstorecomp](https://github.com/sp00nznet/tstorecomp), which is where anything
 title-specific belongs.
 
@@ -58,7 +58,8 @@ have. Licensed MIT; contributions must be your own work.
 | `runtime/shim` | Resolves imports in three layers: explicit implementations, ABI-identical name aliases, then the host C runtime by name. Most of libc costs no code per symbol. | [SHIM](docs/SHIM.md) |
 | `runtime/shim_file` | File I/O, directories and `mmap` at Bionic's struct layouts and flag values, which are *not* the host's. | [SHIM](docs/SHIM.md) |
 | `runtime/shim_pthread` | Threads, semaphores and TLS keys, over storage whose layout we never inspect and only have to fit inside. | [SHIM](docs/SHIM.md) |
-| `runtime/shim_posix` | The locale `*_l` family, time, the stdio entry points MSVC hides inline, wide-character and BSD string helpers. | [SHIM](docs/SHIM.md) |
+| `runtime/shim_posix` | The locale `*_l` family, time, the stdio entry points MSVC hides inline, wide-character and BSD string helpers. Bionic's `struct tm` is 56 bytes with a `tm_zone`, so the time breakdowns are written at its offsets rather than the host's. | [SHIM](docs/SHIM.md) |
+| `runtime/shim_math` | The imports the ordinary native bridge cannot carry. A dispatch miss passes twelve integers; on AArch64 a float argument arrives in `s0`/`d0`, so every float-taking or float-returning import is bound as a context-taking native that reads the guest's own register file. | [SHIM](docs/SHIM.md) |
 | `runtime/shim_sys` | Sockets with the two fields Winsock reorders, plus `dlopen`/`dlsym`/`dl_iterate_phdr` over the loaded images. | [SHIM](docs/SHIM.md) |
 | `runtime/shim_varargs` | Formatting for functions taking the guest's own `va_list`, which is a 32-byte structure and not a pointer. | [SHIM](docs/SHIM.md) |
 | `runtime/shim_zlib` | zlib across a `z_stream` that is 112 bytes in the guest and 88 here, because `uLong` differs. | [SHIM](docs/SHIM.md) |
@@ -148,9 +149,19 @@ is in [`docs/`](docs/README.md):
 - [x] **A frame on the screen.** `--loop` renders, presents, and forwards mouse
       events to `pointerPressed`/`Moved`/`Released` — the part the Java shell
       does on Android. See [BOOTING](docs/BOOTING.md).
-- [ ] **Audio.** openal-soft in place of a shipped `libopenal.so`. A shipped
-      OpenAL resolves plenty but pulls in `libOpenSLES` — its backend is
-      Android's, and it is the one library worth replacing rather than loading.
+- [ ] **Audio.** The OpenAL surface a title actually calls is implemented —
+      buffers, sources, listener, the queueing calls. What is left is
+      `libOpenSLES`, which a shipped `libopenal.so` pulls in: its backend is
+      Android's, and it is the one library worth replacing with native
+      openal-soft rather than loading.
+- [x] **A game running.** Past the title and into gameplay, which needed three
+      things the frame loop did not: every float-taking import bound as a
+      context native rather than through the twelve-integer bridge
+      (`shim_math`), Bionic's `struct tm` rather than the host's, and time
+      breakdowns that survive the Microsoft CRT refusing dates it dislikes.
+      A run that reaches gameplay also earns diagnostics worth keeping — a
+      guest-function census, a draw census per texture, and `ARC_WATCH` for
+      one function's arguments and result. See [BOOTING](docs/BOOTING.md).
 - [x] **Lifter.** ARM64 → C. Boundaries from `.eh_frame`, the PLT, call sites
       and the gaps between them; indirect branches via an address →
       function-pointer table. On the second engine, **100.00% of instructions
